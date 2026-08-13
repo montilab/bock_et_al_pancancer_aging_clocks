@@ -1,0 +1,624 @@
+---
+title: "02 — Aging clock: train on GTEx, apply to TCGA"
+author: "Pan-can aging pipeline"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: united
+    code_folding: hide
+    toc: true
+    toc_float: true
+params:
+  # Must match 01_processing outputs
+  tcga_project: "BRCA"
+  gtex_project: "BREAST"
+  feature_set: "PC"
+
+  # IO
+  out_root: "results/derived/GTEx"
+
+  # Clock training
+  seed: 2026
+  n_folds: 10
+  alpha_grid: NULL              # if NULL, defaults to seq(0, 1, by = 0.1)
+  lambda_min_exp: -4
+  lambda_max_exp: 2
+  n_lambda: 60
+  lambda_choice: "lambda.1se"   # "lambda.min" or "lambda.1se"
+
+  # NAT handling
+  min_nat: 10
+
+  # Evaluation options
+  do_age_capping: true          # evaluate TCGA restricted to GTEx max age
+
+  verbose: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(here)
+  library(glmnet)
+  library(dplyr)
+  library(tibble)
+  library(ggplot2)
+  library(stringr)
+  library(reactable)
+})
+
+# Rmd-friendly verbose printing
+vcat <- function(...) if (isTRUE(params$verbose)) cat(..., "\n")
+```
+
+```{r}
+reactable_pretty <- function(df, digits = 3) {
+  df2 <- df %>% mutate(across(where(is.numeric), ~ signif(., digits)))
+  reactable::reactable(
+    df2,
+    searchable = TRUE,
+    resizable = TRUE,
+    striped = TRUE,
+    highlight = TRUE,
+    defaultPageSize = 10
+  )
+}
+```
+
+## Load processed objects
+
+```{r}
+analysis_id <- paste0(params$tcga_project, "__", params$gtex_project)
+proc_dir <- file.path(here::here(params$out_root), analysis_id)
+suffix   <- paste0("-", params$feature_set)
+
+vcat("proc_dir = ", proc_dir)
+```
+
+```{r}
+scores_gtex <- readRDS(file.path(proc_dir, paste0("ssgsea_scores_gtex", suffix, ".rds")))
+scores_nt   <- readRDS(file.path(proc_dir, paste0("ssgsea_scores_nt",   suffix, ".rds")))
+scores_pt   <- readRDS(file.path(proc_dir, paste0("ssgsea_scores_pt",   suffix, ".rds")))
+
+metadata <- readRDS(file.path(proc_dir, "sample_metadata.rds"))
+
+# sanity: sample IDs match
+stopifnot(all(colnames(scores_gtex) %in% rownames(metadata)))
+stopifnot(all(colnames(scores_pt)   %in% rownames(metadata)))
+stopifnot(all(colnames(scores_nt)   %in% rownames(metadata)))
+```
+
+## Prepare matrices
+
+```{r}
+# Training set (GTEx)
+meta_gtex <- metadata[colnames(scores_gtex), , drop = FALSE]
+x_gtex    <- t(scores_gtex)                 # samples × pathways
+y_gtex    <- meta_gtex$age_years
+
+# Drop missing ages (required for training)
+keep_train <- is.finite(y_gtex)
+x_gtex <- x_gtex[keep_train, , drop = FALSE]
+y_gtex <- y_gtex[keep_train]
+
+stopifnot(nrow(x_gtex) == length(y_gtex))
+
+# IMPORTANT: name the response for safe alignment downstream
+names(y_gtex) <- rownames(x_gtex)
+
+# Test sets (TCGA)
+meta_nt <- metadata[colnames(scores_nt), , drop = FALSE]
+x_nt    <- t(scores_nt)
+age_nt  <- meta_nt$age_years
+age_nt  <- setNames(age_nt, rownames(x_nt))
+
+meta_pt <- metadata[colnames(scores_pt), , drop = FALSE]
+x_pt    <- t(scores_pt)
+age_pt  <- meta_pt$age_years
+age_pt  <- setNames(age_pt, rownames(x_pt))
+
+has_nat <- nrow(x_nt) >= params$min_nat
+vcat("GTEx n=", nrow(x_gtex), " | PT n=", nrow(x_pt), " | NAT n=", nrow(x_nt), " | has_nat=", has_nat)
+```
+
+## Train an elastic-net clock on GTEx (tune alpha & lambda)
+
+This intentionally does **not** do GTEx-anchored bias-correction or any decoupling analyses.
+It only trains the clock and produces:
+
+- raw predicted ages (GTEx / NAT / PT)
+- raw Δ-age = (predicted − chronological)
+- **tumor-intra RAA** = residuals from `lm(predicted ~ chronological)` within tumors
+
+### Key implementation detail (no CV leakage)
+
+To avoid CV leakage from preprocessing, we **do not** scale `x_gtex` globally before CV.
+Instead, we set `standardize = TRUE` inside `cv.glmnet()`, which standardizes **within each CV fold**
+(using only the training portion of each fold), matching what caret’s `preProcess=c("center","scale")` does.
+
+```{r}
+set.seed(params$seed)
+
+# --- age-stratified folds (deciles) ---
+k <- params$n_folds
+age_bin <- dplyr::ntile(y_gtex, 10)
+
+foldid <- integer(length(y_gtex))
+for (b in sort(unique(age_bin))) {
+  idx <- which(age_bin == b)
+  foldid[idx] <- sample(rep(seq_len(k), length.out = length(idx)))
+}
+stopifnot(all(foldid %in% seq_len(k)))
+
+# --- alpha/lambda grid ---
+alpha_grid <- as.numeric(params$alpha_grid)
+alpha_grid <- alpha_grid[is.finite(alpha_grid)]
+if (length(alpha_grid) == 0) alpha_grid <- seq(0, 1, by = 0.1)
+alpha_grid <- sort(unique(alpha_grid))
+
+lambda_grid <- 10 ^ seq(params$lambda_min_exp, params$lambda_max_exp, length.out = params$n_lambda)
+
+get_idx <- function(cvfit, lam) which.min(abs(cvfit$lambda - lam))
+
+tune_list <- vector("list", length(alpha_grid))
+names(tune_list) <- as.character(alpha_grid)
+
+for (i in seq_along(alpha_grid)) {
+  a <- alpha_grid[i]
+
+  cvfit_a <- cv.glmnet(
+    x = x_gtex,
+    y = y_gtex,
+    alpha = a,
+    family = "gaussian",
+    foldid = foldid,
+    type.measure = "mae",
+    lambda = lambda_grid,
+    standardize = TRUE,
+    intercept = TRUE
+  )
+
+  idx_min <- get_idx(cvfit_a, cvfit_a$lambda.min)
+  idx_1se <- get_idx(cvfit_a, cvfit_a$lambda.1se)
+
+  tune_list[[i]] <- list(
+    alpha = a,
+    cvfit = cvfit_a,
+    lambda_min = cvfit_a$lambda[idx_min],
+    mae_min    = cvfit_a$cvm[idx_min],
+    nzero_min  = cvfit_a$nzero[idx_min],
+    lambda_1se = cvfit_a$lambda[idx_1se],
+    mae_1se    = cvfit_a$cvm[idx_1se],
+    nzero_1se  = cvfit_a$nzero[idx_1se]
+  )
+}
+
+tune_tbl <- bind_rows(lapply(tune_list, function(z) {
+  tibble(
+    alpha = z$alpha,
+    lambda.min = z$lambda_min,
+    MAE.min    = z$mae_min,
+    nzero.min  = z$nzero_min,
+    lambda.1se = z$lambda_1se,
+    MAE.1se    = z$mae_1se,
+    nzero.1se  = z$nzero_1se
+  )
+})) %>% dplyr::arrange(alpha)
+
+reactable_pretty(tune_tbl)
+```
+
+```{r}
+metric_col  <- if (params$lambda_choice == "lambda.min") "MAE.min" else "MAE.1se"
+lambda_col  <- if (params$lambda_choice == "lambda.min") "lambda.min" else "lambda.1se"
+nzero_col   <- if (params$lambda_choice == "lambda.min") "nzero.min" else "nzero.1se"
+
+best_row <- tune_tbl %>% dplyr::slice(which.min(.data[[metric_col]]))
+
+best_alpha  <- best_row$alpha
+best_lambda <- best_row[[lambda_col]]
+best_mae    <- best_row[[metric_col]]
+best_nzero  <- best_row[[nzero_col]]
+
+idx_best <- which.min(tune_tbl[[metric_col]])
+best_cvfit <- tune_list[[idx_best]]$cvfit
+
+vcat("Best elastic-net: alpha=", best_alpha,
+    " | ", params$lambda_choice, "=", signif(best_lambda, 4),
+    " | CV MAE=", signif(best_mae, 4),
+    " | nzero=", best_nzero)
+
+plot(best_cvfit)
+abline(v = log(best_lambda), lty = 2)
+```
+
+## Fit final model and predict
+
+```{r}
+enet_model <- glmnet(
+  x = x_gtex,
+  y = y_gtex,
+  alpha = best_alpha,
+  family = "gaussian",
+  lambda = best_lambda,
+  standardize = TRUE,
+  intercept = TRUE
+)
+
+pred_gtex <- as.numeric(predict(enet_model, newx = x_gtex, s = best_lambda))
+pred_pt   <- if (nrow(x_pt) > 0) as.numeric(predict(enet_model, newx = x_pt, s = best_lambda)) else numeric()
+pred_nt   <- if (nrow(x_nt) > 0) as.numeric(predict(enet_model, newx = x_nt, s = best_lambda)) else numeric()
+
+names(pred_gtex) <- rownames(x_gtex)
+if (length(pred_pt)) names(pred_pt) <- rownames(x_pt)
+if (length(pred_nt)) names(pred_nt) <- rownames(x_nt)
+
+# Extract the training scalers used by glmnet (for reproducibility / downstream storage)
+# NOTE: these are the GTEx training mean/sd used internally by glmnet when standardize=TRUE
+x_center <- if (!is.null(enet_model$xm)) enet_model$xm else colMeans(x_gtex, na.rm = TRUE)
+x_scale  <- if (!is.null(enet_model$xs)) enet_model$xs else apply(x_gtex, 2, sd, na.rm = TRUE)
+x_scale[!is.finite(x_scale) | x_scale == 0] <- 1
+
+if (is.null(names(x_center))) names(x_center) <- colnames(x_gtex)
+if (is.null(names(x_scale)))  names(x_scale)  <- colnames(x_gtex)
+
+stopifnot(identical(names(x_center), colnames(x_gtex)))
+stopifnot(identical(names(x_scale),  colnames(x_gtex)))
+```
+
+## Retained pathways (non-zero coefficients)
+
+```{r}
+coef_mat <- as.matrix(coef(enet_model))
+a_orig   <- as.numeric(coef_mat[1, 1])
+b_orig   <- setNames(as.numeric(coef_mat[-1, 1]), rownames(coef_mat)[-1])
+
+retained_tbl <- tibble(
+  pathway = names(b_orig),
+  coefficient = as.numeric(b_orig)
+) %>%
+  filter(is.finite(coefficient), coefficient != 0) %>%
+  mutate(direction = ifelse(coefficient > 0, "Older", "Younger")) %>%
+  arrange(desc(abs(coefficient)))
+
+vcat("Retained pathways (non-zero): n = ", nrow(retained_tbl))
+
+reactable_pretty(retained_tbl)
+```
+
+## Create a ClockSHAP-ready clock parameterization (upstream contract)
+
+ClockSHAP's `linear_clock(alpha, beta, mu, sigma)` uses the standardized form:
+
+\[
+\hat y = \alpha + \sum_j \beta_j \cdot \frac{x_j - \mu_j}{\sigma_j}
+\]
+
+However, `coef(glmnet)` corresponds to coefficients on the **original x scale**:
+
+\[
+\hat y = a + \sum_j b_j x_j
+\]
+
+To keep downstream scripts simple and unambiguous, we convert and save **both**:
+- `clock_raw`: `(a, b)` on the original x scale
+- `clock_cs`: `(alpha_cs, beta_cs, mu, sigma)` in ClockSHAP standardized form
+
+Conversion:
+- `beta_cs_j = b_j * sigma_j`
+- `alpha_cs  = a + sum_j b_j * mu_j`
+
+```{r}
+# Align to the training feature set order
+feat <- colnames(x_gtex)
+b_orig <- b_orig[feat]
+stopifnot(!anyNA(b_orig))
+
+mu    <- x_center[feat]
+sigma <- x_scale[feat]
+
+stopifnot(all(is.finite(mu)))
+stopifnot(all(is.finite(sigma)))
+
+beta_cs  <- b_orig * sigma
+alpha_cs <- a_orig + sum(b_orig * mu, na.rm = TRUE)
+
+names(beta_cs) <- feat
+names(mu) <- feat
+names(sigma) <- feat
+
+# Quick QA: confirm equivalence on a few random GTEx samples
+set.seed(params$seed + 1)
+ix <- sample(seq_len(nrow(x_gtex)), size = min(10, nrow(x_gtex)))
+
+pred_glmnet <- as.numeric(predict(enet_model, newx = x_gtex[ix, , drop = FALSE], s = best_lambda))
+
+Z <- sweep(sweep(x_gtex[ix, , drop = FALSE], 2, mu, "-"), 2, sigma, "/")
+pred_cs <- alpha_cs + as.numeric(Z %*% beta_cs)
+
+max_abs_diff <- max(abs(pred_glmnet - pred_cs), na.rm = TRUE)
+vcat("ClockSHAP parameterization QA: max |pred_glmnet - pred_cs| = ", signif(max_abs_diff, 8))
+stopifnot(max_abs_diff < 1e-6)
+```
+
+## Performance plots: predicted vs chronological
+
+```{r}
+safe_cor <- function(x, y) {
+  ok <- complete.cases(x, y)
+  if (sum(ok) < 3) return(NA_real_)
+  cor(x[ok], y[ok])
+}
+
+perf_tbl <- function(pred, age, label) {
+  ok <- complete.cases(pred, age)
+  tibble(
+    cohort = label,
+    n = sum(ok),
+    r = safe_cor(pred, age),
+    MAE = if (sum(ok) > 0) mean(abs(pred[ok] - age[ok])) else NA_real_,
+    RMSE = if (sum(ok) > 0) sqrt(mean((pred[ok] - age[ok])^2)) else NA_real_
+  )
+}
+
+tab <- bind_rows(
+  perf_tbl(pred_gtex, y_gtex[names(pred_gtex)], "GTEx"),
+  perf_tbl(pred_pt,   age_pt[names(pred_pt)],   "TCGA-PT"),
+  perf_tbl(pred_nt,   age_nt[names(pred_nt)],   "TCGA-AN")
+)
+
+reactable_pretty(tab)
+```
+
+```{r}
+plot_df <- bind_rows(
+  tibble(sample_id = names(pred_gtex), cohort = "GTEx",    age_years = y_gtex[names(pred_gtex)],    pred_age = pred_gtex),
+  tibble(sample_id = names(pred_pt),   cohort = "TCGA-PT", age_years = age_pt[names(pred_pt)],      pred_age = pred_pt),
+  tibble(sample_id = names(pred_nt),   cohort = "TCGA-AN", age_years = age_nt[names(pred_nt)],      pred_age = pred_nt)
+) %>%
+  filter(!is.na(age_years), !is.na(pred_age))
+
+ggplot(plot_df, aes(x = age_years, y = pred_age, colour = cohort)) +
+  geom_point(alpha = 0.25, size = 1.2) +
+  geom_smooth(method = "lm", se = FALSE, linetype = "dotted", linewidth = 0.8) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  facet_wrap(~ cohort, nrow = 1) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none",
+        strip.text = element_text(face = "bold")) +
+  labs(
+    title = paste0("Raw clock predictions vs age: ", analysis_id),
+    x = "Chronological age (years)",
+    y = "Predicted age (years)"
+  )
+```
+
+## Δ-age (Predicted − chronological)
+
+```{r}
+delta_df <- plot_df %>%
+  mutate(delta_age = pred_age - age_years)
+
+ggplot(delta_df, aes(x = cohort, y = delta_age, fill = cohort)) +
+  geom_boxplot(width = 0.6, outlier.shape = NA, alpha = 0.8) +
+  geom_jitter(width = 0.12, alpha = 0.25, size = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none") +
+  labs(
+    title = paste0("Δ-age by cohort: ", analysis_id),
+    x = NULL,
+    y = "Δ-age (years)"
+  )
+
+delta_summary <- delta_df %>%
+  group_by(cohort) %>%
+  summarise(
+    n = n(),
+    mean = mean(delta_age),
+    sd   = sd(delta_age),
+    median = median(delta_age),
+    IQR = IQR(delta_age),
+    .groups = "drop"
+  )
+
+reactable_pretty(delta_summary)
+```
+
+## Optional: evaluation capped to GTEx max age
+
+```{r}
+cap_df   <- NULL
+cap_perf <- NULL
+cap_plot <- NULL
+
+if (isTRUE(params$do_age_capping)) {
+  age_max <- suppressWarnings(max(y_gtex, na.rm = TRUE))
+
+  if (!is.finite(age_max)) {
+    vcat("Age-capped evaluation requested, but GTEx max age is not finite. Skipping.")
+  } else {
+    cap_df <- delta_df %>% filter(age_years <= age_max)
+
+    vcat("Age-capped evaluation: max_age=", age_max,
+         " | n(GTEx)=", sum(cap_df$cohort == "GTEx"),
+         " | n(PT)=",   sum(cap_df$cohort == "TCGA-PT"),
+         " | n(NAT)=",  sum(cap_df$cohort == "TCGA-AN"))
+
+    if (nrow(cap_df) == 0) {
+      vcat("Age-capped evaluation skipped: no samples ≤ max GTEx age after filtering.")
+    } else {
+      cap_perf <- cap_df %>%
+        group_by(cohort) %>%
+        summarise(
+          n = n(),
+          r = safe_cor(pred_age, age_years),
+          MAE = mean(abs(pred_age - age_years)),
+          RMSE = sqrt(mean((pred_age - age_years)^2)),
+          .groups = "drop"
+        )
+
+      cap_plot <- ggplot(cap_df, aes(x = age_years, y = pred_age, colour = cohort)) +
+        geom_point(alpha = 0.25, size = 1.2) +
+        geom_smooth(method = "lm", se = FALSE, linetype = "dotted", linewidth = 0.8) +
+        geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+        facet_wrap(~ cohort, nrow = 1) +
+        theme_minimal(base_size = 12) +
+        theme(legend.position = "none",
+              strip.text = element_text(face = "bold")) +
+        labs(
+          title = paste0("Predicted vs age (≤ GTEx max): ", analysis_id),
+          x = "Chronological age (years)",
+          y = "Predicted age (years)"
+        )
+    }
+  }
+}
+```
+
+```{r}
+if (isTRUE(params$do_age_capping) && !is.null(cap_perf) && nrow(cap_perf) > 0) {
+  reactable_pretty(cap_perf)
+}
+```
+
+```{r}
+if (isTRUE(params$do_age_capping) && !is.null(cap_plot)) {
+  cap_plot
+}
+```
+
+## Tumor-intra RAA (residual within tumors)
+
+This is the **tumor-only** residual:
+
+\[
+\mathrm{RAA}_{\mathrm{tum,intra}} = \hat y_{\mathrm{tum}} - (\alpha_T + \beta_T \cdot \mathrm{Age})
+\]
+
+It is useful for **tumor-only** downstream comparisons (stage, survival).
+
+```{r}
+raa_tum_intra <- NA_real_
+if (length(pred_pt) && sum(is.finite(age_pt[names(pred_pt)])) >= 3) {
+  age_pt_aligned <- age_pt[names(pred_pt)]
+
+  ok <- complete.cases(pred_pt, age_pt_aligned)
+  fit <- lm(pred_pt[ok] ~ age_pt_aligned[ok])
+
+  alpha_T <- coef(fit)[1]
+  beta_T  <- coef(fit)[2]
+
+  raa_vals <- pred_pt[ok] - (alpha_T + beta_T * age_pt_aligned[ok])
+  raa_tum_intra <- setNames(as.numeric(raa_vals), names(pred_pt)[ok])
+
+  vcat("Tumor-intra bias line: alpha=", round(alpha_T, 3), " beta=", round(beta_T, 3),
+      " | cor(RAA,Age)=", round(safe_cor(raa_vals, age_pt_aligned[ok]), 3))
+} else {
+  warning("Not enough tumors with age to compute tumor-intra RAA.")
+}
+```
+
+```{r}
+if (!all(is.na(raa_tum_intra))) {
+  raa_df <- tibble(sample_id = names(raa_tum_intra), RAA = as.numeric(raa_tum_intra))
+  ggplot(raa_df, aes(x = RAA)) +
+    geom_histogram(bins = 40) +
+    theme_minimal(base_size = 12) +
+    labs(title = paste0("Tumor-intra RAA distribution: ", analysis_id),
+         x = "Tumor-intra RAA (years)", y = "Count")
+}
+```
+
+## Save outputs for downstream analyses
+
+```{r}
+clock_results <- list(
+  params = list(
+    tcga_project = params$tcga_project,
+    gtex_project = params$gtex_project,
+    feature_set  = params$feature_set
+  ),
+  analysis_id = analysis_id,
+  proc_dir    = proc_dir,
+
+  # feature processing
+  feature_names = colnames(x_gtex),
+  x_center = x_center,
+  x_scale  = x_scale,
+
+  # tuning + training
+  tuning = list(
+    alpha_grid = alpha_grid,
+    lambda_grid = lambda_grid,
+    tune_table = tune_tbl,
+    best_alpha = best_alpha,
+    best_lambda = best_lambda,
+    lambda_choice = params$lambda_choice
+  ),
+  cvfit_best = best_cvfit,
+  enet_model = enet_model,
+
+  # retained features (explicitly saved for convenience)
+  retained = retained_tbl,
+
+  # clock parameterizations (explicit contract)
+  clock_raw = list(
+    alpha = a_orig,
+    beta  = b_orig
+  ),
+  clock_cs = list(
+    # ClockSHAP standardized form:
+    # yhat = alpha + sum_j beta_j * (x_j - mu_j) / sigma_j
+    alpha = alpha_cs,
+    beta  = beta_cs,
+    mu    = mu,
+    sigma = sigma
+  ),
+
+  # predictions (named by sample_id)
+  pred = list(
+    GTEx = pred_gtex,
+    NAT  = pred_nt,
+    Tumour = pred_pt
+  ),
+
+  # ages (named by sample_id where available)
+  age = list(
+    GTEx = y_gtex,
+    NAT  = if (nrow(x_nt) > 0) age_nt else numeric(),
+    Tumour = if (nrow(x_pt) > 0) age_pt else numeric()
+  ),
+
+  # delta-age + RAA objects
+  raa = list(
+    # Raw delta-age (pred - age) for tumors only (not bias-corrected)
+    Tumour_delta_raw = if (length(pred_pt)) setNames(pred_pt - age_pt[names(pred_pt)], names(pred_pt)) else numeric(),
+
+    # Tumor-only residuals (recommended for tumor-only downstream comparisons)
+    Tumour_intra = raa_tum_intra
+  ),
+
+  # quick performance tables (optional)
+  perf = list(
+    raw = tab
+  )
+)
+
+saveRDS(clock_results, file = file.path(proc_dir, paste0("clock_and_RAA_objects", suffix, ".rds")))
+
+vcat("Saved clock_results to: ", file.path(proc_dir, paste0("clock_and_RAA_objects", suffix, ".rds")))
+```
+
+## Session info
+
+```{r}
+sessionInfo()
+```

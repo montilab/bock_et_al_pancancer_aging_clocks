@@ -1,0 +1,555 @@
+---
+title: "Determining Covariates for Statistical Analysis"
+subtitle: "TCGA PanCancer Aging"
+author: "Payton Bock - Monti Lab"
+date:   "`r format(Sys.Date(), '%B %d, %Y')`"
+params: 
+  dummy: "dummy"
+output:
+  html_document:
+    theme: united
+    code_folding: hide
+    css: style.css
+    toc: true
+    toc_float: true
+    
+---
+
+```{r opts, echo=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+## Script Summary
+In this script, we determine which covariates to include in our differential analysis (per cancer type in each omics layer)
+using various criteria: 
+
+For all Projects:
+  - Only run differential analysis if there are at least 50 samples for that omics layer
+
+  - Include gender if we have at least 5 of each gender and one gender isn't more than 90% of the samples
+
+  - Include race if we have at least two races with ≥5 samples each (excluding races with <5 samples)
+
+  - Include grade (`histological_grade`) if there are at least two grade categories with ≥5 samples each, and at least 75% of samples have grade information. 
+
+  - Include HPV status for HNSC only (see this github issue for details why  https://github.com/orgs/montilab/projects/2?pane=issue&itemId=84862253&issue=montilab%7Cpancancer-aging%7C16)
+
+  For BRCA: Include tumor molecular subtype (PAM50)
+
+We also: 
+  - Creates tables for determined covariates per cancer type, across omics layers
+
+  - Creates table showing discrepancies for determined covariates between omics layers of a given cancer type
+
+  - Saves determined covariates for each omics layer as tables in RDS files 
+
+Future considerations:
+  - Include tumor subtype for other cancer types?? (22 projects have info)
+    
+
+```{r setup}
+#library path
+.libPaths("/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/r-library/")
+
+#Load libraries
+library(dplyr)
+library(reactable)
+library(purrr)
+library(SummarizedExperiment)
+library(tidyr)
+library(stringr)  # Added for string operations
+library(tools) 
+
+#get environmental variables
+PATH <- file.path( Sys.getenv("PCANAGE","/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/")) 
+TCGA <- file.path( Sys.getenv("CBMDATA","/restricted/projectnb/agedisease/CBMrepositoryData/"), "TCGA-GDC")
+```
+
+## Load in FILTERED SummarizedExperiments
+These paths should lead to the directories containing analysis ready SummarizedExperiment objects
+in the form of RDS files. Its important these SummarizedExperiments are fully processed so we can accurately determine 
+which projects we have enough samples for (50) and determine the appropriate
+covariates. 
+
+Note the # of samples reported here may not line up with the # of samples in the harmonized meta data script. There are additonal samples in the clinical information which are not found
+in the downloaded TCGA data (not sure why, could be addtional tumor types or samples not part of the official TCGA study)
+
+For now, we use the "processed_data/all" objects for the 4 omics layer with these objects generated (miRNA, RPPA, RNAseq, DNA methylation)
+
+For SCNA and mutation, we utilize the raw SummarizedExperiment objects with the harmonized meta data added (not yet a focus of our analyses). 
+
+
+```{r Data locations}
+#Load in all RDS files of a directory
+file_list_METHYL <- list.files(
+  path = file.path(TCGA,"methylation/processed_data/all"), 
+  pattern = "*.rds", full.names = TRUE)
+
+file_list_RPPA <- list.files(
+  path = file.path(TCGA,"RPPA/processed_data/all"),
+  pattern = "*.rds", full.names = TRUE)
+
+# as specified by Pranav Narnur
+file_list_SCNA <- list.files(
+  path = file.path(TCGA, "scna/GISTIC/processed_data") , 
+  pattern = "*segment.rds", full.names = TRUE)
+
+file_list_RNASEQ <- list.files(
+  path = file.path(TCGA,"RNAseq/processed_data/all"), 
+  pattern = "*.rds", full.names = TRUE)
+
+file_list_MIRNA <- list.files(
+  path = file.path(TCGA,"miR/processed_data/all"),
+  pattern = "*.rds", full.names = TRUE)
+
+file_list_MUTATION <- list.files(
+  path = file.path(TCGA,"mutation/processed_data/all"),
+  pattern = "*.rds", full.names = TRUE)
+```
+
+
+## Determine Covariates
+This code is designed to process SummarizedExperiment objects stored as RDS files for our 6 omics data types (e.g., METHYL, RPPA). It dynamically determines which covariates to include for differential analysis based on predefined criteria. Specifically:
+
+1. Gender is included as a covariate if there are at least 5 samples for each gender, and no single gender comprises more than 90% of the samples.
+
+2. Race is considered if there are at least two different racial categories, each with more than 5 samples. The "not reported" category is excluded from this analysis.
+
+3. Grade (histological_grade) is included if there are at least two grade categories with ≥5 samples each, and atleast 75% of samples have grade information. 
+
+4. HPV status is included for HNSC only. 
+
+5. For the BRCA project, the tumor molecular subtype (PAM50) is included.
+
+6. Tumor Purity is included if at least 75% of samples have available purity information
+
+The output is a data frame for each omics type, detailing the cancer type, the number of samples, and whether each covariate (gender, race, subtype, HPV status, grade, etc) meets the criteria for inclusion.
+
+For race, it includes which races we have ample sample size for (>5 samples).
+```{r Data Process Function}
+process_rds_file <- function(file_path, omics_type) {
+  # Load in file
+  se <- readRDS(file_path)
+  
+  # Get file name
+  file_name <- basename(file_path)
+  
+  # Finds cancer type in file name, adds TCGA if necessary
+  matches <- regmatches(file_name, regexpr("(TCGA-)?[A-Z]+", file_name))
+  cancer_type <- ifelse(length(matches) > 0, gsub("TCGA-", "", matches), NA)
+  cancer_type <- ifelse(!is.na(cancer_type), paste0("TCGA-", cancer_type), cancer_type)
+  
+  # Get number of samples
+  num_samples <- ncol(se)
+  
+  # Define mandatory and optional metadata columns
+  mandatory_columns <- c("gender", "race", "purity")
+  optional_columns <- c("subtype_selected", "HPV.status", "histological_grade")
+  
+  # Check for existence of mandatory metadata columns in colData
+  missing_mandatory <- mandatory_columns[!mandatory_columns %in% colnames(SummarizedExperiment::colData(se))]
+  
+  if (length(missing_mandatory) > 0) {
+    stop(paste("Meta data is not up to date!! Missing mandatory columns:", paste(missing_mandatory, collapse=", ")))
+  }
+  
+  # Check for existence of optional metadata columns
+  available_optional <- optional_columns[optional_columns %in% colnames(SummarizedExperiment::colData(se))]
+  
+  
+  # Initialize covariates to include as FALSE; they will be updated based on criteria
+  include_purity <- FALSE 
+  include_gender <- FALSE
+  races_included <- ""  # Store race information
+  include_subtype <- FALSE
+  include_HPV_status <- FALSE
+  include_grade <- FALSE
+  grades_included <- ""  # Store grade information
+  include_race <- FALSE
+  
+  if (num_samples >= 1) { 
+    # Gender criteria
+    genders <- table(SummarizedExperiment::colData(se)$gender)
+    min_gender <- min(genders)
+    max_gender_percent <- max(genders) / sum(genders) * 100
+    if (min_gender >= 5 && max_gender_percent <= 90) {
+      include_gender <- TRUE
+    }
+    
+    # Race criteria, excluding "not reported", checking for at least two races with >5 samples
+    races <- SummarizedExperiment::colData(se)$race
+    valid_races <- races[races != "not reported" & !is.na(races)]
+    race_counts <- table(valid_races)
+    valid_race_names <- names(race_counts[race_counts >= 5])
+    if (length(valid_race_names) >= 2) {
+      include_race <- TRUE
+      races_included <- paste(valid_race_names, collapse=", ")
+    }
+    
+    #add purity if atleast 75% of samples have it
+    purity <- SummarizedExperiment::colData(se)$purity
+    non_na_purity <- sum(!is.na(purity))
+    if (non_na_purity / num_samples >= 0.75) {
+        include_purity <- TRUE
+      }
+    
+    # Tumor subtype for BRCA
+    if ("subtype_selected" %in% available_optional && stringr::str_detect(cancer_type, "BRCA")) {
+      # Check if there are at least two subtypes with >=5 samples
+      subtypes <- SummarizedExperiment::colData(se)$subtype_selected
+      subtype_counts <- table(subtypes)
+      valid_subtypes <- names(subtype_counts[subtype_counts >= 5])
+      if (length(valid_subtypes) >= 2) {
+        include_subtype <- TRUE
+      }
+    }
+    
+        # Include HPV for head and neck cancer 
+    if ("HPV.status" %in% available_optional &&stringr::str_detect(cancer_type, "HNSC")) {
+        include_HPV_status <- TRUE
+    }
+    
+    
+    # Grade inclusion: at least two grade categories with >=5 samples
+    if ("histological_grade" %in% available_optional) {
+      #get infor
+      grades <- SummarizedExperiment::colData(se)$histological_grade
+      
+      #get number of grades non-na and distribution
+      non_na_grade <- sum(!is.na(grades))
+      valid_grades <- grades[!is.na(grades)]
+      grade_counts <- table(valid_grades)
+      
+      #check criteria
+      valid_grade_names <- names(grade_counts[grade_counts >= 5])
+      
+      if (non_na_grade / num_samples >= 0.75 & length(valid_grade_names) >= 2) {
+        include_grade <- TRUE
+        grades_included <- paste(valid_grade_names, collapse=", ")
+      }
+    }
+  }
+  
+  return(data.frame(
+    cancer_type = cancer_type, 
+    omics_type = omics_type,
+    num_samples = num_samples,
+    include_gender = include_gender,
+    include_race = include_race,
+    races_included = ifelse(include_race, races_included, NA),
+    include_subtype = include_subtype,
+    include_HPV_status = include_HPV_status,
+    include_grade = include_grade,
+    grades_included = ifelse(include_grade, grades_included, NA),
+    include_purity = include_purity
+  ))
+}
+
+# Runs above function on all files in list
+process_files <- function(file_list, omics_type) {
+  purrr::map_df(file_list, process_rds_file, omics_type = omics_type)
+}
+
+# Adds try statement to above function
+process_with_try <- function(file_list, omics_type) {
+  try({
+    results <- process_files(file_list, omics_type)
+    return(results)
+  }, silent = FALSE)  
+}
+
+```
+
+Call the above function on all OMICS types
+```{r data process}
+results_METHYL <- process_with_try(file_list_METHYL, "METHYL")
+results_RPPA <- process_with_try(file_list_RPPA, "RPPA")
+results_RNAseq <- process_with_try(file_list_RNASEQ, "RNAseq")
+results_miRNA <- process_with_try(file_list_MIRNA, "miRNA")
+results_SCNA <- process_with_try(file_list_SCNA, "SCNA")
+results_Mutation <- process_with_try(file_list_MUTATION, "Mutation")
+```
+
+
+## Save Results
+```{r}
+save_omics_covariates <- function(results, omics_type) {
+  output <- "/restricted/projectnb/agedisease/CBMrepositoryData/TCGA-GDC/metadata/covariates/"
+  saveRDS(results, paste0(output,omics_type, "_covariates.rds"))
+}
+save_omics_covariates(results_METHYL,"METHYLATION")
+save_omics_covariates(results_RPPA,"RPPA")
+save_omics_covariates(results_RNAseq,"RNASEQ")
+save_omics_covariates(results_miRNA,"MIRNA")
+save_omics_covariates(results_SCNA,"SCNA")
+save_omics_covariates(results_Mutation,"MUTATION")
+```
+
+
+## Covariate Results Per Omics Layer {.tabset}
+
+### DNA Methylation
+```{r}
+reactable::reactable(as.data.frame(results_METHYL), searchable = TRUE,resizable = TRUE)
+```
+
+### RPPA
+```{r}
+reactable::reactable(as.data.frame(results_RPPA), searchable = TRUE,resizable = TRUE)
+```
+
+### RNAseq
+```{r}
+reactable::reactable(as.data.frame(results_RNAseq), searchable = TRUE,resizable = TRUE)
+```
+
+### miRNA
+```{r}
+reactable::reactable(as.data.frame(results_miRNA), searchable = TRUE,resizable = TRUE)
+```
+
+### SCNA
+```{r}
+reactable::reactable(as.data.frame(results_SCNA), searchable = TRUE,resizable = TRUE)
+```
+
+### Mutation
+```{r}
+reactable::reactable(as.data.frame(results_Mutation), searchable = TRUE,resizable = TRUE)
+```
+
+## Covariate Differences between Omics Layers {.tabset}
+Here we show a combined covariate table between our omics types to look for differences
+in covariate assignment for the same cancer type across different omics layers.
+
+Note, many of these differences are caused by some cancer projects missing omics layers 
+(e.g., TCGA-GBM has only 5 miRNA samples). miRNA in GBM would likely not even be
+analyzed given the current 50 sample requirement. 
+
+We also show, for each covariate, identical cancer types that have differences in covariates between omics layers. This issue may or may not be impactful, but is important to
+keep in mind during analysis.
+
+```{r}
+# Bind all results into one data frame
+all_results <- dplyr::bind_rows(
+  results_METHYL, 
+  results_RPPA, 
+  results_miRNA, 
+  results_SCNA, 
+  results_RNAseq, 
+  results_Mutation, 
+  .id = "omics_id"
+)
+
+# Transform data to wide format for comparison
+wide_results <- all_results %>%
+  dplyr::select(cancer_type, omics_type, include_gender, include_race, include_subtype, include_HPV_status, include_grade, include_purity) %>%
+  tidyr::pivot_wider(
+    names_from = omics_type,
+    values_from = c(include_gender, include_race, include_subtype, include_HPV_status, include_grade, include_purity)
+  )
+
+
+reactable::reactable(wide_results)
+```
+
+
+### Race Covariate Discrepanices
+```{r}
+# Programmatically identify discrepancies
+# Here's a basic example where we identify cancer types with discrepancies in 'include_race' across omics types
+discrepancies_race <- wide_results %>%
+  dplyr::filter(apply(.[, grepl("include_race", names(.))], 1, var) > 0) %>%
+  dplyr::select(cancer_type, dplyr::contains("include_race"))
+
+# View discrepancies for race covariates
+reactable::reactable(discrepancies_race)
+```
+
+### Gender Covariate Discrepanices
+```{r}
+# View discrepancies for gender covariates
+discrepancies_gender <- wide_results %>%
+  dplyr::filter(apply(.[, grepl("include_gender", names(.))], 1, var) > 0) %>%
+  dplyr::select(cancer_type, dplyr::contains("include_gender"))
+
+reactable::reactable(discrepancies_gender)
+```
+
+### HPV Covariate Discrepanices
+```{r}
+# View discrepancies for covariates
+discrepancies_hpv <- wide_results %>%
+  dplyr::filter(apply(.[, grepl("HPV_status", names(.))], 1, var) > 0) %>%
+  dplyr::select(cancer_type, dplyr::contains("HPV_status"))
+
+reactable::reactable(discrepancies_hpv)
+```
+
+### Grade Covariate Discrepanices
+```{r}
+# View discrepancies for covariates
+discrepancies_grade <- wide_results %>%
+  dplyr::filter(apply(.[, grepl("grade", names(.))], 1, var) > 0) %>%
+  dplyr::select(cancer_type, dplyr::contains("grade"))
+
+reactable::reactable(discrepancies_grade)
+```
+
+### Purity Covariate Discrepanices
+```{r}
+# View discrepancies for covariates
+discrepancies_purity <- wide_results %>%
+  dplyr::filter(apply(.[, grepl("purity", names(.))], 1, var) > 0) %>%
+  dplyr::select(cancer_type, dplyr::contains("purity"))
+
+reactable::reactable(discrepancies_purity)
+```
+
+
+## Number of Samples with Complete Information 
+Here we determine how many samples we have available for differential that have complete information for all
+dynamically determined covariates for that cancer-omics combination (and available Age).
+
+The number of samples after filtering assumes ALL covariates are included, and also excludes races/grades with insufficient sample information (not part of the races_included/grades_included column). 
+
+```{r}
+# Function to filter SummarizedExperiment object based on inclusion criteria
+filter_samples_based_on_criteria <- function(file_path, covariate_info) {
+  # Load the SummarizedExperiment object
+  se <- readRDS(file_path)
+  
+  # Get file name
+  file_name <- basename(file_path)
+  
+  # Extract cancer type using regex, ensuring it matches the format in covariate_info
+  ct <- regmatches(file_name, regexpr("(TCGA-)?[A-Z]+", file_name))
+  ct <- ifelse(!grepl("^TCGA-", ct), paste0("TCGA-", ct), ct)
+  
+  # Find the matching row in covariate_info
+  cancer_type_row <- covariate_info[covariate_info$cancer_type == ct, ]
+  
+  if (nrow(cancer_type_row) == 0) {
+    warning(paste("No covariate information found for cancer type:", ct))
+    return(data.frame(
+      cancer_type = ct,
+      omics_type = NA,
+      num_samples_before = ncol(se),
+      num_samples_after = NA
+    ))
+  }
+  
+  # Extract inclusion criteria
+  include_gender <- cancer_type_row$include_gender
+  include_race <- cancer_type_row$include_race
+  include_subtype <- cancer_type_row$include_subtype
+  include_HPV_status <- cancer_type_row$include_HPV_status
+  include_grade <- cancer_type_row$include_grade
+  include_purity <- cancer_type_row$include_purity
+  
+  races_to_keep <- cancer_type_row$races_included
+  grades_to_keep <- cancer_type_row$grades_included
+  
+  omics_type <- cancer_type_row$omics_type
+  
+  # Get the number of samples before filtering
+  num_samples_before <- ncol(se)
+  
+  # Initialize a logical vector indicating samples to keep
+  keep_samples <- rep(TRUE, num_samples_before)
+  
+  #first remove missing age
+  keep_samples <- keep_samples & !is.na(SummarizedExperiment::colData(se)$Age)
+  
+  # Apply filtering based on the inclusion criteria
+  if (include_gender) {
+    keep_samples <- keep_samples & !is.na(SummarizedExperiment::colData(se)$gender)
+  }
+  
+  # Apply filtering based on the inclusion criteria
+  if (include_purity) {
+    keep_samples <- keep_samples & !is.na(SummarizedExperiment::colData(se)$purity )
+  }
+  
+  if (include_race) {
+    races_to_keep_list <- strsplit(as.character(races_to_keep), ",\\s*")[[1]]
+    keep_samples <- keep_samples & 
+      !is.na(SummarizedExperiment::colData(se)$race) & 
+      SummarizedExperiment::colData(se)$race %in% races_to_keep_list
+  }
+  
+  if (include_subtype) {
+    keep_samples <- keep_samples & !is.na(SummarizedExperiment::colData(se)$subtype_selected)
+  }
+  
+  if (include_HPV_status) {
+    keep_samples <- keep_samples & !is.na(SummarizedExperiment::colData(se)$HPV.status)
+  }
+  
+  if (include_grade) {
+    grades_to_keep_list <- strsplit(as.character(grades_to_keep), ",\\s*")[[1]]
+    keep_samples <- keep_samples & 
+      !is.na(SummarizedExperiment::colData(se)$histological_grade) & 
+      SummarizedExperiment::colData(se)$histological_grade %in% grades_to_keep_list
+  }
+  
+  # Subset the SummarizedExperiment to keep only the valid samples
+  se_filtered <- se[, keep_samples]
+  
+  # Get the number of samples after filtering
+  num_samples_after <- ncol(se_filtered)
+  
+  return(data.frame(
+    cancer_type = ct,
+    omics_type = omics_type,
+    num_samples_before = num_samples_before,
+    num_samples_after = num_samples_after
+  ))
+}
+
+# Create a function to filter each file in an omics type based on the processed results
+filter_all_files_in_omics <- function(file_list, results_df) {
+  # Split the results_df into a list of single-row data frames
+  results_split <- split(results_df, seq(nrow(results_df)))
+  
+  # Map over file_list and results_split simultaneously
+  purrr::map2_df(file_list, results_split, ~filter_samples_based_on_criteria(.x, .y))
+}
+
+# Apply the filtering to each omics type
+filtered_results_METHYL <- filter_all_files_in_omics(file_list_METHYL, results_METHYL)
+filtered_results_RPPA <- filter_all_files_in_omics(file_list_RPPA, results_RPPA)
+filtered_results_RNAseq <- filter_all_files_in_omics(file_list_RNASEQ, results_RNAseq)
+filtered_results_miRNA <- filter_all_files_in_omics(file_list_MIRNA, results_miRNA)
+filtered_results_SCNA <- filter_all_files_in_omics(file_list_SCNA, results_SCNA)
+filtered_results_Mutation <- filter_all_files_in_omics(file_list_MUTATION, results_Mutation)
+
+# Combine the filtered results into a summary table
+all_filtered_results_summary <- dplyr::bind_rows(
+  filtered_results_METHYL,
+  filtered_results_RPPA,
+  filtered_results_RNAseq,
+  filtered_results_miRNA,
+  filtered_results_SCNA,
+  filtered_results_Mutation
+)
+
+# Display summary table showing number of samples before and after filtering
+reactable::reactable(
+  all_filtered_results_summary,
+  searchable = TRUE,
+  resizable = TRUE,
+  columns = list(
+    cancer_type = reactable::colDef(name = "Cancer Type"),
+    omics_type = reactable::colDef(name = "Omics Type"),
+    num_samples_before = reactable::colDef(name = "# of Samples Before Filtering"),
+    num_samples_after = reactable::colDef(name = "# of Samples After Filtering")
+  )
+)
+```
+
+
+## Session Info
+```{r}
+sessionInfo()
+```

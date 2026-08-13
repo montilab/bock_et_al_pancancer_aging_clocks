@@ -1,0 +1,219 @@
+---
+title: "TCGA RPPA - Data Preprocessing"
+subtitle: "TCGA PanCancer Aging"
+author: "Payton Bock - Monti Lab"
+date:   "`r format(Sys.Date(), '%B %d, %Y')`"
+params: 
+  dummy: "dummy"
+output:
+  html_document:
+    theme: united
+    code_folding: hide
+    css: style.css
+    toc: true
+    toc_float: true
+---
+```{r opts, echo=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+```{r setup, include=FALSE}
+#r library
+.libPaths("/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/r-library/")
+
+#libraries
+library(dplyr)
+library(SummarizedExperiment)
+library(ggplot2)
+library(reshape2)
+library(impute)
+
+#get environmental variables
+PATH <- file.path( Sys.getenv("PCANAGE","/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/")) 
+TCGA <- file.path( Sys.getenv("CBMDATA","/restricted/projectnb/agedisease/CBMrepositoryData/TCGA-GDC"), "TCGA-GDC")
+```
+
+## Script Summary 
+- Removes proteins and samples with >20% missing values in each SummarizedExperiment object (TCGA project) 
+
+- Includes an optional imputation step (currently not included)
+
+- Comments on and creates plots to check data normalization
+
+- Saves processed SummarizedExperiments
+
+## Data Loading
+Load in SummarizedExperiment RDS objects and define output directory
+```{r data loading}
+#Path where the summarized experiment objects you are updating are located
+se_directory <- file.path(TCGA, "RPPA/raw_data/SummarizedExperiments/")
+#Path to directory you want to output to
+output_directory <- file.path(PATH, "data/RPPA/processed_SummarizedExperiments")
+```
+
+
+Here we load in a single TCGA project (BRCA) to show the workflow
+```{r Load in BRCA object}
+BRCA_RPPA <- readRDS(file.path(TCGA,"RPPA/raw_data/SummarizedExperiments/TCGA-BRCA_RPPA.rds"))
+```
+
+## Quality Control
+RPPA data quality control guidelines are almost non existent. We should consider finding
+resources on this. 
+
+Regardless, I will remove Samples with >20% missing values and proteins with >20% missing samples. The number of removed proteins/samples are printed. 
+
+```{r}
+filter_samples_proteins <- function(se_obj, max_missing = 20) {
+    # Calculate percentage of missing values for each row and column
+    row_na_percentage <- rowMeans(is.na(assay(se_obj))) * 100
+    col_na_percentage <- colMeans(is.na(assay(se_obj))) * 100
+
+    # Filter out rows and columns with more than max_missing% missing values
+    se_obj_filtered <- se_obj[row_na_percentage <= max_missing, col_na_percentage <= max_missing]
+    
+    protein_removed <- dim(se_obj)[1] - dim(se_obj_filtered)[1]
+    subjects_removed <- dim(se_obj)[2] - dim(se_obj_filtered)[2]
+
+    print(paste0("Number of Proteins with >20% missing value removed : ",protein_removed))
+    print(paste0("Number of Samples with >20% missing value removed : ",subjects_removed))
+
+    # Return the filtered object
+    return(se_obj_filtered)
+}
+
+BRCA_RPPA_filtered <- filter_samples_proteins(BRCA_RPPA)
+
+```
+
+## Imputation 
+Here we use K nearest-neighbor to impute missing feature data. 
+This uses the `impute` package to estimate missing values based 
+
+When using impute.knn, each missing value in a feature (column) is imputed by considering its nearest neighbors. 
+The neighbors are identified based on the similarity across all other features for a given sample.
+Essentially, for each missing value, the function looks across other samples (rows) 
+to find the ones most similar (the nearest neighbors) based on all the other features.
+
+In this case, the nearest neighbors for a given sample are determined by looking at other samples (rows) and comparing their features (columns), excluding the feature with the missing value.
+
+*Note after further discussion, we do NOT impute the missing data. The code remains here incase we would like to at a future point. 
+```{r handling missing values}
+#Check number of columns with a missing features
+num_columns_with_na <- sum(apply(SummarizedExperiment::assay(BRCA_RPPA_filtered), 1, function(x) any(is.na(x))))
+paste0("Number of features with missing values: ", num_columns_with_na)
+
+total_data_points <- prod(dim(SummarizedExperiment::assay(BRCA_RPPA_filtered)))
+num_missing_values_before <- sum(is.na(SummarizedExperiment::assay(BRCA_RPPA_filtered)))
+
+paste0("Number of missing values: ", num_missing_values_before, " out of ", total_data_points)
+```
+
+```{r impute,include = FALSE}
+impute_missing_values <- function(se_obj, k = 5) {
+    # Perform KNN imputation
+    data_imputed <- impute.knn(as.matrix(SummarizedExperiment::assay(se_obj)), k = k)$data
+    return(data_imputed)
+}
+
+#data_imputed <- impute_missing_values(BRCA_RPPA_filtered)
+```
+
+```{r check impute results,eval = FALSE, include = FALSE }
+#Check remaining columns with missing feature (should be zero)
+num_columns_with_na_imp <- sum(apply(data_imputed, 1, function(x) any(is.na(x))))
+paste0("Number of features with missing values after imputation: ", num_columns_with_na_imp)
+
+#Get the percent computed
+percent_imputed <- (num_missing_values_before / total_data_points) * 100
+paste0("Percentage of data imputed: ", percent_imputed, "%")
+
+if (identical(rownames(data_imputed), rownames(BRCA_RPPA_filtered)) && 
+    identical(colnames(data_imputed), colnames(BRCA_RPPA_filtered))) {
+  SummarizedExperiment::assay(BRCA_RPPA_filtered) <- data_imputed
+}
+
+paste0("Number of NA values after imputation: " ,sum(is.na(SummarizedExperiment::assay(BRCA_RPPA_filtered))))
+```
+
+
+## Comment on Normalization
+The TCGA RPPA were processed at MD Anderson Cancer Center, which provided this comment
+on data normalization:
+
+We perform 2 sets of normalization procedures:  (1) normalization for protein loading for all samples within a set (Level 3 data) and (2) debatching across sets by replicates-based normalization (RBN, Level 4 data).  Unlike Western blots where only one protein is used (e.g., β-Actin or GAPDH), we use the entire panel of antibodies to normalize for protein loading.  Normalization for Level 3 data involves bidirectionally median centering a table consisting of rows of all 1056 samples and columns of all reported antibodies.  (See example)  
+
+RBN involves normalizing by taking identical (technically replicated) control samples in the given set with an invariant control sample set and applying the adjustment (differences in means × inverse of standard deviation ratio) to each corresponding data point to produce Level 4 data.  Level 4 data enables comparison of results across different RPPA Core sets.  (Click on RBN for more details.)  
+
+The median of each antibody median-centered sample in Level 3 data generation is referred to as “Total Protein Content” (TPC) and reflects the sample’s average signal across the entire antibody panel.  Low values reflect low average signal of the sample while high values reflect high average signal.  Any sample with a TPC <-3 is considered too low for reliable quantification results.  We recommend carefully reviewing or censoring these results. 
+
+Link:https://www.mdanderson.org/research/research-resources/core-facilities/functional-proteomics-rppa-core/faq.html
+
+
+```{r Normalization check}
+long_format <- reshape2::melt(SummarizedExperiment::assay(BRCA_RPPA_filtered))
+
+unique_samples <- unique(long_format$variable)
+
+# Sample 5 unique sample IDs
+set.seed(123) # For reproducibility
+selected_samples <- sample(unique_samples, 10)
+
+# Now subset the original data for only those 5 samples
+sampled_data_small <- long_format[long_format$variable %in% selected_samples, ]
+
+#Box plot of samples data
+ggplot2::ggplot(sampled_data_small, aes(x = variable, y = value)) + 
+  ggplot2::geom_boxplot() +
+  ggplot2::labs(title = "Boxplot of RPPA Values for 10 Samples - BRCA", x = "Sample", y = "RPPA Values") +
+  ggplot2::theme(axis.text.x = element_text(angle = 45, hjust = 1))  # Rotate x-axis labels if they overlap
+
+# Density graph of sampled data 
+ggplot2::ggplot(long_format, aes(x = value)) +
+  ggplot2::geom_density() +
+  ggplot2::labs(title = "Density of RPPA Values - BRCA", x = "RPPA Values", y = "Density")
+
+#Histogram of beta-values for all data
+ggplot2::ggplot(long_format, aes(x = value)) +
+  ggplot2::geom_histogram(bins = 30, fill = 'blue', color = 'black') +
+  ggplot2::labs(title = "Histogram of RPPA Values - BRCA", x = "RPPA Values", y = "Frequency")
+```
+
+## Apply Filtering to all TCGA projects
+Here we apply the two defined functions to all TCGA projects to perform filtering.
+
+Note: A different number of proteins may be removed from each project, which could be troublesome. 
+
+This code block outputs the now filtered SummarizedExperiment objects to the "output directory"
+variable : /restricted/projectnb/agedisease/projects/pancancer_aging/data/RPPA/filtered_SummarizedExperiments
+
+```{r Filter Folder of Summarized Experiments}
+#Creates a list of all files ending in .rds in se_directory
+file_list <- list.files(path = se_directory, pattern = "*.rds", full.names = TRUE)
+# Loop through each file
+# Loop through each file
+for (file_path in file_list) {
+    cat("Processing ", file_path, "\n")
+  
+    # Read the SummarizedExperiment object
+    se_obj <- readRDS(file_path)
+
+    # Filter samples and proteins
+    se_obj_filtered <- filter_samples_proteins(se_obj)
+    cat("\n\n")
+
+    # Impute missing values
+    #se_obj_imputed <- impute_missing_values(se_obj_filtered)
+
+    # Save the processed object (change path accordingly)
+    saveRDS(se_obj_filtered, file.path(output_directory, basename(file_path)))
+}
+
+
+```
+
+
+## Session Info
+```{r session info}
+sessionInfo()
+```

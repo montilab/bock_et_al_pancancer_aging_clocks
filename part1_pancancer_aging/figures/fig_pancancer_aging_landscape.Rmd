@@ -1,0 +1,741 @@
+---
+title: "Pan-cancer age-associated molecular changes"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+## Overview
+
+This script generates manuscript-oriented plots for part 1 from the official derived outputs:
+
+- per-layer counts and direction of age-associated features,
+- a multi-omic cancer similarity dendrogram using the layer set selected in `03_prepare_clustering.Rmd`,
+- an RNA-seq Hallmark GSEA combined heatmap (currently unused in the main manuscript figure),
+- within- versus between-organ-system pairwise distances by molecular layer.
+
+The similarity dendrogram and within- versus between-organ-system comparison both rely on
+`pancancer_clustering_results.rds`, which contains the layer-inclusion diagnostics,
+retained-layer similarity matrices, the per-pair overlap floor used during averaging,
+and the final hierarchical clustering. This script reads those outputs directly without
+re-deriving them. Not every plot generated here is necessarily included in the published
+manuscript, and final multi-panel assembly may be performed in Adobe Illustrator.
+
+## Libraries
+
+```{r}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggplot2)
+  library(here)
+  library(ape)
+  library(ggtree)
+  library(pheatmap)
+  library(cba)
+  library(reactable)
+})
+```
+
+## Paths
+
+```{r}
+import_file <- here::here(
+  "results", "derived", "part1", "01_import_official_results", "part1_imported_results.rds"
+)
+
+gsea_file <- here::here(
+  "results", "derived", "part1", "02_rnaseq_hallmark_gsea", "rnaseq_hallmark_gsea_results.rds"
+)
+
+clustering_file <- here::here(
+  "results", "derived", "part1", "03_prepare_clustering", "pancancer_clustering_results.rds"
+)
+
+missing_files <- c(import_file, gsea_file, clustering_file)[!file.exists(c(import_file, gsea_file, clustering_file))]
+if (length(missing_files) > 0) {
+  stop(
+    "Missing required inputs. Run the part-1 prep Rmds first:\n",
+    paste(missing_files, collapse = "\n")
+  )
+}
+
+fig_dir <- here::here("results", "figures", "part1")
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Load official derived results
+
+```{r}
+part1_imported_results <- readRDS(import_file)
+rnaseq_hallmark_gsea   <- readRDS(gsea_file)
+pancancer_clustering   <- readRDS(clustering_file)
+```
+
+## Per-layer age-associated feature counts
+
+```{r}
+fig1a_long <- part1_imported_results$fig1a_long
+
+p_fig1A <- ggplot(fig1a_long, aes(x = Cancer, y = Count, fill = Regulation)) +
+  geom_bar(stat = "identity", position = "identity") +
+  scale_fill_manual(
+    values = c("Positive" = "red", "Negative" = "blue"),
+    labels = c(
+      "Positive" = "Positive Age-Association",
+      "Negative" = "Negative Age-Association"
+    )
+  ) +
+  labs(
+    x = NULL,
+    y = "Number of Age-Associated Features",
+    fill = NULL
+  ) +
+  facet_wrap(~Layer, scales = "free_x", nrow = 1) +
+  coord_flip() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  theme_minimal() +
+  theme(
+    panel.spacing       = unit(0.8, "cm"),
+    panel.grid.major.y  = element_blank(),
+    panel.grid.minor.y  = element_blank(),
+    axis.text.x         = element_text(size = 10),
+    axis.text.y         = element_text(size = 8),
+    strip.background    = element_blank(),
+    strip.text.x        = element_text(size = 12),
+    legend.position     = "bottom"
+  )
+
+p_fig1A
+
+ggsave(
+  filename = file.path(fig_dir, "multiomics_age_association.pdf"),
+  plot     = p_fig1A,
+  width    = 7.5,
+  height   = 5.25,
+  units    = "in"
+)
+
+fig1a_axis_ranges <- fig1a_long %>%
+  dplyr::group_by(Layer) %>%
+  dplyr::summarise(
+    min_count = round(min(Count, na.rm = TRUE)),
+    max_count = round(max(Count, na.rm = TRUE)),
+    .groups   = "drop"
+  )
+
+reactable(fig1a_axis_ranges)
+```
+
+## Multi-omic similarity dendrogram
+
+The clustering is computed in `03_prepare_clustering.Rmd` from the four
+retained layers (Methylation, RNA-seq, miRNA, SCNA), with a per-pair
+feature-overlap floor applied during cross-layer averaging. This chunk only
+renders the saved `hclust` object as an organ-system-annotated tree.
+
+```{r}
+hc_pw_opt <- pancancer_clustering$hclust
+
+selected_tree_obj    <- ape::as.phylo(hc_pw_opt)
+selected_orig_labels <- selected_tree_obj$tip.label
+selected_clean_labels <- stringr::str_remove(selected_orig_labels, "^TCGA-")
+selected_tree_obj$tip.label <- selected_clean_labels
+
+selected_anno_df <- part1_imported_results$organ_annotations %>%
+  dplyr::filter(Project %in% selected_orig_labels) %>%
+  dplyr::mutate(label = stringr::str_remove(Project, "^TCGA-")) %>%
+  dplyr::select(label, Organ_System)
+
+p_fig1B <- ggtree(selected_tree_obj, layout = "rectangular", branch.length = "none") %<+% selected_anno_df +
+  geom_tiplab(size = 3, align = TRUE, linetype = 0, offset = 0.3) +
+  geom_tippoint(aes(color = Organ_System), size = 3) +
+  scale_color_manual(
+    name   = "Organ System",
+    values = part1_imported_results$organ_palette
+  ) +
+  theme_tree2() +
+  theme(
+    legend.position = "right",
+    plot.title      = element_blank(),
+    axis.text.x     = element_blank(),
+    axis.ticks.x    = element_blank(),
+    plot.margin     = margin(5, 0, 5, 5),
+    text            = element_text(size = 8),
+    legend.text     = element_text(size = 9),
+    legend.title    = element_text(size = 10),
+    legend.key.size = unit(4, "mm")
+  )
+
+selected_max_x <- max(p_fig1B$data$x, na.rm = TRUE)
+p_fig1B <- p_fig1B + xlim(0, selected_max_x + 1.5)
+
+p_fig1B
+
+ggsave(
+  filename = file.path(fig_dir, "cancer_clustering_tree.pdf"),
+  plot     = p_fig1B,
+  width    = 4.5,
+  height   = 5,
+  units    = "in"
+)
+```
+
+## RNA-seq Hallmark GSEA heatmap (currently unused in the manuscript)
+
+Filtered combined heatmap: rows are Hallmark gene sets significant in at
+least 6 cancers, grouped by the pathway-category scheme used elsewhere in the manuscript.
+Within each category, rows are ordered by hierarchical clustering on the
+signed enrichment scores (Pearson distance, Ward.D linkage, optimal leaf
+ordering). Columns are clustered the same way using Euclidean distance.
+Cell colors show direction-and-significance bins (±2 highly sig.
+FDR ≤ 0.01, ±1 moderately sig. FDR ≤ 0.05, 0 not significant).
+
+```{r}
+# --- Pathway category mapping ------------------------------------------------
+# Same pathway-category scheme used elsewhere in the manuscript. A few Hallmark
+# labels need cleaning so they
+# match the keys in `hallmark_category_map`.
+clean_pathway_label <- function(x) {
+  dplyr::recode(
+    x,
+    "Reactive Oxygen Species Pathway" = "ROS Pathway",
+    "Il2 Stat5 Signaling"             = "IL2/STAT5 Signaling",
+    "Tnfa Signaling Via Nfkb"         = "TNFA Signaling via NFKB",
+    "Pi3k Akt Mtor Signaling"         = "PI3K/AKT/MTOR Signaling",
+    "Interferon Alpha Response"       = "Interferon Alpha",
+    "Interferon Gamma Response"       = "Interferon Gamma",
+    .default = x
+  )
+}
+
+hallmark_category_map <- c(
+  # Proliferation
+  "E2f Targets" = "Proliferation", "G2m Checkpoint" = "Proliferation",
+  "Mitotic Spindle" = "Proliferation", "Myc Targets V1" = "Proliferation",
+  "Myc Targets V2" = "Proliferation",
+  # Immune
+  "Allograft Rejection" = "Immune", "Complement" = "Immune",
+  "Coagulation" = "Immune", "IL2/STAT5 Signaling" = "Immune",
+  "Il6 Jak Stat3 Signaling" = "Immune", "Inflammatory Response" = "Immune",
+  "Interferon Alpha" = "Immune", "Interferon Gamma" = "Immune",
+  "TNFA Signaling via NFKB" = "Immune",
+  # Metabolic
+  "Adipogenesis" = "Metabolic", "Bile Acid Metabolism" = "Metabolic",
+  "Cholesterol Homeostasis" = "Metabolic", "Fatty Acid Metabolism" = "Metabolic",
+  "Glycolysis" = "Metabolic", "Heme Metabolism" = "Metabolic",
+  "Oxidative Phosphorylation" = "Metabolic", "Peroxisome" = "Metabolic",
+  "Xenobiotic Metabolism" = "Metabolic",
+  # Stress / Damage
+  "Apoptosis" = "Stress / Damage", "Dna Repair" = "Stress / Damage",
+  "Hypoxia" = "Stress / Damage", "P53 Pathway" = "Stress / Damage",
+  "ROS Pathway" = "Stress / Damage", "Unfolded Protein Response" = "Stress / Damage",
+  "Uv Response Dn" = "Stress / Damage", "Uv Response Up" = "Stress / Damage",
+  # Signaling
+  "Hedgehog Signaling" = "Signaling", "Kras Signaling Dn" = "Signaling",
+  "Kras Signaling Up" = "Signaling", "Mtorc1 Signaling" = "Signaling",
+  "Notch Signaling" = "Signaling", "PI3K/AKT/MTOR Signaling" = "Signaling",
+  "Tgf Beta Signaling" = "Signaling", "Wnt Beta Catenin Signaling" = "Signaling",
+  # Hormone
+  "Androgen Response" = "Hormone", "Estrogen Response Early" = "Hormone",
+  "Estrogen Response Late" = "Hormone",
+  # Cell State
+  "Angiogenesis" = "Cell State", "Apical Junction" = "Cell State",
+  "Apical Surface" = "Cell State", "Epithelial Mesenchymal Transition" = "Cell State",
+  "Myogenesis" = "Cell State", "Pancreas Beta Cells" = "Cell State",
+  "Protein Secretion" = "Cell State", "Spermatogenesis" = "Cell State"
+)
+
+assign_pathway_category <- function(pathway) {
+  pathway <- clean_pathway_label(pathway)
+  out <- unname(hallmark_category_map[pathway])
+  out[is.na(out)] <- "Other"
+  out
+}
+
+pathway_category_levels <- c(
+  "Proliferation", "Immune", "Metabolic", "Stress / Damage",
+  "Signaling", "Hormone", "Cell State", "Other"
+)
+
+# --- Significance filter -----------------------------------------------------
+# Keep gene sets significant (FDR ≤ 0.05) in ≥ 6 cancers.
+min_sig_cancers <- 20
+
+sig_labels <- rnaseq_hallmark_gsea$gsea_best %>%
+  dplyr::group_by(label) %>%
+  dplyr::summarise(
+    n_sig_cancers = sum(fdr <= 0.05, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::filter(n_sig_cancers >= min_sig_cancers) %>%
+  dplyr::pull(label)
+
+threshold_matrix <- rnaseq_hallmark_gsea$threshold_matrix[sig_labels, , drop = FALSE]
+score_matrix     <- rnaseq_hallmark_gsea$score_matrix[sig_labels, , drop = FALSE]
+
+threshold_matrix[is.na(threshold_matrix)] <- 0
+score_matrix[is.na(score_matrix)]         <- 0
+
+# Apply pretty pathway names and strip TCGA- prefixes
+rownames(threshold_matrix) <- clean_pathway_label(rownames(threshold_matrix))
+rownames(score_matrix)     <- clean_pathway_label(rownames(score_matrix))
+colnames(threshold_matrix) <- stringr::str_remove(colnames(threshold_matrix), "^TCGA-")
+colnames(score_matrix)     <- stringr::str_remove(colnames(score_matrix),     "^TCGA-")
+
+# --- Within-category row ordering -------------------------------------------
+hcopt <- function(d, HC = NULL, method = "ward.D", members = NULL) {
+  if (is.null(HC)) HC <- stats::hclust(d, method = method, members = members)
+  ORD <- cba::order.optimal(d, merge = HC$merge)
+  HC$merge <- ORD$merge
+  HC$order <- ORD$order
+  HC
+}
+
+row_categories <- assign_pathway_category(rownames(score_matrix))
+names(row_categories) <- rownames(score_matrix)
+
+row_order <- character(0)
+for (cat in pathway_category_levels) {
+  rows_in_cat <- names(row_categories)[row_categories == cat]
+  if (length(rows_in_cat) == 0) next
+  if (length(rows_in_cat) == 1) {
+    row_order <- c(row_order, rows_in_cat)
+    next
+  }
+  sub_score <- score_matrix[rows_in_cat, , drop = FALSE]
+  sub_dist  <- as.dist(1 - stats::cor(t(sub_score), use = "pairwise.complete.obs"))
+  sub_hc    <- hcopt(sub_dist, method = "ward.D")
+  row_order <- c(row_order, rows_in_cat[sub_hc$order])
+}
+
+threshold_matrix <- threshold_matrix[row_order, , drop = FALSE]
+score_matrix     <- score_matrix[row_order, , drop = FALSE]
+row_categories   <- row_categories[row_order]
+
+# --- Column clustering --------------------------------------------------------
+col_dist <- stats::dist(t(score_matrix))
+col_hc   <- hcopt(col_dist, method = "ward.D")
+
+# --- Annotations and gap positions ------------------------------------------
+organ_df <- part1_imported_results$organ_annotations %>%
+  dplyr::mutate(Project = stringr::str_remove(Project, "^TCGA-")) %>%
+  dplyr::filter(Project %in% colnames(threshold_matrix)) %>%
+  dplyr::arrange(match(Project, colnames(threshold_matrix))) %>%
+  tibble::column_to_rownames("Project") %>%
+  dplyr::select(`Organ System` = Organ_System)
+
+category_df <- data.frame(
+  `Pathway Category` = factor(row_categories, levels = pathway_category_levels),
+  row.names = rownames(threshold_matrix),
+  check.names = FALSE
+)
+
+# Gaps between pathway categories
+category_counts <- as.numeric(table(factor(row_categories, levels = pathway_category_levels)))
+category_counts <- category_counts[category_counts > 0]
+gaps_row <- head(cumsum(category_counts), -1)
+
+# --- Colors -----------------------------------------------------------------
+heatmap_colors <- c("blue", "lightblue", "white", "pink", "red")
+heatmap_breaks <- c(-2.5, -1.5, -0.5, 0.5, 1.5, 2.5)
+
+category_palette <- setNames(
+  RColorBrewer::brewer.pal(8, "Set2"),
+  pathway_category_levels
+)
+
+# --- Render ------------------------------------------------------------------
+p_fig1C <- pheatmap::pheatmap(
+  threshold_matrix,
+  color             = heatmap_colors,
+  breaks            = heatmap_breaks,
+  cluster_rows      = FALSE,             # rows pre-ordered by category + within-cat clustering
+  cluster_cols      = col_hc,
+  gaps_row          = gaps_row,
+  annotation_row    = category_df,
+  annotation_col    = organ_df,
+  annotation_colors = list(
+    `Pathway Category` = category_palette,
+    `Organ System`     = part1_imported_results$organ_palette
+  ),
+  annotation_legend = TRUE,
+  legend            = FALSE,
+  show_rownames     = TRUE,
+  show_colnames     = TRUE,
+  angle_col         = 45,
+  fontsize          = 10,
+  fontsize_row      = 9,
+  fontsize_col      = 9,
+  treeheight_row    = 8,
+  treeheight_col    = 8,
+  cellwidth         = 12,
+  cellheight        = 9,
+  main              = ""
+)
+
+# Save to PDF
+pdf(
+  file   = file.path(fig_dir, "pathway_gsea_heatmap_filtered.pdf"),
+  width  = 11,
+  height = 7
+)
+print(p_fig1C)
+dev.off()
+```
+
+### Horizontal version (cancers as rows, pathways as columns)
+
+Same data, ordering, and palettes as the vertical version above; only the
+matrices are transposed. Row names render on the right by default in
+pheatmap; flip them to the left in Illustrator if needed for layout
+alignment.
+
+```{r}
+threshold_matrix_h <- t(threshold_matrix)
+
+# Pathway category factor in column order
+column_categories <- factor(unname(row_categories), levels = pathway_category_levels)
+
+# Annotations swap sides: pathway category becomes a column annotation,
+# organ system becomes a row annotation.
+category_df_h <- data.frame(
+  `Pathway Category` = column_categories,
+  row.names = colnames(threshold_matrix_h),
+  check.names = FALSE
+)
+
+organ_df_h <- organ_df  # rownames = cancers, column = "Organ System"
+
+# Gaps between pathway category groups (now between columns)
+gaps_col <- gaps_row    # same cumulative counts, just applied to columns now
+
+p_fig1C_h <- pheatmap::pheatmap(
+  threshold_matrix_h,
+  color             = heatmap_colors,
+  breaks            = heatmap_breaks,
+  cluster_rows      = col_hc,             # same cancer clustering as the vertical
+  cluster_cols      = FALSE,              # pathways pre-ordered within categories
+  gaps_col          = gaps_col,
+  annotation_row    = organ_df_h,
+  annotation_col    = category_df_h,
+  annotation_colors = list(
+    `Pathway Category` = category_palette,
+    `Organ System`     = part1_imported_results$organ_palette
+  ),
+  annotation_legend = TRUE,
+  legend            = FALSE,
+  show_rownames     = TRUE,
+  show_colnames     = TRUE,
+  angle_col         = 45,
+  fontsize          = 10,
+  fontsize_row      = 9,
+  fontsize_col      = 9,
+  treeheight_row    = 8,
+  treeheight_col    = 8,
+  cellwidth         = 12,
+  cellheight        = 9,
+  main              = ""
+)
+
+pdf(
+  file   = file.path(fig_dir, "pathway_gsea_heatmap_horizontal.pdf"),
+  width  = 13,
+  height = 8
+)
+print(p_fig1C_h)
+dev.off()
+```
+
+## Within- vs between-organ-system pairwise distance (per layer)
+
+Per-pair distances are masked at the same per-pair feature-overlap floor used
+in the clustering averaging step. Pairs below the floor in a given layer are
+dropped from that layer's plot and from its permutation test. Each layer is
+then evaluated on the cancers it measured, so the cancer set and the retained
+organ systems are defined per layer and the panels differ in the number of
+pairs they test. Significance is assessed by shuffling organ labels among that
+layer's cancers, which holds the distance matrix fixed while breaking only the
+organ assignment.
+
+```{r within_between_organ_distances}
+organ_lookup <- setNames(
+  part1_imported_results$organ_annotations$Organ_System,
+  part1_imported_results$organ_annotations$Project
+)
+
+# Masked pair-distance extraction. A pair is dropped (NA) for a layer if its
+# per-pair feature overlap in that layer is below the clustering floor.
+similarity_to_pair_df <- function(sim_mat, overlap_mat, organ_lookup,
+                                  layer_label, min_overlap) {
+  cancers <- colnames(sim_mat)
+  d_mat   <- 1 - sim_mat
+  d_mat[overlap_mat < min_overlap] <- NA
+
+  ij <- which(upper.tri(d_mat), arr.ind = TRUE)
+
+  tibble::tibble(
+    cancer1  = cancers[ij[, 1]],
+    cancer2  = cancers[ij[, 2]],
+    organ1   = organ_lookup[cancers[ij[, 1]]],
+    organ2   = organ_lookup[cancers[ij[, 2]]],
+    distance = as.numeric(d_mat[ij]),
+    layer    = layer_label
+  )
+}
+
+layer_label_map <- c(
+  "Methylation" = "Methylation",
+  "RNAseq"      = "RNA-seq",
+  "miRNA"       = "miRNA",
+  "SCNA"        = "SCNA"
+)
+
+panel_levels <- unname(layer_label_map[pancancer_clustering$selected_layers])
+
+min_overlap <- pancancer_clustering$thresholds$MIN_PAIR_OVERLAP
+
+per_layer_pairs <- purrr::imap_dfr(
+  pancancer_clustering$similarity_by_layer,
+  function(sim, layer_id) {
+    similarity_to_pair_df(
+      sim_mat      = sim,
+      overlap_mat  = pancancer_clustering$pair_overlap_by_layer[[layer_id]],
+      organ_lookup = organ_lookup,
+      layer_label  = layer_label_map[[layer_id]],
+      min_overlap  = min_overlap
+    )
+  }
+)
+
+# Per-layer eligibility. Each layer is tested on the cancers it measured, so
+# the cancer set comes from that layer's own pairs rather than from the
+# clustered cancer set. Masking runs first: a pair below the overlap floor is
+# already NA here, so a cancer whose pairs are all masked does not enter the
+# layer. Organ systems with fewer than two cancers in the layer contribute no
+# within-organ pairs and are dropped from that layer.
+eligible_by_layer   <- list()
+all_pairs_by_layer  <- list()
+filter_summary_list <- list()
+
+for (lyr in panel_levels) {
+  layer_pairs <- per_layer_pairs %>%
+    dplyr::filter(layer == lyr)
+
+  layer_pairs_kept <- layer_pairs %>%
+    dplyr::filter(is.finite(distance), !is.na(organ1), !is.na(organ2))
+
+  layer_cancers     <- union(layer_pairs_kept$cancer1, layer_pairs_kept$cancer2)
+  layer_organ_n     <- table(organ_lookup[layer_cancers])
+  layer_multi_organ <- names(layer_organ_n[layer_organ_n >= 2])
+
+  eligible_by_layer[[lyr]] <- layer_cancers[
+    organ_lookup[layer_cancers] %in% layer_multi_organ
+  ]
+
+  all_pairs_by_layer[[lyr]] <- layer_pairs_kept %>%
+    dplyr::filter(
+      cancer1 %in% eligible_by_layer[[lyr]],
+      cancer2 %in% eligible_by_layer[[lyr]]
+    )
+
+  filter_summary_list[[lyr]] <- tibble::tibble(
+    layer                 = lyr,
+    n_cancers_in_layer    = length(union(layer_pairs$cancer1, layer_pairs$cancer2)),
+    n_cancers_after_floor = length(layer_cancers),
+    n_cancers_eligible    = length(eligible_by_layer[[lyr]]),
+    n_organ_systems       = length(layer_multi_organ),
+    n_pairs_in_layer      = nrow(layer_pairs),
+    n_pairs_below_floor   = sum(!is.finite(layer_pairs$distance)),
+    n_pairs_tested        = nrow(all_pairs_by_layer[[lyr]])
+  )
+}
+
+all_pairs <- dplyr::bind_rows(all_pairs_by_layer) %>%
+  dplyr::mutate(
+    pair_type = ifelse(organ1 == organ2, "Within Organ", "Between Organ"),
+    pair_type = factor(pair_type, levels = c("Within Organ", "Between Organ")),
+    layer     = factor(layer, levels = panel_levels)
+  )
+
+filter_summary <- dplyr::bind_rows(filter_summary_list) %>%
+  dplyr::mutate(layer = factor(layer, levels = panel_levels))
+
+reactable(filter_summary)
+
+sig_label <- function(p) {
+  dplyr::case_when(
+    p < 0.01  ~ "**",
+    p < 0.05  ~ "*",
+    TRUE      ~ "n.s."
+  )
+}
+
+N_PERM    <- 10000
+PERM_SEED <- 20260731
+
+empirical_two_sided_p <- function(observed, null) {
+  null <- null[is.finite(null)]
+
+  p_upper <- (1 + sum(null >= observed)) / (length(null) + 1)
+  p_lower <- (1 + sum(null <= observed)) / (length(null) + 1)
+
+  min(1, 2 * min(p_upper, p_lower))
+}
+
+rank_permutation_p <- function(distance, cancer1, cancer2, organ1, organ2,
+                               eligible_cancers, perm_org_mat) {
+  within  <- organ1 == organ2
+  between <- !within
+  ranks   <- rank(distance, ties.method = "average")
+
+  observed <- mean(ranks[between]) - mean(ranks[within])
+
+  idx1 <- match(cancer1, eligible_cancers)
+  idx2 <- match(cancer2, eligible_cancers)
+
+  if (anyNA(idx1) || anyNA(idx2)) {
+    stop("Cancer matching failed in permutation test.")
+  }
+
+  within_perm <-
+    perm_org_mat[idx1, , drop = FALSE] ==
+    perm_org_mat[idx2, , drop = FALSE]
+
+  n_within_perm  <- colSums(within_perm)
+  n_between_perm <- length(distance) - n_within_perm
+  valid           <- n_within_perm > 0 & n_between_perm > 0
+
+  total_rank      <- sum(ranks)
+  within_rank_sum <- colSums(within_perm * ranks)
+
+  null <- rep(NA_real_, ncol(perm_org_mat))
+  null[valid] <-
+    (total_rank - within_rank_sum[valid]) / n_between_perm[valid] -
+    within_rank_sum[valid] / n_within_perm[valid]
+
+  empirical_two_sided_p(observed, null)
+}
+
+set.seed(PERM_SEED)
+
+# Organ labels are shuffled among the cancers eligible in each layer, so each
+# layer's null preserves its own organ-system sizes.
+perm_org_by_layer <- list()
+
+for (lyr in panel_levels) {
+  layer_organs <- unname(organ_lookup[eligible_by_layer[[lyr]]])
+  perm_org_by_layer[[lyr]] <- vapply(
+    seq_len(N_PERM),
+    function(b) sample(layer_organs, size = length(layer_organs), replace = FALSE),
+    FUN.VALUE = layer_organs
+  )
+}
+
+perm_per_layer <- all_pairs %>%
+  dplyr::group_by(layer) %>%
+  dplyr::summarise(
+    p_value = rank_permutation_p(
+      distance         = distance,
+      cancer1          = cancer1,
+      cancer2          = cancer2,
+      organ1           = organ1,
+      organ2           = organ2,
+      eligible_cancers = eligible_by_layer[[as.character(layer[1])]],
+      perm_org_mat     = perm_org_by_layer[[as.character(layer[1])]]
+    ),
+    n_within       = sum(pair_type == "Within Organ"),
+    n_between      = sum(pair_type == "Between Organ"),
+    median_within  = median(distance[pair_type == "Within Organ"]),
+    median_between = median(distance[pair_type == "Between Organ"]),
+    .groups        = "drop"
+  ) %>%
+  dplyr::mutate(
+    sig_label = sig_label(p_value),
+    layer     = factor(layer, levels = panel_levels)
+  )
+
+utils::write.csv(
+  perm_per_layer,
+  file = file.path(fig_dir, "within_vs_between_organ_summary.csv"),
+  row.names = FALSE
+)
+
+reactable(perm_per_layer)
+
+x_global_max <- max(all_pairs$distance, na.rm = TRUE)
+x_global_min <- min(all_pairs$distance, na.rm = TRUE)
+x_pad        <- (x_global_max - x_global_min) * 0.06
+
+sig_anno_df <- perm_per_layer %>%
+  dplyr::mutate(x_position = x_global_max + x_pad)
+
+pair_fill_values <- c("Within Organ" = "#4DAF4A", "Between Organ" = "grey75")
+
+p_fig1D <- ggplot(all_pairs, aes(x = distance, y = pair_type, fill = pair_type)) +
+  geom_boxplot(outlier.size = 0.4, width = 0.55, alpha = 0.85) +
+  geom_jitter(height = 0.16, size = 0.3, alpha = 0.25) +
+  geom_segment(
+    data = sig_anno_df,
+    aes(x = x_position, xend = x_position, y = 1, yend = 2),
+    inherit.aes = FALSE, linewidth = 0.3
+  ) +
+  geom_segment(
+    data = sig_anno_df,
+    aes(x = x_position - x_pad * 0.3, xend = x_position, y = 1, yend = 1),
+    inherit.aes = FALSE, linewidth = 0.3
+  ) +
+  geom_segment(
+    data = sig_anno_df,
+    aes(x = x_position - x_pad * 0.3, xend = x_position, y = 2, yend = 2),
+    inherit.aes = FALSE, linewidth = 0.3
+  ) +
+  geom_text(
+    data = sig_anno_df,
+    aes(x = x_position + x_pad * 0.3, y = 1.5, label = sig_label),
+    inherit.aes = FALSE, size = 3, fontface = "bold"
+  ) +
+  scale_fill_manual(name = NULL, values = pair_fill_values) +
+  scale_x_continuous(expand = expansion(mult = c(0.05, 0.22))) +
+  facet_wrap(~ layer, ncol = 1, strip.position = "right") +
+  labs(
+    x = "Distance (1 \u2212 Pearson)",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    legend.position    = "bottom",
+    legend.key.size    = unit(0.4, "cm"),
+    legend.text        = element_text(size = 10),
+    panel.grid.major.y = element_blank(),
+    axis.text.y        = element_blank(),
+    axis.ticks.y       = element_blank(),
+    strip.text.y       = element_text(size = 10, face = "bold", angle = 0),
+    strip.background   = element_blank(),
+    panel.spacing      = unit(0.3, "cm"),
+    plot.margin        = margin(4, 4, 4, 4)
+  )
+
+print(p_fig1D)
+
+ggsave(
+  filename = file.path(fig_dir, "within_between_combined.pdf"),
+  plot     = p_fig1D,
+  width    = 4,
+  height   = 5,
+  units    = "in"
+)
+
+scna_pairs <- per_layer_pairs[per_layer_pairs$layer == "SCNA", ]
+scna_kept  <- scna_pairs[is.finite(scna_pairs$distance), ]
+
+setdiff(
+  union(scna_pairs$cancer1, scna_pairs$cancer2),
+  union(scna_kept$cancer1, scna_kept$cancer2)
+)
+```

@@ -1,0 +1,743 @@
+---
+title: "04_SCNA_Regressions.Rmd"
+author: "Pranav Narnur - Monti Lab"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: united
+    css: themes/style.css
+    code_folding: hide
+    toc: true
+    toc_float:
+      collapsed: true
+      smooth_scroll: true
+    toc_depth: 3
+    df_print: paged
+params:
+  cancer_type: "TCGA-HNSC"
+  include_gender: TRUE
+  include_race: TRUE
+  races_included: "asian, black or african american, white"
+  include_subtype: FALSE
+  include_HPV_status: TRUE
+  include_grade: TRUE
+  grades_included: "G1, G2, G3, G4, GX"
+  include_purity: TRUE
+---
+
+# `r if (!is.null(params$cancer_type)) paste(params$cancer_type)`
+
+We perform, for each segment, a linear regression to detect whether patient age is significantly associated with SCNA GISTIC score. The SCNA GISTIC scores are binarized such that non-zero scores become a 1.
+
+```{r, setup, include = FALSE}
+set.seed(1)
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE,
+                      dev = "ragg_png", dpi = 300)
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(dplyr)
+library(maftools)
+library(broom)
+library(tidyverse)
+library(biomaRt)
+library(data.table)
+library(reshape2)
+library(reactable)
+library(htmlwidgets)
+library(GGally)
+library(data.table)
+library(patchwork)
+```
+
+```{r params}
+selected_cancer_type <- params$cancer_type
+include_gender <- params$include_gender
+include_race <- params$include_race
+include_HPV_status <- params$include_HPV_status
+include_subtype <- params$include_subtype
+include_grade <- params$include_grade
+include_purity <- params$include_purity
+
+races_included <- params$races_included
+if (length(races_included) == 1 && !is.na(races_included) && grepl(",", races_included)) {
+  races_included <- trimws(strsplit(races_included, ",")[[1]])
+}
+
+grades_included <- params$grades_included
+if (length(grades_included) == 1 && !is.na(grades_included) && grepl(",", grades_included)) {
+  grades_included <- trimws(strsplit(grades_included, ",")[[1]])
+}
+```
+
+```{r paths}
+DATA_ROOT <- "/restricted/projectnb/agedisease/projects/pancancer_aging/TCGA-GDC/scna/GISTIC"
+SCRIPT_ROOT <- "/restricted/projectnb/agedisease/projects/pancancer_aging/scripts/scna_pn"
+RESULTS_ROOT <- "/restricted/projectnb/agedisease/projects/pancancer_aging/results/scna_pn"
+
+path_filtered_SE <- file.path(DATA_ROOT, "processed_data", "filtered")
+TCGA <- file.path(Sys.getenv("CBMDATA", "/restricted/projectnb/agedisease/CBMrepositoryData/"), "TCGA-GDC")
+
+result_dir <- file.path(RESULTS_ROOT, selected_cancer_type)
+dir.create(result_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r helpers}
+source(file.path(SCRIPT_ROOT, "utils.r"))
+```
+
+```{r}
+covariates <- c()
+if (include_gender) covariates <- c(covariates, "gender")
+if (include_race) covariates <- c(covariates, "race")
+if (include_purity) covariates <- c(covariates, "purity")
+if (include_grade) covariates <- c(covariates, "grade")
+if (include_subtype) covariates <- c(covariates, "subtype_selected")
+
+cat("Covariates for", selected_cancer_type, ":", paste(covariates, collapse = ", "), "\n")
+```
+
+Model covariates for this cancer type:
+
+Gender: `r include_gender`
+Race: `r include_race`
+Subtype: `r include_subtype`
+HPV Status: `r include_HPV_status`
+Grade: `r include_grade`
+Purity: `r include_purity`
+
+# Functions
+
+## Linear regression function
+
+We perform, for each segment, a linear regression to detect whether patient age is significantly associated with SCNA GISTIC score.
+
+```{r}
+run_regression_scna <- function(se, assay, outcome, covariates = NULL, n_levels, min_group_size) {
+  mat <- SummarizedExperiment::assay(se, assay)
+  pheno <- as.data.frame(SummarizedExperiment::colData(se)[c(outcome, covariates)])
+
+  if (!is.null(covariates)) {
+    categorical_vars <- c("gender", "race", "grade")
+    categorical_vars <- categorical_vars[categorical_vars %in% covariates]
+    pheno[categorical_vars] <- lapply(pheno[categorical_vars], as.factor)
+  }
+
+  if (is.numeric(pheno[[outcome]]) == FALSE) {
+    pheno[[outcome]] <- as.numeric(pheno[[outcome]])
+  }
+
+  `n_-2` <- rowSums(mat == -2)
+  `n_-1` <- rowSums(mat == -1)
+  n_0 <- rowSums(mat == 0)
+  n_1 <- rowSums(mat == 1)
+  n_2 <- rowSums(mat == 2)
+
+  keep_feature <- logical()
+  for (i in seq_len(nrow(mat))) {
+    if (length(unique(mat[i, ])) < n_levels) {
+      keep_feature <- c(keep_feature, FALSE)
+      next
+    }
+    counts <- table(mat[i, ])
+    if (all(counts >= min_group_size)) {
+      keep_feature <- c(keep_feature, TRUE)
+    } else {
+      keep_feature <- c(keep_feature, FALSE)
+    }
+  }
+  features_to_test <- rownames(mat)[keep_feature]
+
+  if (length(features_to_test) == 0) {
+    warning("No features passed the filtering criteria.")
+    return(data.frame(
+      feature_name = character(),
+      beta = numeric(),
+      p_val = numeric(),
+      adj_p_val = numeric(),
+      se = numeric(),
+      stat = numeric()
+    ))
+  }
+
+  base_formula <- paste0(outcome, " ~ cna_vector")
+  if (!is.null(covariates) && length(covariates) > 0) {
+    covariates_part <- paste(covariates, collapse = " + ")
+    model_formula <- as.formula(paste(base_formula, covariates_part, sep = " + "))
+  } else {
+    model_formula <- as.formula(base_formula)
+  }
+
+  cat("Model formula:", deparse(model_formula), "\n")
+
+  results_df <- purrr::map_dfr(features_to_test, function(feature) {
+    cna_vector <- mat[feature, ]
+    model_data <- cbind(pheno, cna_vector)
+
+    tryCatch(
+      {
+        test_result <- lm(model_formula, data = model_data)
+        tidy_test_result <- broom::tidy(test_result) %>%
+          dplyr::filter(term == "cna_vector")
+
+        if (nrow(tidy_test_result) == 0) {
+          return(NULL)
+        }
+
+        data.frame(
+          p_val = pull(tidy_test_result["p.value"]),
+          beta = pull(tidy_test_result["estimate"]),
+          se = pull(tidy_test_result["std.error"]),
+          stat = pull(tidy_test_result["statistic"])
+        )
+      },
+      error = function(e) {
+        warning(paste0("Regression failed for feature: ", feature, " - ", e$message))
+        return(NULL)
+      }
+    )
+  }, .id = "feature_index")
+
+  if (nrow(results_df) == 0) {
+    warning("All regressions failed.")
+    return(data.frame(
+      feature_name = character(),
+      beta = numeric(),
+      p_val = numeric(),
+      adj_p_val = numeric(),
+      se = numeric(),
+      stat = numeric()
+    ))
+  }
+
+  final_df <- results_df %>%
+    mutate(feature_name = features_to_test[as.integer(feature_index)]) %>%
+    mutate(
+      `n_-2` = `n_-2`[feature_name],
+      `n_-1` = `n_-1`[feature_name],
+      n_0 = n_0[feature_name],
+      n_1 = n_1[feature_name],
+      n_2 = n_2[feature_name]
+    ) %>%
+    dplyr::select(feature_name, beta, p_val, se, stat, `n_-2`, `n_-1`, n_0, n_1, n_2)
+
+  if (n_levels == 2) {
+    final_df <- final_df %>% dplyr::select(-c(`n_-2`, `n_-1`, n_2))
+  }
+  if (n_levels == 3) {
+    final_df <- final_df %>% dplyr::select(-c(`n_-2`, `n_-1`))
+  }
+
+  final_df <- dplyr::mutate(final_df, adj_p_val = p.adjust(final_df$p_val, method = "BH"), .after = p_val)
+  rownames(final_df) <- NULL
+  return(final_df)
+}
+```
+
+## Plot age by GISTIC function
+
+```{r}
+plot_age_by_gistic <- function(segment_name, se_data, assay, segment_type, results_df) {
+  gistic_scores <- assay(se_data, assay)[segment_name, ]
+
+  plot_data <- data.frame(
+    Age = colData(se_data)$Age,
+    GISTIC_Score = factor(gistic_scores, levels = c("0", "1"))
+  ) %>%
+    filter(!is.na(Age))
+
+  counts <- table(plot_data$GISTIC_Score)
+  count_str <- paste(names(counts), "=", counts, collapse = ", ")
+
+  row <- results_df %>% filter(feature_name == segment_name)
+
+  if (nrow(row) == 0) {
+    adj_p <- "NA"
+    stat_val <- "NA"
+  } else {
+    adj_p <- format(row$adj_p_val, scientific = TRUE, digits = 3)
+    stat_val <- round(row$stat, 3)
+  }
+
+  ggplot(plot_data, aes(x = GISTIC_Score, y = Age, fill = GISTIC_Score)) +
+    geom_violin(alpha = 0.7) +
+    geom_boxplot(width = 0.1, alpha = 0.8, outlier.size = 0.5) +
+    scale_fill_manual(values = c("0" = "steelblue", "1" = "orange")) +
+    labs(
+      title = paste0(segment_name),
+      subtitle = paste0(count_str, " | adj_p = ", adj_p),
+      x = "GISTIC Score",
+      y = "Age (years)",
+      fill = "GISTIC Score"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "none")
+}
+```
+
+# Load Filtered Data
+
+Loading filtered SummarizedExperiment objects created by the EDA script.
+
+```{r}
+se_segment <- tryCatch(
+  {
+    readRDS(file.path(path_filtered_SE, paste0(selected_cancer_type, "_SCNA_GISTIC_segment.rds")))
+  },
+  error = function(e) {
+    stop(paste0("Could not load segment-level SE for ", selected_cancer_type, ": ", e$message))
+  }
+)
+
+cat("Loaded segment-level SE for", selected_cancer_type, "\n")
+cat("Number of samples:", ncol(se_segment), "\n")
+cat("Number of segments:", nrow(se_segment), "\n")
+
+if (ncol(se_segment) == 0) {
+  stop(paste0("No samples in filtered SE for ", selected_cancer_type))
+}
+```
+
+# Linear regression - segment level, thresholded, no covariates (Age ~ SCNA_level)
+
+## Remove segments from sex chromosomes
+
+```{r}
+se <- se_segment[grep("_X", rownames(se_segment), invert = TRUE), ]
+cat("After removing sex chromosome segments:", nrow(se), "segments remain\n")
+```
+
+## Run tests (no covariates)
+
+```{r}
+se_amp <- se[grep("Amplification", rownames(se)), ]
+se_del <- se[grep("Deletion", rownames(se)), ]
+
+cat("Amplification segments:", nrow(se_amp), "\n")
+cat("Deletion segments:", nrow(se_del), "\n")
+
+segment_two_level_amp <- data.frame()
+segment_two_level_del <- data.frame()
+
+if (nrow(se_amp) > 0) {
+  segment_two_level_amp <- run_regression_scna(
+    se_amp,
+    assay = "GISTIC_thresholded_two_level",
+    covariates = NULL,
+    outcome = "Age",
+    n_levels = 2,
+    min_group_size = 10
+  )
+}
+
+if (nrow(se_del) > 0) {
+  segment_two_level_del <- run_regression_scna(
+    se_del,
+    assay = "GISTIC_thresholded_two_level",
+    covariates = NULL,
+    outcome = "Age",
+    n_levels = 2,
+    min_group_size = 10
+  )
+}
+
+segment_two_level_no_cov <- rbind(segment_two_level_amp, segment_two_level_del)
+
+if (nrow(segment_two_level_no_cov) > 0) {
+  rowdata <- as.data.frame(rowData(se))
+  rowdata$feature_name <- rowdata$index
+  rowdata <- rowdata %>% dplyr::select(-c(index, chromosome, region_start, region_end, peak_start, peak_end, enlarged_peak_start, enlarged_peak_end))
+
+  segment_two_level_no_cov <- dplyr::left_join(segment_two_level_no_cov, rowdata, by = "feature_name")
+}
+
+saveRDS(segment_two_level_no_cov, file.path(result_dir, "lm_test_no_covariates_results_segment_level.rds"))
+cat("Saved segment-level no-covariate results to:", file.path(result_dir, "lm_test_no_covariates_results_segment_level.rds"), "\n")
+```
+
+## Results - All features (two levels) {.tabset}
+
+### All segments
+```{r}
+if (nrow(segment_two_level_no_cov) > 0) {
+  reactable_pretty(segment_two_level_no_cov)
+} else {
+  cat("No segments passed filtering criteria.\n")
+}
+```
+
+### Significant segments only (adj_p <= 0.05)
+
+```{r}
+if (nrow(segment_two_level_no_cov) > 0) {
+  sig_segments <- segment_two_level_no_cov %>%
+    dplyr::filter(adj_p_val <= 0.05)
+
+  if (nrow(sig_segments) > 0) {
+    reactable_pretty(sig_segments)
+  } else {
+    cat("No significant segments found (adj_p <= 0.05).\n")
+  }
+} else {
+  cat("No segments to display.\n")
+}
+```
+
+# Linear regression - segment level, thresholded, with covariates
+
+Covariates for `r selected_cancer_type`: `r paste(covariates, collapse = ", ")`
+
+```{r}
+segment_two_level_amp_cov <- data.frame()
+segment_two_level_del_cov <- data.frame()
+
+if (length(covariates) > 0) {
+  if (nrow(se_amp) > 0) {
+    segment_two_level_amp_cov <- run_regression_scna(
+      se_amp,
+      assay = "GISTIC_thresholded_two_level",
+      covariates = covariates,
+      outcome = "Age",
+      n_levels = 2,
+      min_group_size = 10
+    )
+  }
+
+  if (nrow(se_del) > 0) {
+    segment_two_level_del_cov <- run_regression_scna(
+      se_del,
+      assay = "GISTIC_thresholded_two_level",
+      covariates = covariates,
+      outcome = "Age",
+      n_levels = 2,
+      min_group_size = 10
+    )
+  }
+
+  segment_two_level_with_cov <- rbind(segment_two_level_amp_cov, segment_two_level_del_cov)
+
+  if (nrow(segment_two_level_with_cov) > 0) {
+    rowdata <- as.data.frame(rowData(se))
+    rowdata$feature_name <- rowdata$index
+    rowdata <- rowdata %>% dplyr::select(-c(index, chromosome, region_start, region_end, peak_start, peak_end, enlarged_peak_start, enlarged_peak_end))
+
+    segment_two_level_with_cov <- dplyr::left_join(segment_two_level_with_cov, rowdata, by = "feature_name")
+  }
+
+  saveRDS(segment_two_level_with_cov, file.path(result_dir, "lm_test_with_covariates_results_segment_level.rds"))
+  cat("Saved segment-level with-covariate results.\n")
+} else {
+  segment_two_level_with_cov <- segment_two_level_no_cov
+  cat("No covariates specified; using no-covariate results.\n")
+}
+```
+
+## Results - All features (with covariates) {.tabset}
+
+### All segments
+
+```{r}
+if (nrow(segment_two_level_with_cov) > 0) {
+  reactable_pretty(segment_two_level_with_cov)
+} else {
+  cat("No segments passed filtering criteria.\n")
+}
+```
+
+### Significant segments only (adj_p <= 0.05)
+
+```{r}
+if (nrow(segment_two_level_with_cov) > 0) {
+  sig_segments_cov <- segment_two_level_with_cov %>%
+    dplyr::filter(adj_p_val <= 0.05)
+
+  if (nrow(sig_segments_cov) > 0) {
+    reactable_pretty(sig_segments_cov)
+  } else {
+    cat("No significant segments found (adj_p <= 0.05).\n")
+  }
+} else {
+  cat("No segments to display.\n")
+}
+```
+
+
+### List genes in significant peaks
+
+```{r}
+if (nrow(segment_two_level_with_cov) > 0) {
+  sig_peaks <- segment_two_level_with_cov %>%
+    dplyr::filter(adj_p_val <= 0.05)
+
+  if (nrow(sig_peaks) > 0) {
+    for (i in seq_len(nrow(sig_peaks))) {
+      cat(paste0(
+        sig_peaks$feature_name[i],
+        " contains ",
+        sig_peaks$n_genes_in_region[i],
+        " genes (",
+        sig_peaks$genes_in_region[i],
+        ") in the region and ",
+        sig_peaks$n_genes_in_peak[i],
+        " genes (",
+        sig_peaks$genes_in_peak[i],
+        ") in the peak.\n\n"
+      ))
+    }
+  } else {
+    cat("No significant peaks to list.\n")
+  }
+} else {
+  cat("No results available.\n")
+}
+```
+
+Interpretation Guide
+For an Amplification Peak:
+
+The levels 0 to 1 mean "more segment copies".
+Positive beta: As amplification level increases, Age tends to increase. (Older patients have more amplifications).
+Negative beta: As amplification level increases, Age tends to decrease. (Younger patients have more amplifications).
+For a Deletion Peak:
+
+The levels 0 to 1 mean "more severe deletion".
+Positive beta: As the severity of deletion increases, Age tends to increase. (Older patients have more/deeper deletions).
+Negative beta: As the severity of deletion increases, Age tends to decrease. (Younger patients have more/deeper deletions).
+
+# Visualize age distributions for top 10 segments {.tabset}
+
+Using results from linear model with covariates.
+
+```{r}
+if (nrow(segment_two_level_with_cov) > 0) {
+  top_10_segments <- segment_two_level_with_cov %>%
+    dplyr::slice_min(adj_p_val, n = 10) %>%
+    dplyr::pull(feature_name)
+
+  if (length(top_10_segments) > 0) {
+    for (segment in top_10_segments) {
+      cat("\n")
+      cat(paste0("## ", segment, "\n"))
+      cat("\n")
+      p <- plot_age_by_gistic(segment, se, "GISTIC_thresholded_two_level", str_split_i(segment, "_", 1), segment_two_level_with_cov)
+      print(p)
+      cat("\n\n")
+    }
+  } else {
+    cat("No segments to visualize.\n")
+  }
+} else {
+  cat("No segment results available for visualization.\n")
+}
+```
+
+# Regressions - gene level
+
+Only autosomal, protein-coding genes were kept, as documented in the data processing scripts.
+
+```{r}
+se_gene <- tryCatch(
+  {
+    readRDS(file.path(path_filtered_SE, paste0(selected_cancer_type, "_SCNA_GISTIC_gene.rds")))
+  },
+  error = function(e) {
+    stop(paste0("Could not load gene-level SE for ", selected_cancer_type, ": ", e$message))
+  }
+)
+
+cat("Loaded gene-level SE for", selected_cancer_type, "\n")
+cat("Number of samples:", ncol(se_gene), "\n")
+cat("Number of genes:", nrow(se_gene), "\n")
+```
+
+## Gene-level regressions - no covariates
+
+```{r}
+amplified_two_levels_no_cov <- run_regression_scna(
+  se_gene,
+  assay = "amplified_two_levels",
+  covariates = NULL,
+  outcome = "Age",
+  n_levels = 2,
+  min_group_size = 10
+)
+
+deleted_two_levels_no_cov <- run_regression_scna(
+  se_gene,
+  assay = "deleted_two_levels",
+  covariates = NULL,
+  outcome = "Age",
+  n_levels = 2,
+  min_group_size = 10
+)
+
+lm_test_results_list_no_cov <- list(
+  amplified_two_levels = amplified_two_levels_no_cov,
+  deleted_two_levels = deleted_two_levels_no_cov
+)
+
+rowdata_gene <- rowData(se_gene) %>%
+  as.data.frame() %>%
+  dplyr::rename(feature_name = Gene.Symbol) %>%
+  dplyr::select(-Locus.ID)
+
+lm_test_results_list_no_cov <- purrr::map(lm_test_results_list_no_cov, ~ {
+  if (nrow(.x) == 0) {
+    return(.x)
+  }
+  .x %>%
+    dplyr::left_join(rowdata_gene, by = "feature_name") %>%
+    remove_rownames() %>%
+    dplyr::relocate(Cytoband, .after = feature_name)
+})
+
+saveRDS(lm_test_results_list_no_cov, file.path(result_dir, "lm_test_no_covariates_results_gene_level.rds"))
+cat("Saved gene-level no-covariate results.\n")
+```
+
+## amplified_two_levels (no covariates)
+
+```{r}
+if (nrow(lm_test_results_list_no_cov[["amplified_two_levels"]]) > 0) {
+  reactable_pretty(lm_test_results_list_no_cov[["amplified_two_levels"]])
+} else {
+  cat("No amplified genes passed filtering criteria.\n")
+}
+```
+
+## deleted_two_levels (no covariates)
+
+```{r}
+if (nrow(lm_test_results_list_no_cov[["deleted_two_levels"]]) > 0) {
+  reactable_pretty(lm_test_results_list_no_cov[["deleted_two_levels"]])
+} else {
+  cat("No deleted genes passed filtering criteria.\n")
+}
+```
+
+## Gene-level regressions - with covariates
+
+Covariates for `r selected_cancer_type`: `r paste(covariates, collapse = ", ")`
+
+```{r}
+if (length(covariates) > 0) {
+  amplified_two_levels_cov <- run_regression_scna(
+    se_gene,
+    assay = "amplified_two_levels",
+    covariates = covariates,
+    outcome = "Age",
+    n_levels = 2,
+    min_group_size = 10
+  )
+
+  deleted_two_levels_cov <- run_regression_scna(
+    se_gene,
+    assay = "deleted_two_levels",
+    covariates = covariates,
+    outcome = "Age",
+    n_levels = 2,
+    min_group_size = 10
+  )
+
+  lm_test_results_list_with_cov <- list(
+    amplified_two_levels = amplified_two_levels_cov,
+    deleted_two_levels = deleted_two_levels_cov
+  )
+
+  lm_test_results_list_with_cov <- purrr::map(lm_test_results_list_with_cov, ~ {
+    if (nrow(.x) == 0) {
+      return(.x)
+    }
+    .x %>%
+      dplyr::left_join(rowdata_gene, by = "feature_name") %>%
+      remove_rownames() %>%
+      dplyr::relocate(Cytoband, .after = feature_name)
+  })
+
+  saveRDS(lm_test_results_list_with_cov, file.path(result_dir, "lm_test_with_covariates_results_gene_level.rds"))
+  cat("Saved gene-level with-covariate results.\n")
+} else {
+  lm_test_results_list_with_cov <- lm_test_results_list_no_cov
+  cat("No covariates specified; using no-covariate results.\n")
+}
+```
+
+### amplified_two_levels (with covariates)
+
+```{r}
+if (nrow(lm_test_results_list_with_cov[["amplified_two_levels"]]) > 0) {
+  reactable_pretty(lm_test_results_list_with_cov[["amplified_two_levels"]])
+} else {
+  cat("No amplified genes passed filtering criteria.\n")
+}
+```
+
+### deleted_two_levels (with covariates)
+
+```{r}
+if (nrow(lm_test_results_list_with_cov[["deleted_two_levels"]]) > 0) {
+  reactable_pretty(lm_test_results_list_with_cov[["deleted_two_levels"]])
+} else {
+  cat("No deleted genes passed filtering criteria.\n")
+}
+```
+
+# Visualize age distributions for top 10 genes
+
+Using results from linear model with covariates. 5 amplified genes and 5 deleted genes (sorted by adjusted p-value, one per cytoband).
+
+```{r}
+get_top_genes_per_cytoband <- function(df, n = 10) {
+  if (nrow(df) == 0) {
+    return(character(0))
+  }
+  df %>%
+    dplyr::arrange(adj_p_val) %>%
+    dplyr::distinct(Cytoband, .keep_all = TRUE) %>%
+    dplyr::slice_head(n = n) %>%
+    dplyr::pull(feature_name)
+}
+
+top_genes_list <- lapply(lm_test_results_list_with_cov, get_top_genes_per_cytoband)
+```
+
+## Age distribution - amplified_two_levels {.tabset}
+
+Showing age distributions for the top 10 amplified genes with significant associations (one gene per cytoband).
+
+```{r}
+if (length(top_genes_list[["amplified_two_levels"]]) > 0) {
+  for (gene in top_genes_list[["amplified_two_levels"]]) {
+    cat("\n")
+    cat(paste0("### ", gene, "\n"))
+    cat("\n")
+    p <- plot_age_by_gistic(gene, se_gene, "amplified_two_levels", "amplified", lm_test_results_list_with_cov[["amplified_two_levels"]])
+    print(p)
+    cat("\n\n")
+  }
+} else {
+  cat("No amplified genes to visualize.\n")
+}
+```
+
+## Age distribution - deleted_two_levels {.tabset}
+
+Showing age distributions for the top 10 deleted genes with significant associations (one gene per cytoband).
+
+```{r}
+if (length(top_genes_list[["deleted_two_levels"]]) > 0) {
+  for (gene in top_genes_list[["deleted_two_levels"]]) {
+    cat("\n")
+    cat(paste0("### ", gene, "\n"))
+    cat("\n")
+    p <- plot_age_by_gistic(gene, se_gene, "deleted_two_levels", "deleted", lm_test_results_list_with_cov[["deleted_two_levels"]])
+    print(p)
+    cat("\n\n")
+  }
+} else {
+  cat("No deleted genes to visualize.\n")
+}
+```
+
+```{r}
+sessionInfo()
+```

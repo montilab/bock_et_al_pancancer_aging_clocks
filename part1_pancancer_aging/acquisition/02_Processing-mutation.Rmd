@@ -1,0 +1,114 @@
+---
+title: "Processing Mutation SummarizedExperiment Objects"
+subtitle: "TCGA PanCancer Aging"
+author: "Payton Bock - Monti Lab"
+date:   "`r format(Sys.Date(), '%B %d, %Y')`"
+params: 
+  dummy: "dummy"
+output:
+  html_document:
+    theme: united
+    code_folding: hide
+    css: style.css
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+
+```{r, include = FALSE}
+.libPaths("/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/r-library/")
+
+library(dplyr)
+library(SummarizedExperiment)
+library(ggplot2)
+library(reactable)
+library(S4Vectors)
+
+#get environmental variables
+PATH <- file.path( Sys.getenv("PCANAGE","/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/")) 
+TCGA <- file.path( Sys.getenv("CBMDATA","/restricted/projectnb/agedisease/CBMrepositoryData/"), "TCGA-GDC")
+```
+
+## Script Summary 
+- Loads harmonized meta data RDS file
+
+- Adds meta data to all SummarizedExperiment objects for the mutation omics layer
+
+
+## Path Setting
+Load in metadata RDS object and define directory with SummarizedExperiment objects
+```{r data loading}
+#Where the meta data RDS file is
+metadata <- readRDS(file.path(TCGA,"metadata/data/harmonized_metadata.rds"))
+
+#Path where the summarized experiment objects you are updating are located
+se_directory <- file.path(TCGA,"mutation/raw_data/raw_SE/")
+
+#Path to directory you want to output to
+output_directory <- file.path(TCGA,"mutation/processed_data/all/") 
+```
+
+## Add Meta Data to all Summarized Experiment Objects in folder
+Here we loop through all SummarizedExperiment RDS files and add the harmonzied meta data to the SummarizedObject (which is then saved). 
+
+This assumes the data has only one of each "submitter_id", which should be the case given only primary tumors were downloaded.
+
+```{r Add Meta Data to Folder of Summarized Experiments}
+#Creates a list of all files ending in .rds in se_directory
+file_list <- list.files(path = se_directory, pattern = "*.rds", full.names = TRUE)
+
+
+# Loop through files
+for (file in file_list) {
+  
+  cat("Updating metadata for ", file, "\n")
+  
+  # Read in the file
+  data <- readRDS(file)
+  
+  # Determine which samples are in the current TCGA project + assay
+  samples_to_keep <- intersect(colnames(data), rownames(metadata))
+  
+  # Only keep metadata for the current project
+  project_specific_metadata <- metadata[rownames(metadata) %in% samples_to_keep,]
+  
+  # Ensure metadata is a DataFrame object (needed to add as colData)
+  project_specific_metadata <- DataFrame(project_specific_metadata)
+  
+  # Ensures the order of samples match between Summarized Experiment and metadata
+  data_sorted <- data[, match(rownames(project_specific_metadata), colnames(data))]
+  
+  # Create a new SummarizedExperiment object if the samples are identical
+  if (identical(colnames(data_sorted), rownames(project_specific_metadata))) {
+    # Extract all assays from the original data and maintain their names
+    assays_list <- lapply(assayNames(data_sorted), function(assay_name) assay(data_sorted, assay_name))
+    names(assays_list) <- assayNames(data_sorted)  # Preserving the original assay names
+    
+    # Recreate the SummarizedExperiment with the new metadata and all assays
+    new_se <- SummarizedExperiment(assays = SimpleList(assays_list),
+                                   colData = project_specific_metadata,
+                                   rowData = rowData(data_sorted))
+    
+    # Prepare file output name in output directory with the same file name as original
+    output <- paste0(output_directory, "/", basename(file))
+    
+    # Save the RDS file
+    saveRDS(new_se, output)
+    
+  } else {
+    # Add error message for mismatch
+    stop("Mismatch between column names (sample names) and metadata samples")
+  }
+}
+```
+
+
+## Session Info
+```{r}
+sessionInfo()
+```
+

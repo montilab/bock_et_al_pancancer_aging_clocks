@@ -1,0 +1,246 @@
+---
+title: "TCGA miRNA - Data Preprocessing"
+subtitle: "TCGA PanCancer Aging"
+author: "Payton Bock - Monti Lab"
+date:   "`r format(Sys.Date(), '%B %d, %Y')`"
+params: 
+  dummy: "dummy"
+output:
+  html_document:
+    theme: united
+    code_folding: hide
+    css: style.css
+    toc: true
+    toc_float: true
+---
+```{r opts, echo=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+```{r setup, include=FALSE}
+#r library
+.libPaths("/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/r-library/")
+
+#libraries
+library(dplyr)
+library(SummarizedExperiment)
+library(ggplot2)
+library(reshape2)
+library(edgeR)
+library(limma)
+library(reactable)
+library(RColorBrewer)
+
+
+#get environmental variables
+PATH <- file.path( Sys.getenv("PCANAGE","/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/")) 
+TCGA <- file.path( Sys.getenv("CBMDATA","/restricted/projectnb/agedisease/CBMrepositoryData/TCGA-GDC"), "TCGA-GDC")
+```
+
+## Script Summary 
+- Removes lowly expressed genes from the raw miRNA data using `edgeR`
+
+- Applies filtering to all TCGA projects
+
+- Saves processed SummarizedExperiments
+
+## Data Loading
+Load in SummarizedExperiment RDS objects and define output directory
+```{r data loading}
+#Path where the summarized experiment objects you are updating are located
+se_directory <- file.path(TCGA, "miR/raw_data/SummarizedExperiments/")
+#Path to directory you want to output to
+output_directory <- file.path(PATH, "data/mirna/processed_SummarizedExperiments")
+```
+
+
+Here we load in a single TCGA project (BRCA) to show the workflow
+```{r Load in BRCA object}
+BRCA_raw <- readRDS(file.path(TCGA,"miR/raw_data/SummarizedExperiments/TCGA-BRCA_miRNA.rds"))
+```
+
+## Quality Control
+
+### Filtering Lowly Expressed Genes
+
+First, lets remove features that have zero expression
+```{r}
+BRCA_filtered <- BRCA_raw[rowSums(assay(BRCA_raw,"reads_per_million")) > 0,]
+cat("Number of removed miRNAs with zero expression", dim(BRCA_raw)[1] - dim(BRCA)[1] , "\n")
+```
+
+Visualizes the distribution of gene counts before and after filtering to see the impact of removing lowly expressed genes.
+```{r}
+# Distribution of counts before filtering
+counts_before <- SummarizedExperiment::assay(BRCA_raw)
+row_sums_before <- rowSums(counts_before)
+
+p_before <- ggplot2::ggplot(data.frame(counts = row_sums_before + 1), aes(x = counts)) +
+            ggplot2::geom_histogram(bins = 50, fill = "blue", alpha = 0.7) +
+            ggplot2::scale_x_log10() +
+            ggplot2::ggtitle("miRNA Counts Distribution Before Filtering")
+
+# Distribution of counts after filtering
+counts_after <- SummarizedExperiment::assay(BRCA_filtered)
+row_sums_after <- rowSums(counts_after)
+
+p_after <- ggplot2::ggplot(data.frame(counts = row_sums_after + 1), aes(x = counts)) +
+           ggplot2::geom_histogram(bins = 50, fill = "green", alpha = 0.7) +
+           ggplot2::scale_x_log10() +
+           ggplot2::ggtitle("miRNA Counts Distribution After Filtering")
+
+gridExtra::grid.arrange(p_before, p_after, ncol = 2)
+```
+
+
+```{r}
+# Assuming 'counts' is your raw counts matrix and 'BRCA_filtered' is your filtered SummarizedExperiment object
+counts <- SummarizedExperiment::assay(BRCA_raw, "raw_counts")
+filtered_counts <- SummarizedExperiment::assay(BRCA_filtered, "raw_counts")
+
+# Create DGEList objects for raw and filtered data
+dge_raw <- DGEList(counts)
+dge_filtered <- DGEList(filtered_counts)
+
+# Calculate log-CPM for raw and filtered data
+lcpm_raw <- cpm(dge_raw, log=TRUE)
+lcpm_filtered <- cpm(dge_filtered, log=TRUE)
+
+# Determine cutoff for log-CPM with min.count = 5
+M <- median(dge_raw$samples$lib.size)
+L <- nrow(dge_raw)  # number of genes or miRNAs
+lcpm_cutoff <- log2(5/M + 2/L)
+
+# Convert to long format for ggplot2
+lcpm_raw_long <- melt(lcpm_raw)
+lcpm_filtered_long <- melt(lcpm_filtered)
+
+# Add a status column to distinguish between raw and filtered data
+lcpm_raw_long$status <- "Raw"
+lcpm_filtered_long$status <- "Filtered"
+
+# Combine both data frames
+lcpm_combined <- rbind(lcpm_raw_long, lcpm_filtered_long)
+
+# Create the density plot using ggplot2
+ggplot(lcpm_combined, aes(x = value, fill = status)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~ status, scales = "free_y") +
+  labs(title = "Density Plot of Log-CPM Values", x = "Log-CPM", y = "Density") +
+  theme_minimal()
+```
+
+
+
+### Normalization
+As mentioned in the script summary, normalization is not performed here. But here is the code to perform the TMM normalizaiton method with `edgeR` 
+(code is not evaluated)
+```{r, eval = FALSE}
+# Create DGEList object from filtered data
+dge <- DGEList(counts = assay(BRCA_filtered))
+
+# Normalize using TMM
+dge <- calcNormFactors(dge, method = "TMM")
+
+# perform normalization on counts
+normalized_counts <- edgeR::cpm(dge, normalized.lib.sizes = TRUE)
+
+if (identical(rownames(normalized_counts), rownames(BRCA_filtered)) & identical(colnames(normalized_counts), colnames(BRCA_filtered))) {
+  cat("Creating new SummarizedExperiment with normalized counts...")
+  BRCA_normalized <- SummarizedExperiment(assays = list(counts = normalized_counts),
+                                          colData = colData(BRCA_filtered),
+                                          rowData = rowData(BRCA_filtered))
+
+  # Visualize counts before and after normalization
+  counts_before <- SummarizedExperiment::assay(BRCA_filtered)
+  counts_after <- SummarizedExperiment::assay(BRCA_normalized)
+
+  # Sample 5 genes to visualize
+  set.seed(123)
+  sampled_genes <- sample(rownames(counts_before), 5)
+
+  counts_before_sampled <- counts_before[sampled_genes, ]
+  counts_after_sampled <- counts_after[sampled_genes, ]
+
+  # Melt data for ggplot
+  counts_before_melt <- reshape2::melt(counts_before_sampled)
+  counts_after_melt <- reshape2::melt(counts_after_sampled)
+
+  # Add a column to distinguish between raw and normalized counts
+  counts_before_melt$Normalization <- 'Before'
+  counts_after_melt$Normalization <- 'After'
+
+  # Combine the data
+  combined_melt <- rbind(counts_before_melt, counts_after_melt)
+2
+  # Create a combined density plot
+  p <- ggplot(combined_melt, aes(x = value, fill = Normalization)) +
+       geom_density(alpha = 0.5) +
+       scale_x_log10() +
+       ggtitle("Density Plot of Counts Before and After Normalization") +
+       labs(x = "Counts (log scale)", y = "Density") +
+       theme_minimal()
+
+  print(p)
+
+} else {
+  cat("Cannot create new SummarizedExperiment: Samples/Genes are mismatched")
+}
+```
+
+
+
+## Apply Filtering to all TCGA projects
+This section applies the filtering and normalization steps to all SummarizedExperiment objects 
+```{r filter SEs}
+# Create a list of all files ending in .rds in se_directory
+file_list <- list.files(path = se_directory, pattern = "*.rds", full.names = TRUE)
+
+# Initialize a data frame to store the summary information
+summary_table <- data.frame(Project = character(),
+                            RemovedFeatures = numeric(),
+                            RemainingFeatures = numeric(),
+                            stringsAsFactors = FALSE)
+
+# Loop through each file
+for (file_path in file_list) {
+  cat("Filtering and saving ", file_path, "\n")
+  
+  # Read the SummarizedExperiment object
+  se_obj <- readRDS(file_path)
+  
+  # Filter lowly expressed genes
+  keep <- edgeR::filterByExpr(SummarizedExperiment::assay(se_obj), min.count = 5, min.prop = 0.3)
+  se_obj_filtered <- se_obj[keep, ]
+  
+  # Track the number of removed and remaining genes
+  removed_genes <- sum(!keep)
+  remaining_genes <- sum(keep)
+  
+  # Append the information to the summary table
+  project_name <- tools::file_path_sans_ext(basename(file_path))
+  summary_table <- rbind(summary_table, data.frame(Project = project_name,
+                                                   Removed_miRNAs = removed_genes,
+                                                   Remaining_miRNAs = remaining_genes))
+  
+  # Ensure sample order still matches
+  if (identical(colnames(se_obj), colnames(se_obj_filtered))) {
+    
+    # Save output
+    output_path <- file.path(output_directory, basename(file_path))
+    saveRDS(se_obj_filtered, output_path)
+    
+    cat("Saved normalized SummarizedExperiment to", output_path, "\n\n")
+  } else {
+    cat("Cannot create new SummarizedExperiment: Samples/Genes are mismatched\n")
+  }
+}
+
+# Print the summary table
+reactable::reactable(summary_table, searchable = TRUE, resizable = TRUE)
+```
+
+## Session Info
+```{r session info}
+sessionInfo()
+```

@@ -1,0 +1,832 @@
+---
+title: "Figure script — GTEx vs TCGA age-trend comparison (Part 2)"
+author: "Pan-cancer aging pipeline"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: united
+    code_folding: hide
+    toc: true
+    toc_float: true
+params:
+  rnaseq_root: "results/derived/part2/02_rnaseq_age"
+  celltype_root: "results/derived/part2/03_celltype_age"
+  figures_root: "results/figures/fig_GTEx-TCGA-AgeTrends"
+  tables_root: "results/tables/part2"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+## Overview
+
+This script loads the saved Part 2 analysis outputs (scripts 02 and 03) and builds the GTEx vs TCGA age-trend comparison panels. The analysis scripts own all modeling; this script only formats saved tables into figure panels.
+
+Panels produced:
+
+- Pan-tissue pathway agreement (within-cohort meta-analysis, GTEx vs TCGA).
+- Pan-tissue cell-type agreement (within-cohort meta-analysis, GTEx vs TCGA).
+- Combined per-tissue pathway and cell-type agreement across the four emphasis tissues, with a nested x-axis (modality over category) and a shared per-tissue y-axis.
+
+A shared legend follows the per-tissue panel. A full-sized pathway supplement (pan-tissue and per-tissue, all categories) is produced at the end.
+
+Some panels may not appear in the published manuscript. Panels are assembled and typeset in Adobe Illustrator to produce the final figure.
+
+All panels encode dot color by age-trend direction and significance (FDR < 0.05), and dot size by signed significance (`-log10(FDR)`, capped at 5). Size is on a fixed scale (`limits = c(0, 5)`) across every panel, so dot sizes are directly comparable and a single size legend applies throughout. Pathway name cleaning and category assignment follow the same conventions as the cross-cancer figure. Cell-type fibroblast proportions are estimated via EPIC's CAF-like reference and labeled "Fibroblasts"; the caption notes the reference origin.
+
+## Libraries
+
+```{r}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(tibble)
+  library(ggplot2)
+  library(here)
+  library(grid)
+  library(ggh4x)
+})
+```
+
+## Paths and shared plot helpers
+
+```{r}
+rnaseq_root   <- here::here(params$rnaseq_root)
+celltype_root <- here::here(params$celltype_root)
+figures_root  <- here::here(params$figures_root)
+tables_root   <- here::here(params$tables_root)
+
+dir.create(figures_root, recursive = TRUE, showWarnings = FALSE)
+dir.create(tables_root,  recursive = TRUE, showWarnings = FALSE)
+
+agreement_fill_values <- c(
+  "Up_Sig"   = "#d62728",
+  "Up_NS"    = "#f4a3a3",
+  "Down_Sig" = "#1f77b4",
+  "Down_NS"  = "#9ecae1",
+  "Neutral"  = "grey85"
+)
+
+agreement_legend_labels <- c(
+  "Increase with Age (FDR < 0.05)",
+  "Increase with Age (FDR \u2265 0.05)",
+  "Decrease with Age (FDR < 0.05)",
+  "Decrease with Age (FDR \u2265 0.05)"
+)
+
+agreement_size_range <- c(1.2, 4.5)   # smaller max bubble to fit the densest panel (A)
+agreement_size_limits <- c(0, 5)   # fixed across every panel so dot sizes are comparable
+agreement_shape <- 21
+agreement_alpha <- 0.9
+```
+
+## Shared dictionaries
+
+Pathway cleaning and category assignment match the cross-cancer figure. Input pathway names arrive as raw MSigDB labels (`HALLMARK_*`); they are stripped, spaced, title-cased, and recoded for the acronym cases, then mapped to the same category scheme used elsewhere in the manuscript.
+
+```{r}
+clean_pathway_label <- function(x) {
+  x <- stringr::str_remove(x, "^HALLMARK_")
+  x <- stringr::str_replace_all(x, "_", " ")
+  x <- stringr::str_to_title(x)
+
+  dplyr::recode(
+    x,
+    "Reactive Oxygen Species Pathway" = "ROS Pathway",
+    "Il2 Stat5 Signaling" = "IL2/STAT5 Signaling",
+    "Il6 Jak Stat3 Signaling" = "IL6/JAK/STAT3",
+    "Tnfa Signaling Via Nfkb" = "TNFa → NFkB",
+    "Pi3k Akt Mtor Signaling" = "PI3K/AKT/MTOR Signaling",
+    "Epithelial Mesenchymal Transition" = "EMT",
+    "Wnt Beta Catenin Signaling" = "WNT/β-Catenin",
+    "Interferon Alpha Response" = "IFNa Response",
+    "Interferon Gamma Response" = "IFNy Response",
+    "Xenobiotic Metabolism" = "Xenobiotic Metab.",
+    "Unfolded Protein Response" = "UPR",
+    "Inflammatory Response" = "Inflammatory Resp.",
+    "Fatty Acid Metabolism" = "Fatty Acid Metab.",
+    .default = x
+  )
+}
+
+# Exact-match category map for all 50 Hallmark pathways.
+# Keys must match the output of clean_pathway_label().
+hallmark_category_map <- c(
+  # Proliferation
+  "E2f Targets" = "Proliferation",
+  "G2m Checkpoint" = "Proliferation",
+  "Mitotic Spindle" = "Proliferation",
+  "Myc Targets V1" = "Proliferation",
+  "Myc Targets V2" = "Proliferation",
+
+  # Immune
+  "Allograft Rejection" = "Immune",
+  "Complement" = "Immune",
+  "Coagulation" = "Immune",
+  "IL2/STAT5 Signaling" = "Immune",
+  "IL6/JAK/STAT3" = "Immune",
+  "Inflammatory Resp." = "Immune",
+  "IFNa Response" = "Immune",
+  "IFNy Response" = "Immune",
+  "TNFa → NFkB" = "Immune",
+
+  # Metabolic
+  "Adipogenesis" = "Metabolic",
+  "Bile Acid Metabolism" = "Metabolic",
+  "Cholesterol Homeostasis" = "Metabolic",
+  "Fatty Acid Metab." = "Metabolic",
+  "Glycolysis" = "Metabolic",
+  "Heme Metabolism" = "Metabolic",
+  "Oxidative Phosphorylation" = "Metabolic",
+  "Peroxisome" = "Metabolic",
+  "Xenobiotic Metab." = "Metabolic",
+
+  # DNA damage / stress
+  "Apoptosis" = "DNA Damage",
+  "Dna Repair" = "DNA Damage",
+  "Hypoxia" = "DNA Damage",
+  "P53 Pathway" = "DNA Damage",
+  "ROS Pathway" = "DNA Damage",
+  "UPR" = "DNA Damage",
+  "Uv Response Dn" = "DNA Damage",
+  "Uv Response Up" = "DNA Damage",
+
+  # Signaling
+  "Hedgehog Signaling" = "Signaling",
+  "Kras Signaling Dn" = "Signaling",
+  "Kras Signaling Up" = "Signaling",
+  "Mtorc1 Signaling" = "Signaling",
+  "Notch Signaling" = "Signaling",
+  "PI3K/AKT/MTOR Signaling" = "Signaling",
+  "Tgf Beta Signaling" = "Signaling",
+  "WNT/β-Catenin" = "Signaling",
+
+  # Hormone
+  "Androgen Response" = "Hormone",
+  "Estrogen Response Early" = "Hormone",
+  "Estrogen Response Late" = "Hormone",
+
+  # Cell state
+  "Angiogenesis" = "Cell State",
+  "Apical Junction" = "Cell State",
+  "Apical Surface" = "Cell State",
+  "EMT" = "Cell State",
+  "Myogenesis" = "Cell State",
+  "Pancreas Beta Cells" = "Cell State",
+  "Protein Secretion" = "Cell State",
+  "Spermatogenesis" = "Cell State"
+)
+
+assign_pathway_category <- function(pathway) {
+  out <- unname(hallmark_category_map[pathway])
+  out[is.na(out)] <- "Other"
+  out
+}
+
+pathway_category_levels <- c(
+  "Proliferation", "Immune", "Metabolic", "DNA Damage",
+  "Signaling", "Hormone", "Cell State", "Other"
+)
+
+# The per-tissue panel focuses the pathway block on the three primary biological
+# axes to stay readable. Change this vector to show more categories.
+focus_categories_panelC <- c("Proliferation", "Immune", "Metabolic")
+
+# Emphasis-cancer and tissue ordering (matches cross-cancer figure conventions).
+matched_cohort_levels <- c("GTEx", "BRCA", "LUSC", "LUAD", "GBM", "LGG", "COAD")
+matched_tissue_levels <- c("BREAST", "LUNG", "BRAIN", "COLON")
+
+cell_label_map <- c(
+  "otherCells"  = "Other Cells",
+  "Bcells"      = "B Cells",
+  "NKcells"     = "NK Cells",
+  "CD4_Tcells"  = "CD4 T Cells",
+  "CD8_Tcells"  = "CD8 T Cells",
+  "Endothelial" = "Endothelial Cells",
+  "Macrophages" = "Macrophages",
+  "CAFs"        = "Fibroblasts"
+)
+
+cell_category_of <- function(cell_group) {
+  dplyr::case_when(
+    cell_group %in% c("Macrophages", "NKcells") ~ "Innate",
+    cell_group %in% c("Bcells", "CD4_Tcells", "CD8_Tcells") ~ "Adaptive",
+    cell_group %in% c("CAFs", "Endothelial") ~ "Stromal",
+    TRUE ~ "Other"
+  )
+}
+
+# Shared per-tissue row positions (used by the per-tissue panel); gaps separate tissue/tumor
+# blocks. Top to bottom: Breast, Lung, Brain, Colon.
+gtex_to_display <- c(
+  "GTEx-BREAST" = "Breast",
+  "GTEx-LUNG"   = "Lung",
+  "GTEx-BRAIN"  = "Brain",
+  "GTEx-COLON"  = "Colon"
+)
+
+display_top_to_bottom <- c(
+  "Breast", "BRCA",
+  "Lung",   "LUSC", "LUAD",
+  "Brain",  "GBM",  "LGG",
+  "Colon",  "COAD"
+)
+
+row_pos_tbl <- tibble::tibble(
+  RowLab = display_top_to_bottom,
+  RowPos = c(
+    10.0, 9.0,      # Breast block
+     7.6, 6.6, 5.6, # Lung block
+     4.2, 3.2, 2.2, # Brain block
+     0.8, -0.2      # Colon block
+  )
+)
+```
+
+## Load saved analysis outputs
+
+```{r}
+pathway_meta_long <- readRDS(file.path(rnaseq_root, "pathways", "pathway_meta_long.rds")) %>%
+  dplyr::mutate(Pathway = clean_pathway_label(Pathway))
+
+pathway_matched_long <- readRDS(file.path(rnaseq_root, "pathways", "pathway_matched_long.rds")) %>%
+  dplyr::mutate(Pathway = clean_pathway_label(Pathway))
+
+celltype_meta_all <- readRDS(file.path(celltype_root, "meta", "celltype_meta_all.rds"))
+celltype_matched_long <- readRDS(file.path(celltype_root, "meta", "celltype_matched_long.rds"))
+```
+
+## Pan-tissue pathway agreement
+
+Global within-cohort pathway meta-analysis (GTEx vs TCGA), restricted to pathways significant in at least one cohort. Dot size is signed significance (`-log10(FDR)`), harmonized with the other panels.
+
+```{r}
+plot_pathway_meta <- pathway_meta_long %>%
+  dplyr::transmute(
+    Pathway,
+    Cohort = factor(Cohort, levels = c("TCGA", "GTEx")),   # GTEx on top (first level = bottom)
+    fdr,
+    DirLabel = direction,
+    Size = pmin(-log10(pmax(fdr, 1e-300)), 5)   # signed significance, harmonized across the figure
+  )
+
+sig_paths <- plot_pathway_meta %>%
+  dplyr::group_by(Pathway) %>%
+  dplyr::summarise(any_sig = any(fdr < 0.05, na.rm = TRUE), .groups = "drop") %>%
+  dplyr::filter(any_sig) %>%
+  dplyr::pull(Pathway)
+
+plot_pathway_meta <- plot_pathway_meta %>%
+  dplyr::filter(Pathway %in% sig_paths) %>%
+  dplyr::mutate(
+    Category = assign_pathway_category(Pathway),
+    Category = factor(Category, levels = pathway_category_levels),
+    Pathway_wrapped = stringr::str_wrap(Pathway, width = 30)
+  )
+
+# Order pathways alphabetically within category, matching the per-tissue panel's convention.
+alpha_order <- plot_pathway_meta %>%
+  dplyr::distinct(Category, Pathway, Pathway_wrapped) %>%
+  dplyr::arrange(Category, Pathway) %>%
+  dplyr::pull(Pathway_wrapped) %>%
+  unique()
+
+plot_pathway_meta <- plot_pathway_meta %>%
+  dplyr::mutate(
+    Section = "Pan-tissue",
+    Pathway_wrapped = factor(Pathway_wrapped, levels = alpha_order),
+    Sig = ifelse(fdr < 0.05, "Sig", "NS"),
+    Color = dplyr::case_when(
+      DirLabel == "Up"   & Sig == "Sig" ~ unname(agreement_fill_values["Up_Sig"]),
+      DirLabel == "Up"   & Sig == "NS"  ~ unname(agreement_fill_values["Up_NS"]),
+      DirLabel == "Down" & Sig == "Sig" ~ unname(agreement_fill_values["Down_Sig"]),
+      DirLabel == "Down" & Sig == "NS"  ~ unname(agreement_fill_values["Down_NS"]),
+      TRUE ~ unname(agreement_fill_values["Neutral"])
+    )
+  )
+
+fig2_font <- list(
+  base = 10,
+  strip_y = 8.5,
+  strip_section = 10,
+  axis_x = 10,
+  axis_y = 10
+)
+
+p_pathway_meta <- ggplot(plot_pathway_meta, ggplot2::aes(x = Pathway_wrapped, y = Cohort)) +
+  ggplot2::geom_point(
+    ggplot2::aes(size = Size, fill = Color),
+    shape = agreement_shape, color = "black", alpha = agreement_alpha
+  ) +
+  ggplot2::facet_grid(Section ~ Category, scales = "free_x", space = "free_x") +
+  ggplot2::scale_fill_identity() +
+  ggplot2::scale_size(range = agreement_size_range, limits = agreement_size_limits, guide = "none") +
+  ggplot2::theme_minimal(base_size = fig2_font$base) +
+  ggplot2::theme(
+    legend.position = "none",
+    axis.title.y = ggplot2::element_blank(),
+    axis.title.x = ggplot2::element_blank(),
+    panel.spacing.x = grid::unit(0.15, "lines"),
+    strip.text.x = ggplot2::element_text(
+      size = fig2_font$strip_y,
+      face = "bold"
+    ),
+    strip.text.y = ggplot2::element_text(
+      size = fig2_font$strip_section,
+      face = "bold",
+      angle = -90
+    ),
+    strip.background = ggplot2::element_rect(fill = "grey93", color = NA),
+    axis.text.x = ggplot2::element_text(
+      size = 8.5,
+      angle = 45,
+      hjust = 1,
+      vjust = 1.1
+    ),
+    axis.text.y = ggplot2::element_text(
+      size = fig2_font$axis_x,
+      face = "bold"
+    ),
+    panel.grid.major = ggplot2::element_blank(),
+    panel.grid.minor = ggplot2::element_blank()
+  )
+
+p_pathway_meta
+ggsave(file.path(figures_root, "fig_pancohort_pathway.pdf"), p_pathway_meta,
+       width = 7.5, height = 2.5, units = "in")
+message("Saved: fig_pancohort_pathway.pdf")
+```
+
+## Pan-tissue cell-type agreement
+
+Global within-cohort cell-type meta-analysis (GTEx vs TCGA). Mirrors the pan-tissue pathway panel, with cell categories as the column facets.
+
+This panel applies Benjamini-Hochberg FDR (p.adjust) to the meta p-values in celltype_meta_all, computed within each cohort. The per-tissue cell-type panel uses sccomp's c_FDR directly, since each row there is a single sccomp fit. Both quantities are thresholded at 0.05 and mapped onto the same -log10(FDR) size scale, but the underlying computations differ by necessity: a meta-analysis of effect sizes does not produce a c_FDR, and a per-fit sccomp result does not produce a frequentist p-value to BH-adjust.
+
+```{r}
+plot_celltype_meta <- celltype_meta_all %>%
+  dplyr::group_by(Cohort) %>%
+  dplyr::mutate(fdr = stats::p.adjust(pval, method = "fdr")) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(
+    Cohort  = factor(Cohort, levels = c("TCGA", "GTEx")),   # GTEx on top (first level = bottom)
+    Section = "Pan-tissue",
+    Sig = ifelse(!is.na(fdr) & fdr < 0.05, "Sig", "NS"),
+    Dir = dplyr::case_when(
+      is.na(est) ~ "NA", est > 0 ~ "Pos", est < 0 ~ "Neg", TRUE ~ "Zero"
+    ),
+    Color = dplyr::case_when(
+      Dir == "Pos" & Sig == "Sig" ~ unname(agreement_fill_values["Up_Sig"]),
+      Dir == "Pos" & Sig == "NS"  ~ unname(agreement_fill_values["Up_NS"]),
+      Dir == "Neg" & Sig == "Sig" ~ unname(agreement_fill_values["Down_Sig"]),
+      Dir == "Neg" & Sig == "NS"  ~ unname(agreement_fill_values["Down_NS"]),
+      TRUE ~ unname(agreement_fill_values["Neutral"])
+    ),
+    Score = sign(dplyr::coalesce(est, 0)) * -log10(pmax(fdr, 1e-300)),
+    Size  = pmin(abs(Score), 5),
+    Category = factor(cell_category_of(Cell_Group),
+                      levels = c("Adaptive", "Innate", "Stromal", "Other")),
+    Cell_Group_pretty = dplyr::recode(Cell_Group, !!!cell_label_map),
+    Cell_wrapped = stringr::str_wrap(Cell_Group_pretty, width = 18)
+  )
+
+# order cell types within each category (alphabetical), consistent with the per-tissue panel
+cell_order <- plot_celltype_meta %>%
+  dplyr::distinct(Category, Cell_wrapped) %>%
+  dplyr::arrange(Category, Cell_wrapped) %>%
+  dplyr::pull(Cell_wrapped) %>%
+  unique()
+
+plot_celltype_meta <- plot_celltype_meta %>%
+  dplyr::mutate(Cell_wrapped = factor(Cell_wrapped, levels = cell_order))
+
+fig2_font <- list(
+  base = 10,
+  strip_y = 8.5,
+  strip_section = 10,
+  axis_x = 10,
+  axis_y = 10
+)
+
+p_celltype_meta <- ggplot(plot_celltype_meta, ggplot2::aes(x = Cell_wrapped, y = Cohort)) +
+  ggplot2::geom_point(
+    ggplot2::aes(size = Size, fill = Color),
+    shape = agreement_shape, color = "black", alpha = agreement_alpha
+  ) +
+  ggplot2::facet_grid(Section ~ Category, scales = "free_x", space = "free_x") +
+  ggplot2::scale_fill_identity() +
+  ggplot2::scale_size(range = agreement_size_range, limits = agreement_size_limits, guide = "none") +
+  ggplot2::theme_minimal(base_size = fig2_font$base) +
+  ggplot2::theme(
+    legend.position = "none",
+    axis.title.y = ggplot2::element_blank(),
+    axis.title.x = ggplot2::element_blank(),
+    panel.spacing.x = grid::unit(0.15, "lines"),
+    strip.text.x = ggplot2::element_text(
+      size = fig2_font$strip_y,
+      face = "bold"
+    ),
+    strip.text.y = ggplot2::element_text(
+      size = fig2_font$strip_section,
+      face = "bold",
+      angle = -90
+    ),
+    strip.background = ggplot2::element_rect(fill = "grey93", color = NA),
+    axis.text.x = ggplot2::element_text(
+      size = 8.5,
+      angle = 45,
+      hjust = 1,
+      vjust = 1.1
+    ),
+    axis.text.y = ggplot2::element_text(
+      size = fig2_font$axis_x,
+      face = "bold"
+    ),
+    panel.grid.major = ggplot2::element_blank(),
+    panel.grid.minor = ggplot2::element_blank()
+  )
+
+p_celltype_meta
+ggsave(file.path(figures_root, "fig_pancohort_celltype.pdf"), p_celltype_meta,
+       width = 4, height = 2, units = "in")
+message("Saved: fig_pancohort_celltype.pdf")
+```
+
+## Combined per-tissue pathways and cell types
+
+Per-tissue agreement for both modalities in one panel: shared per-tissue y-axis (normal tissue above its tumors within each block), nested x-axis with modality ("Pathways", "Cell Types") over category. Dot size is signed significance for both modalities, so they share one scale.
+
+```{r}
+# pathways (per-tissue) — signed significance, restricted to the pan-tissue panel's significant set
+pw <- pathway_matched_long %>%
+  dplyr::mutate(Category = assign_pathway_category(Pathway)) %>%
+  dplyr::filter(Category %in% focus_categories_panelC, Pathway %in% sig_paths) %>%
+  dplyr::transmute(
+    Modality = "Pathways",
+    Category,
+    Feature = stringr::str_wrap(Pathway, 30),
+    RowLab  = dplyr::if_else(grepl("^GTEx", Cohort),
+                             dplyr::recode(Cohort, !!!gtex_to_display), Cohort),
+    Dir  = direction,
+    Sig  = ifelse(fdr < 0.05, "Sig", "NS"),
+    Size = pmin(-log10(pmax(fdr, 1e-300)), 5)
+  )
+
+# cell types (per-tissue) — signed significance
+ct <- celltype_matched_long %>%
+  dplyr::transmute(
+    Modality = "Cell Types",
+    Category = cell_category_of(Cell_Group),
+    Feature = stringr::str_wrap(dplyr::recode(Cell_Group, !!!cell_label_map), 18),
+    RowLab  = dplyr::if_else(grepl("^GTEx", Cohort),
+                             dplyr::recode(Cohort, !!!gtex_to_display), Cohort),
+    Dir  = dplyr::if_else(c_effect > 0, "Up", "Down"),
+    Sig  = ifelse(!is.na(c_FDR) & c_FDR < 0.05, "Sig", "NS"),
+    Size = pmin(-log10(pmax(c_FDR, 1e-300)), 5)
+  )
+
+combined_BD <- dplyr::bind_rows(pw, ct) %>%
+  dplyr::left_join(row_pos_tbl, by = "RowLab") %>%
+  dplyr::mutate(
+    Section = "Per-tissue",
+    Color = dplyr::case_when(
+      Dir == "Up"   & Sig == "Sig" ~ unname(agreement_fill_values["Up_Sig"]),
+      Dir == "Up"   & Sig == "NS"  ~ unname(agreement_fill_values["Up_NS"]),
+      Dir == "Down" & Sig == "Sig" ~ unname(agreement_fill_values["Down_Sig"]),
+      Dir == "Down" & Sig == "NS"  ~ unname(agreement_fill_values["Down_NS"]),
+      TRUE ~ unname(agreement_fill_values["Neutral"])
+    ),
+    Modality = factor(Modality, levels = c("Pathways", "Cell Types")),
+    Category = factor(Category, levels = c(
+      "Proliferation", "Immune", "Metabolic",
+      "Adaptive", "Innate", "Stromal", "Other"
+    ))
+  )
+
+feat_levels <- combined_BD %>%
+  dplyr::distinct(Modality, Category, Feature) %>%
+  dplyr::arrange(Modality, Category, Feature) %>%
+  dplyr::pull(Feature) %>%
+  unique()
+combined_BD <- combined_BD %>%
+  dplyr::mutate(Feature = factor(Feature, levels = feat_levels))
+
+fig2_font <- list(base = 10, strip_mod = 10, strip_cat = 8.5,
+                  strip_section = 10, axis_feat = 8, axis_row = 9)
+
+p_combined_BD <- ggplot(combined_BD, ggplot2::aes(x = Feature, y = RowPos)) +
+  ggplot2::geom_point(
+    ggplot2::aes(size = Size, fill = Color),
+    shape = agreement_shape, color = "black", alpha = agreement_alpha
+  ) +
+  ggh4x::facet_nested(
+    Section ~ Modality + Category,
+    scales = "free_x", space = "free_x",
+    strip = ggh4x::strip_nested(
+      background_x = ggh4x::elem_list_rect(fill = c("grey93", "grey93")),
+      text_x = ggh4x::elem_list_text(
+        size = c(fig2_font$strip_mod, fig2_font$strip_cat),
+        face = c("bold", "bold")
+      ),
+      by_layer_x = TRUE
+    )
+  ) +
+  ggplot2::scale_y_continuous(
+    breaks = row_pos_tbl$RowPos, labels = row_pos_tbl$RowLab,
+    expand = ggplot2::expansion(add = c(0.35, 0.35))
+  ) +
+  ggplot2::scale_fill_identity() +
+  ggplot2::scale_size(range = agreement_size_range, limits = agreement_size_limits, guide = "none") +
+  ggplot2::theme_minimal(base_size = fig2_font$base) +
+  ggplot2::theme(
+    legend.position = "none",
+    axis.title.x = ggplot2::element_blank(),
+    axis.title.y = ggplot2::element_blank(),
+    panel.spacing.x = grid::unit(0.15, "lines"),
+    strip.text.y = ggplot2::element_text(size = fig2_font$strip_section, face = "bold", angle = -90),
+    strip.background = ggplot2::element_rect(fill = "grey93", color = NA),
+    axis.text.x = ggplot2::element_text(size = fig2_font$axis_feat, angle = 45, hjust = 1, vjust = 1),
+    axis.text.y = ggplot2::element_text(size = fig2_font$axis_row, face = "bold"),
+    panel.grid.major = ggplot2::element_blank(),
+    panel.grid.minor = ggplot2::element_blank()
+  )
+
+p_combined_BD
+ggsave(file.path(figures_root, "fig_pertissue_combined.pdf"),
+       p_combined_BD, width = 7.5, height = 5.5, units = "in")
+message("Saved: fig_pertissue_combined.pdf")
+```
+
+## Shared legend
+
+Two standalone legends covering all panels: dot color (age-trend direction and significance category) and dot size (`-log10(FDR)`, on the same fixed scale used by every panel).
+
+```{r}
+# --- Color / direction-significance legend ---
+legend_color_df <- tibble::tibble(
+  y = 4:1,
+  fill = unname(agreement_fill_values[c("Up_Sig", "Up_NS", "Down_Sig", "Down_NS")]),
+  label = c(
+    "Increase with age (FDR < 0.05)",
+    "Increase with age (FDR \u2265 0.05)",
+    "Decrease with age (FDR < 0.05)",
+    "Decrease with age (FDR \u2265 0.05)"
+  )
+)
+
+p_legend_color <- ggplot(legend_color_df, ggplot2::aes(x = 0, y = y)) +
+  ggplot2::geom_point(ggplot2::aes(fill = fill),
+                      shape = agreement_shape, size = 4.4, color = "black", alpha = agreement_alpha) +
+  ggplot2::geom_text(ggplot2::aes(x = 0.12, label = label), hjust = 0, size = 3.4) +
+  ggplot2::scale_fill_identity() +
+  ggplot2::coord_cartesian(xlim = c(-0.1, 2.4), ylim = c(0.5, 4.5), clip = "off") +
+  ggplot2::theme_void()
+
+p_legend_color
+ggsave(file.path(figures_root, "fig_legend_color.pdf"), p_legend_color,
+       width = 3.4, height = 1.6, units = "in")
+message("Saved: fig_legend_color.pdf")
+
+# --- Size legend (dot size = -log10 FDR, capped at 5; same scale as all panels) ---
+legend_size_df <- tibble::tibble(
+  y = 4:1,
+  size_val = c(5, 3, 2, 1),
+  label = c("\u2264 1e-5", "0.001", "0.01", "0.1")
+)
+
+p_legend_size <- ggplot(legend_size_df, ggplot2::aes(x = 0, y = y)) +
+  ggplot2::geom_point(ggplot2::aes(size = size_val),
+                      shape = agreement_shape, fill = "grey60", color = "black", alpha = agreement_alpha) +
+  ggplot2::geom_text(ggplot2::aes(x = 0.18, label = label), hjust = 0, size = 3.4) +
+  ggplot2::annotate("text", x = 0, y = 4.8, label = "FDR", hjust = 0, fontface = "bold", size = 3.6) +
+  ggplot2::scale_size(range = agreement_size_range, limits = agreement_size_limits, guide = "none") +
+  ggplot2::coord_cartesian(xlim = c(-0.2, 1.1), ylim = c(0.5, 5.0), clip = "off") +
+  ggplot2::theme_void()
+
+p_legend_size
+ggsave(file.path(figures_root, "fig_legend_size.pdf"), p_legend_size,
+       width = 1.6, height = 1.7, units = "in")
+message("Saved: fig_legend_size.pdf")
+```
+
+## Supplement — full pathway agreement (pan-tissue + per-tissue, all categories)
+
+Full pathway view: pan-tissue (GTEx, TCGA) and per-tissue blocks, all seven significant categories, nested per-tissue y-axis. Same color and size encoding as the main panels.
+
+```{r}
+gtex_tissue_label <- c(
+  "GTEx-BREAST" = "Breast",
+  "GTEx-LUNG"   = "Lung",
+  "GTEx-BRAIN"  = "Brain",
+  "GTEx-COLON"  = "Colon"
+)
+
+combined_pathway_global <- pathway_meta_long %>%
+  dplyr::transmute(
+    Pathway,
+    Column = Cohort,
+    Section = "Pan-tissue",
+    TissueBlock = "Pan-tissue",
+    fdr = fdr,
+    direction = direction
+  )
+
+combined_pathway_matched <- pathway_matched_long %>%
+  dplyr::transmute(
+    Pathway,
+    Column = dplyr::if_else(
+      grepl("^GTEx", Cohort),
+      dplyr::recode(Cohort, !!!gtex_tissue_label),
+      Cohort
+    ),
+    Section = "Per-tissue",
+    TissueBlock = dplyr::recode(
+      Tissue,
+      "BREAST" = "Breast",
+      "LUNG"   = "Lung",
+      "BRAIN"  = "Brain",
+      "COLON"  = "Colon"
+    ),
+    fdr = fdr,
+    direction = direction
+  )
+
+combined_pathway <- dplyr::bind_rows(
+  combined_pathway_global,
+  combined_pathway_matched
+) %>%
+  dplyr::mutate(
+    Category = assign_pathway_category(Pathway),
+    Category = factor(Category, levels = pathway_category_levels),
+
+    Sig = ifelse(!is.na(fdr) & fdr < 0.05, "Sig", "NS"),
+
+    Color = dplyr::case_when(
+      direction == "Up"   & Sig == "Sig" ~ unname(agreement_fill_values["Up_Sig"]),
+      direction == "Up"   & Sig == "NS"  ~ unname(agreement_fill_values["Up_NS"]),
+      direction == "Down" & Sig == "Sig" ~ unname(agreement_fill_values["Down_Sig"]),
+      direction == "Down" & Sig == "NS"  ~ unname(agreement_fill_values["Down_NS"]),
+      TRUE ~ unname(agreement_fill_values["Neutral"])
+    ),
+
+    Size = pmin(-log10(pmax(fdr, 1e-300)), 5)   # signed significance, harmonized
+  )
+
+column_levels <- c(
+  "GTEx", "TCGA",
+  "Breast", "BRCA",
+  "Lung",   "LUSC", "LUAD",
+  "Brain",  "GBM",  "LGG",
+  "Colon",  "COAD"
+)
+
+combined_pathway <- combined_pathway %>%
+  dplyr::filter(Column %in% column_levels) %>%
+  dplyr::mutate(
+    Column = factor(Column, levels = rev(column_levels)),
+    Section = factor(Section, levels = c("Pan-tissue", "Per-tissue")),
+    TissueBlock = factor(
+      TissueBlock,
+      levels = c("Pan-tissue", "Breast", "Lung", "Brain", "Colon")
+    )
+  )
+
+# Order pathways alphabetically within category, matching the pan-tissue panel.
+pathway_order <- combined_pathway %>%
+  dplyr::distinct(Category, Pathway) %>%
+  dplyr::arrange(Category, Pathway) %>%
+  dplyr::pull(Pathway) %>%
+  unique()
+
+combined_pathway <- combined_pathway %>%
+  dplyr::mutate(
+    Pathway_wrapped = stringr::str_wrap(Pathway, width = 30),
+    Pathway_wrapped = factor(
+      Pathway_wrapped,
+      levels = stringr::str_wrap(pathway_order, width = 30)
+    )
+  )
+
+p_pathway_combined <- ggplot(
+  combined_pathway,
+  ggplot2::aes(x = Pathway_wrapped, y = Column)
+) +
+  ggplot2::geom_tile(
+    fill = "white",
+    color = "grey90",
+    height = 0.7,
+    width = 0.85
+  ) +
+  ggplot2::geom_point(
+    ggplot2::aes(size = Size, fill = Color),
+    shape = agreement_shape,
+    color = "black",
+    alpha = agreement_alpha
+  ) +
+  ggh4x::facet_nested(
+    Section + TissueBlock ~ Category,
+    scales = "free",
+    space = "free",
+    switch = "y",
+    strip = ggh4x::strip_nested(
+      background_y = list(
+        ggplot2::element_rect(fill = "grey93", colour = NA),
+        ggplot2::element_blank()
+      ),
+      text_y = list(
+        ggplot2::element_text(face = "bold", size = 10, colour = "black"),
+        ggplot2::element_blank()
+      ),
+      by_layer_y = TRUE
+    )
+  ) +
+  ggplot2::scale_fill_identity() +
+  ggplot2::scale_size(range = agreement_size_range, limits = agreement_size_limits, guide = "none") +
+  ggplot2::theme_minimal(base_size = 10) +
+  ggplot2::theme(
+    legend.position = "none",
+
+    strip.placement = "outside",
+    strip.switch.pad.grid = grid::unit(0.1, "lines"),
+
+    panel.spacing.x = grid::unit(0.15, "lines"),
+    panel.spacing.y = grid::unit(c(1.2, 0.2, 0.2, 0.2), "lines"),
+
+    strip.text.x = ggplot2::element_text(size = 8.5, face = "bold"),
+    strip.text.y = ggplot2::element_text(size = 10, face = "bold"),
+    strip.background = ggplot2::element_rect(fill = "grey93", color = NA),
+
+    axis.text.x = ggplot2::element_text(
+      size = 8,
+      angle = 45,
+      hjust = 1,
+      vjust = 1
+    ),
+    axis.text.y = ggplot2::element_text(
+      size = 9,
+      face = "bold"
+    ),
+
+    axis.title.x = ggplot2::element_blank(),
+    axis.title.y = ggplot2::element_blank(),
+
+    panel.grid.major = ggplot2::element_blank(),
+    panel.grid.minor = ggplot2::element_blank()
+  )
+
+p_pathway_combined
+
+ggsave(
+  file.path(figures_root, "Supplement_pathway_full_pancohort_pertissue.pdf"),
+  p_pathway_combined,
+  width = 10,
+  height = 4.8,
+  units = "in"
+)
+
+message("Saved: Supplement_pathway_full_pancohort_pertissue.pdf")
+```
+
+## Save plot source tables
+
+```{r}
+utils::write.csv(
+  plot_pathway_meta,
+  file = file.path(tables_root, "fig_pancohort_pathway_plot_table.csv"),
+  row.names = FALSE
+)
+knitr::kable(plot_pathway_meta, caption = "Pan-tissue pathway agreement")
+
+utils::write.csv(
+  plot_celltype_meta,
+  file = file.path(tables_root, "fig_pancohort_celltype_plot_table.csv"),
+  row.names = FALSE
+)
+knitr::kable(plot_celltype_meta, caption = "Pan-tissue cell-type agreement")
+
+utils::write.csv(
+  combined_BD,
+  file = file.path(tables_root, "fig_pertissue_combined_plot_table.csv"),
+  row.names = FALSE
+)
+knitr::kable(combined_BD, caption = "Per-tissue combined pathways and cell types")
+
+utils::write.csv(
+  combined_pathway,
+  file = file.path(tables_root, "Supplement_pathway_full_plot_table.csv"),
+  row.names = FALSE
+)
+knitr::kable(combined_pathway, caption = "Full pathway agreement supplement")
+```
+
+## Session info
+
+```{r}
+sessionInfo()
+```

@@ -1,0 +1,145 @@
+---
+title: "Supplementary table — GTEx clock nested cross-validation performance"
+subtitle: "GTEx-only, nested-CV performance for the BREAST, BRAIN, LUNG, and COLON clocks"
+author: "Pan-cancer aging project"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: united
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  out_root: "/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/manuscript_analyses/results/derived/GTEx"  # derived GTEx dir (one subfolder per analysis_id)
+  feature_set: "PC"
+  analyses:                       # one analysis per GTEx tissue (clock is trained on GTEx only)
+    - "BRCA__BREAST"              # BREAST
+    - "LGG__BRAIN"                # BRAIN
+    - "LUAD__LUNG"                # LUNG
+    - "COAD__COLON"               # COLON
+  outer_k: 5                      # outer folds (generalization estimate)
+  inner_k: 10                     # inner folds (alpha/lambda tuning), matches Step 02
+  seed: 2026                      # any fixed seed; controls fold partitions
+  out_csv: "/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/manuscript_analyses/results/figures/supplemental/gtex_clock_nestedCV_performance.csv"
+  save_outputs: true             # TRUE writes the table to out_csv; never writes clock objects
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+suppressPackageStartupMessages({
+  library(glmnet); library(dplyr); library(tibble)
+  library(purrr); library(reactable); library(knitr)
+})
+```
+
+## What this does
+
+Nested cross-validation of the GTEx tissue clocks. The full alpha/lambda tuning
+(Step 02's search) is re-run inside each outer fold, so the reported R2/RMSE/MAE
+account for hyperparameter selection, not just fitting. This validates the
+*procedure*; the deployed clock is still the full-data model from Step 02. Its
+alpha and lambda are shown for reference. Read-only: nothing downstream changes.
+
+```{r helpers}
+# Age-decile-stratified k folds (matches Step 02's stratification).
+build_foldid <- function(y, k, seed) {
+  set.seed(seed)
+  bin <- dplyr::ntile(y, 10)
+  f <- integer(length(y))
+  for (b in sort(unique(bin))) {
+    idx <- which(bin == b)
+    f[idx] <- sample(rep(seq_len(k), length.out = length(idx)))
+  }
+  f
+}
+
+# Nested CV: tune (alpha grid x lambda via inner CV, lambda.1se) inside each
+# outer fold, refit on outer-train, predict the held-out outer fold.
+nested_oof <- function(x, y, alpha_grid, lambda_grid, outer_k, inner_k, seed) {
+  outer_fold <- build_foldid(y, outer_k, seed)
+  oof <- rep(NA_real_, length(y))
+  for (of in seq_len(outer_k)) {
+    tr <- outer_fold != of; te <- outer_fold == of
+    x_tr <- x[tr, , drop = FALSE]; y_tr <- y[tr]
+    inner_fold <- build_foldid(y_tr, inner_k, seed + of)
+
+    picks <- purrr::map_dfr(alpha_grid, function(a) {
+      cv <- cv.glmnet(x_tr, y_tr, alpha = a, foldid = inner_fold,
+                      type.measure = "mae", lambda = lambda_grid,
+                      standardize = TRUE, intercept = TRUE)
+      j <- which(cv$lambda == cv$lambda.1se)
+      tibble(alpha = a, lambda = cv$lambda.1se, mae = cv$cvm[j])
+    })
+    best <- picks[which.min(picks$mae), ]
+
+    fit <- glmnet(x_tr, y_tr, alpha = best$alpha, lambda = best$lambda,
+                  standardize = TRUE, intercept = TRUE)
+    oof[te] <- as.numeric(predict(fit, newx = x[te, , drop = FALSE], s = best$lambda))
+  }
+  oof
+}
+```
+
+```{r core}
+process_one <- function(analysis_id) {
+  suffix <- paste0("-", params$feature_set)
+  adir   <- file.path(params$out_root, analysis_id)
+  clock  <- readRDS(file.path(adir, paste0("clock_and_RAA_objects", suffix, ".rds")))
+  scores <- readRDS(file.path(adir, paste0("ssgsea_scores_gtex",     suffix, ".rds")))
+  meta   <- readRDS(file.path(adir, "sample_metadata.rds"))
+
+  feat        <- clock$feature_names
+  alpha_grid  <- as.numeric(clock$tuning$alpha_grid)
+  lambda_grid <- as.numeric(clock$tuning$lambda_grid)
+  if (length(alpha_grid) == 0) alpha_grid <- seq(0, 1, by = 0.1)
+
+  # Rebuild the training matrix exactly as Step 02.
+  x <- t(scores)[, feat, drop = FALSE]
+  y <- meta[rownames(x), "age_years"]
+  keep <- is.finite(y)
+  x <- x[keep, , drop = FALSE]; y <- as.numeric(y[keep])
+
+  oof <- nested_oof(x, y, alpha_grid, lambda_grid,
+                    params$outer_k, params$inner_k, params$seed)
+  ok  <- is.finite(oof) & is.finite(y)
+
+  cv_r2   <- cor(oof[ok], y[ok])^2                                   # squared Pearson r
+  # cv_r2 <- 1 - sum((oof[ok]-y[ok])^2)/sum((y[ok]-mean(y[ok]))^2)   # variance-explained alt.
+  cv_rmse <- sqrt(mean((oof[ok] - y[ok])^2))
+  cv_mae  <- mean(abs(oof[ok] - y[ok]))
+
+  n_nonzero <- if (!is.null(clock$retained)) nrow(clock$retained)
+               else sum(clock$clock_cs$beta != 0, na.rm = TRUE)
+
+  tibble(
+    `GTEx tissue`            = sub(".*__", "", analysis_id),
+    `n GTEx`                 = length(y),
+    `Age median`             = median(y),
+    `Age SD`                 = round(sd(y), 2),
+    `Age min`                = min(y),
+    `Age max`                = max(y),
+    `Input pathways`         = length(feat),
+    `Nonzero-coef pathways`  = n_nonzero,
+    `Nested-CV R2`           = round(cv_r2, 3),
+    `Nested-CV RMSE`         = round(cv_rmse, 2),
+    `Nested-CV MAE`          = round(cv_mae, 2),
+    `Deployed alpha`         = as.numeric(clock$tuning$best_alpha),
+    `Deployed lambda`        = signif(as.numeric(clock$tuning$best_lambda), 4)
+  )
+}
+
+perf_tbl <- purrr::map_dfr(params$analyses, process_one)
+```
+
+## Table
+
+```{r table}
+knitr::kable(perf_tbl, caption = "GTEx tissue clocks: descriptors and nested-CV performance.")
+reactable::reactable(perf_tbl, striped = TRUE, highlight = TRUE, defaultPageSize = 8)
+```
+
+```{r save, eval=isTRUE(params$save_outputs)}
+dir.create(dirname(params$out_csv), recursive = TRUE, showWarnings = FALSE)
+readr::write_csv(perf_tbl, params$out_csv)
+message("Wrote: ", params$out_csv)
+```

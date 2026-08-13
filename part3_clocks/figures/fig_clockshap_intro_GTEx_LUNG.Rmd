@@ -1,0 +1,460 @@
+---
+title: "ClockSHAP introduction (GTEx-LUNG)"
+subtitle: "Anchored age scatter, positive and negative deviator waterfalls, and per-value mechanism"
+author: "Pan-cancer aging project"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: united
+    toc: true
+    toc_float: true
+    code_folding: hide
+    css: /restricted/projectnb/agedisease/projects/pancancer_aging_pbock/manuscript_analyses/R/style.css
+params:
+  # ---- Analysis directory: LUAD__LUNG carries the LUNG clock + GTEx-LUNG ----
+  tcga_project: "LUAD"
+  gtex_project: "LUNG"
+  feature_set:  "PC"
+  base_dir:     "results/derived/GTEx"
+
+  # ---- GTEx sample-selection windows (deviation percentiles) ----
+  dev_q_neg: !r c(0.10, 0.35)
+  dev_q_pos: !r c(0.65, 0.90)
+
+  # Waterfall display
+  waterfall_top_n: 5
+  waterfall_min_bar: 2.0
+
+  # Pathway used for the "under the hood" mechanism panel
+  mech_pathway: "Epithelial Mesenchymal Transition"
+
+  # ---- Output directory ----
+  fig_dir:      "results/figures/fig_clockshap_intro"
+  save_figures: true
+  seed:         2026
+---
+
+<!--
+ClockSHAP introduction, four panels, single cohort (GTEx-LUNG):
+
+  Anchored scatter: predicted vs chronological age, two deviators highlighted,
+     annotated Mean Deviation = 0 (zero by construction in the reference).
+     Positive deviator shown in red, negative deviator in blue; each drives one
+     of the waterfalls below.
+  Positive waterfall: ClockSHAP contributions for the POSITIVE-deviator GTEx sample (red).
+  Negative waterfall: ClockSHAP contributions for the NEGATIVE-deviator GTEx sample (blue).
+  Mechanism: "Under the hood" — what a single ClockSHAP value is.
+     phi_k = w_k ( x_k - E[X_k | Age] ), where E[X_k|Age] is the per-feature GTEx
+     age trend (gamma0 + gamma1*age) and w_k = beta_k / sigma_k (clock is on
+     standardized features). Shown for one pathway (EMT) and the two highlighted
+     samples: same pathway, same reference line, opposite-sign contributions
+     because the samples sit on opposite sides of E[X|Age].
+
+Some panels may not appear in the published manuscript. Panels are assembled and
+typeset in Adobe Illustrator to produce the final figure.
+-->
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+set.seed(params$seed)
+```
+
+```{r libs}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(tidyr)
+  library(readr)
+  library(ggplot2)
+  library(grid)        # unit(), arrow()
+  library(here)
+
+  library(glmnet)
+  library(ClockSHAP)
+})
+```
+
+# 1 — Load LUNG clock + ClockSHAP infrastructure
+
+```{r load-lung}
+tcga_project <- params$tcga_project
+gtex_project <- params$gtex_project
+feature_set  <- params$feature_set
+base_dir     <- params$base_dir
+
+analysis_id  <- paste0(tcga_project, "__", gtex_project)
+analysis_dir <- file.path(here::here(base_dir), analysis_id)
+suffix       <- paste0("-", feature_set)
+
+clock_rds       <- file.path(analysis_dir, paste0("clock_and_RAA_objects", suffix, ".rds"))
+clockshap_rds   <- file.path(analysis_dir, paste0("clockshap_objects",     suffix, ".rds"))
+metadata_rds    <- file.path(analysis_dir, "sample_metadata.rds")
+scores_gtex_rds <- file.path(analysis_dir, paste0("ssgsea_scores_gtex", suffix, ".rds"))
+
+stopifnot(
+  file.exists(clock_rds),
+  file.exists(clockshap_rds),
+  file.exists(metadata_rds),
+  file.exists(scores_gtex_rds)
+)
+
+clock_results    <- readRDS(clock_rds)
+clockshap_bundle <- readRDS(clockshap_rds)
+metadata         <- readRDS(metadata_rds)
+scores_gtex      <- readRDS(scores_gtex_rds)
+
+feat <- clock_results$feature_names
+stopifnot(all(feat %in% rownames(scores_gtex)))
+
+message("LUNG clock features: ", length(feat),
+        " | GTEx-LUNG ssGSEA samples: ", ncol(scores_gtex))
+```
+
+# 2 — GTEx reference line (anchoring coefficients)
+
+```{r gtex-fit}
+pred_gtex <- clock_results$pred$GTEx
+age_gtex  <- clock_results$age$GTEx[names(pred_gtex)]
+
+ok_g       <- complete.cases(pred_gtex, age_gtex)
+pred_gtex  <- pred_gtex[ok_g]
+age_gtex   <- age_gtex[ok_g]
+
+bias_fit <- lm(pred_gtex ~ age_gtex)
+beta0    <- coef(bias_fit)[1]
+beta1    <- coef(bias_fit)[2]
+
+c(beta0 = unname(beta0), beta1 = unname(beta1), n_gtex = length(pred_gtex))
+```
+
+# 3 — ClockSHAP on GTEx-LUNG
+
+```{r gtex-clockshap}
+X_gtex_full <- t(scores_gtex[feat, , drop = FALSE])
+
+ids_keep      <- intersect(rownames(X_gtex_full), names(age_gtex))
+X_gtex_cs     <- X_gtex_full[ids_keep, , drop = FALSE]
+age_gtex_cs   <- as.numeric(age_gtex[ids_keep]); names(age_gtex_cs) <- ids_keep
+
+clock_cs  <- clockshap_bundle$clock
+reference <- clockshap_bundle$reference
+
+cs_gtex <- ClockSHAP::clockshap(
+  features  = X_gtex_cs,
+  age       = age_gtex_cs,
+  clock     = clock_cs,
+  reference = reference
+)
+
+inv_max <- max(abs(rowSums(cs_gtex$phi) - cs_gtex$deviation), na.rm = TRUE)
+message("GTEx-LUNG ClockSHAP invariant max |rowSums(phi) - deviation| = ", signif(inv_max, 3))
+stopifnot(inv_max < 1e-8)
+```
+
+```{r dev-vs-gtex-line-check}
+# Sanity: ClockSHAP "expected" should equal the GTEx pred-line at each sample's age.
+exp_recon <- beta0 + beta1 * cs_gtex$age
+d_dev <- max(abs(cs_gtex$deviation - (cs_gtex$predicted - exp_recon)), na.rm = TRUE)
+message(sprintf("[GTEx-LUNG] max|dev-(pred-line)| = %.3g", d_dev))
+stopifnot(d_dev < 1e-6)
+```
+
+# 4 — Clock metrics + deviation summary
+
+```{r clock-metrics}
+metrics_tbl <- tibble(
+  cohort = "GTEx-LUNG",
+  n      = length(pred_gtex),
+  r      = cor(pred_gtex, age_gtex),
+  MAE    = mean(abs(pred_gtex - age_gtex)),
+  mean_deviation = mean(cs_gtex$deviation, na.rm = TRUE),
+  sd_deviation   = sd(cs_gtex$deviation, na.rm = TRUE)
+)
+knitr::kable(metrics_tbl, digits = 3,
+             caption = "Clock fit (GTEx) + ClockSHAP deviation summary.")
+```
+
+```{r out-dir}
+out_dir <- here::here(params$fig_dir)
+if (isTRUE(params$save_figures)) dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+# 5 — Pick representative samples
+
+```{r pick-samples}
+pick_waterfall_sample <- function(cs, dev_q, top_n = 8, min_bar = 2.0, exclude = character()) {
+  phi <- cs$phi; ids <- rownames(phi)
+  ok  <- is.finite(cs$deviation) & is.finite(cs$expected) & is.finite(cs$predicted)
+  phi <- phi[ok, , drop = FALSE]; dev <- cs$deviation[ok]; ids <- ids[ok]
+
+  keep_excl <- !(ids %in% exclude)
+  phi <- phi[keep_excl, , drop = FALSE]; dev <- dev[keep_excl]; ids <- ids[keep_excl]
+
+  lo <- unname(stats::quantile(dev, dev_q[1], na.rm = TRUE))
+  hi <- unname(stats::quantile(dev, dev_q[2], na.rm = TRUE))
+  keep <- dev >= lo & dev <= hi
+  phi2 <- phi[keep, , drop = FALSE]; ids2 <- ids[keep]
+  if (nrow(phi2) == 0) stop("No samples left after dev_q filtering.", call. = FALSE)
+
+  top_abs  <- t(apply(abs(phi2), 1, function(v) sort(v, decreasing = TRUE)[seq_len(top_n)]))
+  min_top  <- apply(top_abs, 1, min); mean_top <- rowMeans(top_abs)
+  cand <- which(min_top >= min_bar); if (length(cand) == 0) cand <- seq_len(nrow(phi2))
+  ids2[cand[which.max(mean_top[cand])]]
+}
+
+# Hand-picked GTEx deviators: POSITIVE (red) and NEGATIVE (blue).
+sample_neg <- "GTEX-QDVN-0726-SM-4B64L.1"   # negative deviator (blue)
+sample_pos <- "GTEX-13JUV-0526-SM-5K7XE.1"  # positive deviator (red)
+
+# ---- To override any pick manually, uncomment and set IDs: ----
+# sample_neg <- "GTEX-XXXXX-..."
+# sample_pos <- "GTEX-XXXXX-..."
+
+pick_one <- function(cs, sid, label) {
+  i <- match(sid, rownames(cs$phi))
+  tibble(panel = label, sample_id = sid,
+         age = cs$age[i], predicted = cs$predicted[i],
+         expected = cs$expected[i], deviation = cs$deviation[i])
+}
+knitr::kable(bind_rows(
+  pick_one(cs_gtex, sample_pos, "GTEx pos"),
+  pick_one(cs_gtex, sample_neg, "GTEx neg")
+), digits = 2, caption = "Selected representative samples.")
+```
+
+---
+
+# GTEx-LUNG: predicted vs chronological age
+
+GTEx-LUNG on the anchored axis (`age + deviation`). The dashed identity line is the
+cohort expectation; the cohort sits on it (mean deviation 0 by construction). Two
+representative samples are highlighted (positive = red; negative = blue), each with a
+grey vertical segment to the identity line, labelled with its deviation. Each drives one
+of the waterfalls below.
+
+```{r panelA, fig.width=8, fig.height=5}
+cohort_pal <- c("GTEx-LUNG" = "#4daf4a", "LUAD-NAT" = "darkorange")
+
+# Combined legend palette: cohort + the two deviator directions in one scale.
+legend_pal <- c(
+  "GTEx-LUNG"                   = unname(cohort_pal[["GTEx-LUNG"]]),
+  "Positive deviator" = "#b2182b",
+  "Negative deviator" = "#2166ac"
+)
+
+gtex_df <- tibble(
+  sample_id     = rownames(cs_gtex$phi),
+  age_years     = as.numeric(cs_gtex$age),
+  pred_anchored = as.numeric(cs_gtex$age + cs_gtex$deviation)
+) %>%
+  filter(complete.cases(age_years, pred_anchored)) %>%
+  mutate(highlight = case_when(
+    sample_id == sample_pos ~ "positive",
+    sample_id == sample_neg ~ "negative",
+    TRUE                    ~ "other"
+  ))
+
+# Highlighted deviators carry their direction as the legend group
+gtex_hl <- gtex_df %>% filter(highlight != "other") %>%
+  mutate(legend_group = ifelse(highlight == "positive",
+                               "Positive deviator",
+                               "Negative deviator"),
+         deviation  = pred_anchored - age_years,
+         label_text = sprintf("%+.1f yr", deviation),
+         label_y    = ifelse(highlight == "positive", pred_anchored + 4, pred_anchored - 4))
+
+# Background cloud carries the cohort as its legend group
+gtex_bg <- gtex_df %>% mutate(legend_group = "GTEx-LUNG")
+
+gtex_mean_dev <- mean(cs_gtex$deviation, na.rm = TRUE)
+common_breaks <- c(20, 40, 60, 80)
+
+p_panelA <- ggplot() +
+  geom_point(data = gtex_bg, aes(age_years, pred_anchored, colour = legend_group),
+             alpha = 0.18, size = 1.2) +
+  geom_smooth(data = gtex_bg, aes(age_years, pred_anchored),
+              method = "lm", se = FALSE, colour = cohort_pal[["GTEx-LUNG"]], linewidth = 1.0) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "black") +
+  geom_segment(data = gtex_hl,
+               aes(x = age_years, y = pred_anchored, xend = age_years, yend = age_years),
+               colour = "grey40", linewidth = 0.9) +
+  geom_point(data = gtex_hl, aes(age_years, pred_anchored, colour = legend_group), size = 4.5) +
+  geom_text(data = gtex_hl, aes(age_years, label_y, label = label_text, colour = legend_group),
+            fontface = "bold", size = 5, hjust = -0.15, show.legend = FALSE) +
+  annotate("text", x = -Inf, y = Inf,
+           label = sprintf("Mean Deviation \u2248 %.1f yr", gtex_mean_dev),
+           hjust = -0.08, vjust = 1.6, size = 5, fontface = "italic") +
+  scale_colour_manual(values = legend_pal, name = NULL,
+                      breaks = c("GTEx-LUNG",
+                                 "Positive deviator",
+                                 "Negative deviator")) +
+  guides(colour = guide_legend(override.aes = list(alpha = 1, size = 3))) +
+  scale_x_continuous(breaks = common_breaks) +
+  scale_y_continuous(breaks = common_breaks) +
+  labs(x = "Chronological age (years)", y = "Predicted Age (GTEx-Anchored, years)") +
+  theme_minimal(base_size = 17) +
+  theme(legend.position = "right", legend.title = element_blank(),
+        panel.grid.minor = element_blank(), axis.ticks = element_line(),
+        axis.ticks.length = unit(2, "mm"), axis.title = element_text(size = 17),
+        axis.text = element_text(size = 15), legend.text = element_text(size = 13))
+p_panelA
+```
+
+```{r panelA-save}
+if (isTRUE(params$save_figures)) {
+  ggsave(file.path(out_dir, "GTEx_LUNG_scatter.pdf"), p_panelA,
+         width = 220/25.4, height = 130/25.4, units = "in")
+  message("Saved: GTEx_LUNG_scatter.pdf")
+}
+```
+
+---
+
+# GTEx-LUNG: positive-deviator ClockSHAP waterfall
+
+Decomposition of the positive-deviator GTEx sample (red in the anchored scatter) into pathway
+contributions summing to its age-matched deviation.
+
+```{r panelB, fig.width=8, fig.height=5}
+wf_common <- function(cs, sid) {
+  plot_clockshap_waterfall(
+    x = cs, sample = sid, top_n = params$waterfall_top_n,
+    show_age_labels = TRUE, show_delta_label = TRUE, show_effect_labels = TRUE, effect_label_min_frac = 0.1, 
+    x_axis_title = "Clock Age (years)", y_axis_title = NULL,
+    deviation_label = "Age-Matched Deviation = {value} yr",
+    expected_age_label = "Expected Age (GTEx)",
+    predicted_age_label = "Predicted Age",
+    effect_label = "{value}"
+  ) + theme(axis.title.x = element_text(size = 13),
+            axis.text.x = element_text(size = 11), axis.text.y = element_text(size = 11),
+            plot.margin = margin(t = 20, r = 10, b = 10, l = 10))
+}
+
+p_panelB <- wf_common(cs_gtex, sample_pos)
+p_panelB
+```
+
+```{r panelB-save}
+if (isTRUE(params$save_figures)) {
+  ggsave(file.path(out_dir, "GTEx_LUNG_waterfall_pos.pdf"), p_panelB,
+         width = 180/25.4, height = 90/25.4, units = "in")
+  message("Saved: GTEx_LUNG_waterfall_pos.pdf")
+}
+```
+
+---
+
+# GTEx-LUNG: negative-deviator ClockSHAP waterfall
+
+Decomposition of the negative-deviator GTEx sample (blue in the anchored scatter).
+Contrasting the two waterfalls shows that individual decompositions differ by sample and
+by direction — ClockSHAP captures per-sample heterogeneity.
+
+```{r panelC, fig.width=8, fig.height=5}
+p_panelC <- wf_common(cs_gtex, sample_neg)
+p_panelC
+```
+
+```{r panelC-save}
+if (isTRUE(params$save_figures)) {
+  ggsave(file.path(out_dir, "GTEx_LUNG_waterfall_neg.pdf"), p_panelC,
+         width = 180/25.4, height = 90/25.4, units = "in")
+  message("Saved: GTEx_LUNG_waterfall_neg.pdf")
+}
+```
+
+---
+
+# Under the hood: what a single ClockSHAP value is
+
+What a single ClockSHAP value is, demonstrated on one pathway (EMT). The line is the
+GTEx age trend `E[X_EMT|Age]`; the gap from line to point, times the clock weight, gives
+the φ in years. The two highlighted samples sit on opposite sides of the line, so the
+*same* pathway contributes a positive value for one (red) and a negative value for the
+other (blue). The formal equation lives next to this plot in the assembled figure.
+
+```{r panelD-mechanism, fig.width=7, fig.height=5}
+# --- Resolve the mechanism pathway (EMT) and its effective raw-scale weight ---
+emt_name <- if (params$mech_pathway %in% feat) params$mech_pathway else grep("Mesenchymal", feat, value = TRUE)[1]
+stopifnot(!is.na(emt_name), emt_name %in% feat)
+
+cs_params <- clock_results$clock_cs
+beta_k  <- cs_params$beta;  if (is.null(names(beta_k)))  names(beta_k)  <- feat
+sigma_k <- cs_params$sigma; if (is.null(names(sigma_k))) names(sigma_k) <- feat
+w_emt   <- as.numeric(beta_k[emt_name] / sigma_k[emt_name])
+
+# --- GTEx EMT scores vs age + age-conditioned reference line E[X_EMT|Age] ---
+emt_ids  <- rownames(cs_gtex$phi)
+emt_gtex <- tibble(
+  sample_id = emt_ids,
+  age       = as.numeric(cs_gtex$age),
+  emt_obs   = X_gtex_cs[emt_ids, emt_name]
+) %>% filter(complete.cases(age, emt_obs))
+
+emt_fit <- lm(emt_obs ~ age, data = emt_gtex)
+g0_emt  <- unname(coef(emt_fit)[1]); g1_emt <- unname(coef(emt_fit)[2])
+
+# QA: reconstructed phi must match ClockSHAP phi for EMT
+emt_gtex <- emt_gtex %>%
+  mutate(emt_exp   = g0_emt + g1_emt * age,
+         phi_recon = w_emt * (emt_obs - emt_exp),
+         phi_cs    = cs_gtex$phi[sample_id, emt_name])
+phi_err <- max(abs(emt_gtex$phi_recon - emt_gtex$phi_cs), na.rm = TRUE)
+message(sprintf("EMT phi reconstruction max abs error = %.3g (should be ~0)", phi_err))
+stopifnot(phi_err < 1e-6)
+
+# --- Two highlighted samples: positive (red) and negative (blue) ---
+dir_pal <- c("Positive deviator" = "#b2182b",
+             "Negative deviator" = "#2166ac")
+hl <- emt_gtex %>%
+  filter(sample_id %in% c(sample_pos, sample_neg)) %>%
+  mutate(direction = ifelse(sample_id == sample_pos,
+                            "Positive deviator", "Negative deviator"),
+         phi_lab  = sprintf('phi[EMT] == "%+.1f yr"', phi_cs),
+         lab_h    = ifelse(sample_id == sample_pos, -0.12, 1.12))
+
+p_panelD <- ggplot() +
+  # GTEx cloud
+  geom_point(data = emt_gtex, aes(age, emt_obs), colour = "grey75", alpha = 0.22, size = 1.1) +
+  # E[X_EMT | Age] reference line (no label here — add in AI if you want it)
+  geom_abline(slope = g1_emt, intercept = g0_emt, colour = "grey20", linewidth = 1.0) +
+  # gaps: expected -> observed, coloured by direction
+  geom_segment(data = hl, aes(x = age, xend = age, y = emt_exp, yend = emt_obs, colour = direction),
+               linewidth = 1.1, show.legend = FALSE) +
+  # expected points (open, on line) + observed points (filled)
+  geom_point(data = hl, aes(age, emt_exp), shape = 21, fill = "white", colour = "grey20",
+             size = 2.6, stroke = 0.9) +
+  geom_point(data = hl, aes(age, emt_obs, colour = direction), size = 4.8) +
+  # phi value labels (parsed plotmath)
+  geom_text(data = hl, aes(age, emt_obs, label = phi_lab, colour = direction, hjust = lab_h),
+            parse = TRUE, fontface = "bold", size = 4.6, vjust = -0.5, show.legend = FALSE) +
+  scale_y_continuous(expand = expansion(mult = c(0.20, 0.05))) +
+  scale_colour_manual(values = dir_pal, name = NULL) +
+  guides(colour = guide_legend(override.aes = list(size = 3.2))) +
+  labs(x = "Chronological age (years)",
+       y = "EMT score (ssGSEA)") +
+  theme_minimal(base_size = 15) +
+  theme(panel.grid.minor = element_blank(),
+        legend.position = "right", legend.title = element_blank(),
+        legend.text = element_text(size = 12),
+        axis.title = element_text(size = 15),
+        axis.text.x = element_text(size = 13),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+p_panelD
+```
+
+```{r panelD-save}
+if (isTRUE(params$save_figures)) {
+  ggsave(file.path(out_dir, "EMT_mechanism.pdf"), p_panelD,
+         width = 175/25.4, height = 125/25.4, units = "in")
+  message("Saved: EMT_mechanism.pdf")
+}
+```
+
+# Session info
+
+```{r session}
+sessionInfo()
+```

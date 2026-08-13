@@ -1,0 +1,83 @@
+# ============================================================================
+# Protected and derived data
+#
+# This repository contains analysis code only. It must never contain
+# controlled-access data (GTEx protected phenotypes, dbGaP-derived material)
+# or large derived objects. The rules below are deliberately broad.
+# ============================================================================
+data/
+results/
+*.rds
+*.RDS
+*.RData
+*.rda
+*.h5
+*.h5ad
+*.mtx
+*.bam
+*.fastq
+*.fastq.gz
+*.vcf
+*.vcf.gz
+*.maf
+
+# Analysis outputs, wherever they land
+*.csv
+*.tsv
+*.txt.gz
+!renv.lock
+
+# ============================================================================
+# Credentials and machine-specific configuration
+# ============================================================================
+.Renviron
+!.Renviron.example
+*token*
+*credential*
+gdc-user-token*
+.netrc
+
+# ============================================================================
+# R and RStudio
+# ============================================================================
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+.Rapp.history
+
+# ============================================================================
+# renv
+# The lockfile and activation scripts are tracked so the environment is
+# reconstructable. The installed library itself is not.
+# ============================================================================
+renv/library/
+renv/local/
+renv/cellar/
+renv/lock/
+renv/python/
+renv/staging/
+
+# ============================================================================
+# knitr and rmarkdown intermediates
+#
+# Rendered .html reports ARE tracked; they are the readable record of the
+# analysis. Only the scratch directories that accompany them are excluded.
+# ============================================================================
+*_cache/
+*_files/
+!*.html
+
+# ============================================================================
+# Stray output and OS clutter
+# ============================================================================
+Rplot.pdf
+Rplots.pdf
+.DS_Store
+Thumbs.db
+*~
+.ipynb_checkpoints/
+
+# Repository build scaffolding, not part of the analysis
+build_repo_standalone.sh
+add_repo_files.sh

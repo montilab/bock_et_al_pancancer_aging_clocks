@@ -1,0 +1,381 @@
+---
+title: "TCGA DNA Methylation - Data Preprocessing"
+subtitle: "TCGA PanCancer Aging"
+author: "Payton Bock - Monti Lab"
+date:   "`r format(Sys.Date(), '%B %d, %Y')`"
+params: 
+  dummy: "dummy"
+output:
+  html_document:
+    theme: united
+    code_folding: hide
+    css: style.css
+    toc: true
+    toc_float: true
+---
+
+```{r opts, echo=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+```{r setup, include=FALSE}
+#r library
+.libPaths("/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/r-library/")
+
+#libraries
+library(dplyr)
+library(SummarizedExperiment)
+library(ggplot2)
+library(reshape2)
+
+#This library is used to access cross-reactive probes
+library(maxprobes)
+
+#get environmental variables
+PATH <- file.path( Sys.getenv("PCANAGE","/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/")) 
+TCGA <- file.path( Sys.getenv("CBMDATA","/restricted/projectnb/agedisease/CBMrepositoryData/"), "TCGA-GDC")
+```
+
+## Script Summary 
+- Filters probes (CpG sites) in each SummarizedExperiment object (TCGA project) 
+
+- Creates a histogram plot showing the # of probes removed at each filtering step
+
+- Saves processed SummarizedExperiments
+
+## Data Loading
+Load in SummarizedExperiment RDS objects and define output directory
+```{r data loading}
+#Path where the summarized experiment objects you are updating are located
+se_directory <- file.path(TCGA, "methylation/processed_data/all/")
+
+#Path to directory you want to output to
+output_directory <- file.path(PATH, "data/methylation/processed_SummarizedExperiments")
+plot_path <- file.path(PATH,"data/methylation/preprocessing_plots")
+```
+
+Here we load in a single TCGA project (BRCA) to show the workflow
+```{r Load in BRCA object}
+BRCA_methyl <- readRDS(file.path(TCGA,"methylation/processed_data/all/TCGA-BRCA_methylation.rds"))
+```
+
+## Probe Filtering
+These are the preprocessing steps taken to remove poor performing probes (CpG sites)
+that may influence downstream analysis. There is no consensus preprocessing steps, so I performed
+the ones that appeared most often in literature. 
+
+Note that we are starting from BETA values (level 3 methylation data) that has already 
+undergone some preprocessing using the Sesame pipeline: 
+
+Link to GDC's explanation of methylation processing
+( https://docs.gdc.cancer.gov/Data/Bioinformatics_Pipelines/Methylation_Pipeline/)
+
+Here we remove (per TCGA project):
+  All NA Probes: These probes are missing all of their values, most likely due to 
+  low detection p-value calculated during Sesame workflow
+  
+  Non-CpG probes: This is a common preprocessing step to remove probes targeting 
+  sites that are not "CpG", usually called "ch" as it indicates a C followed by either A,T, or C. 
+  
+  Probes that Overlap with SNPs: SNPs can affect probe binding and methylation readings. 
+  We remove both "common" SNPs and those with a minor allele frequency greater than 1%. This is determined
+  using the MASK annotations (see next) from a 2017 paper. 
+
+  General Mask Probes: This step helps in removing probes flagged for various issues, 
+  adding another layer of quality control. This is generated from a 2017 study (https://doi.org/10.1093/nar/gkw967) which
+  created all MASK annotations through testing which CpGs methylation levels are heavily affected by SNPs, repetitive regions,
+  etc. 
+  
+  Probes with more than 20% missing values: Setting a threshold (like 20%) for 
+  missing values is standard practice. If a probe has more than 20% of its value 
+  missing across samples, drop it
+  
+  Cross-Reactive probes: Probes that have been proven to bind to multiple sequences
+  We use "maxprobe" here which combines results from two papers identifying cross
+  reactive probes :  https://github.com/markgene/maxprobes
+
+  Removing Probes on Sex Chromosomes: Relevant if sex chromosome-related variations 
+  are not the focus of your study. Sex chromosome probes perform poorly and are 
+  difficult to account for when analyzing both genders. 
+
+```{r Removing bad Cpg sites}
+ filter_probes <- function(summarized_experiment) {
+    initial_count <- dim(SummarizedExperiment::assay(summarized_experiment))[1]
+    cat("Number of CpG probes initially: ", initial_count, "\n")
+    
+    # Remove rows with all NAs
+    rows_with_all_na <- rowSums(!is.na(SummarizedExperiment::assay(summarized_experiment))) == 0
+    methyl_subset <- summarized_experiment[!rows_with_all_na, ]
+    post_na_count <- dim(SummarizedExperiment::assay(methyl_subset))[1]
+    cat("Number of ALL NA CpG probes removed: ", initial_count - post_na_count, "\n")
+    
+    # Remove non-CpG probes
+    methyl_subset <- methyl_subset[SummarizedExperiment::rowData(methyl_subset)$probeType != "ch", ]
+    post_nonCpG_count <- dim(SummarizedExperiment::assay(methyl_subset))[1]
+    cat("Number of non-CpG probes removed: ", post_na_count - post_nonCpG_count, "\n")
+    
+    # Remove probes that overlap with SNPs (at least 1% MAF in any population)
+    methyl_subset <- methyl_subset[!SummarizedExperiment::rowData(methyl_subset)$MASK_snp5_common, ]
+    post_snp_common_count <- dim(SummarizedExperiment::assay(methyl_subset))[1]
+    cat("Number of common SNP probes removed: ", post_nonCpG_count - post_snp_common_count, "\n")
+    
+    # Remove any probes that have a GLOBAL minor allele freq >1%
+    methyl_subset <- methyl_subset[!SummarizedExperiment::rowData(methyl_subset)$MASK_snp5_GMAF1p, ]
+    post_snp_GMAF1_count <- dim(SummarizedExperiment::assay(methyl_subset))[1]
+    cat("Number of probes with SNPS MAF >1% removed: ", post_snp_common_count - post_snp_GMAF1_count, "\n")
+    
+    # Remove any probes that are flagged with MASK_general
+    # This is a combination of multiple flags indicating a problematic probe
+    # Usually only all NA probes are flagged (should already be removed)
+    methyl_subset <- methyl_subset[!SummarizedExperiment::rowData(methyl_subset)$MASK_general, ]
+    post_mask_gen_count <- dim(SummarizedExperiment::assay(methyl_subset))[1]
+    cat("Number of flagged probes removed: ", post_snp_GMAF1_count - post_mask_gen_count, "\n")
+    
+    # Calculate the proportion of missing values for each probe in the subset
+    proportion_missing <- apply(SummarizedExperiment::assay(methyl_subset), 1, function(x) sum(is.na(x)) / length(x))
+    # Identify probes with more than 20% missing values
+    probes_to_remove <- which(proportion_missing > 0.20)
+    # Remove these probes from the subset
+    methyl_subset <- methyl_subset[-probes_to_remove, ]
+    post_gt20missing_probe_count <- dim(SummarizedExperiment::assay(methyl_subset))[1]
+    cat("Number of probes with >20% missing values removed: ", post_mask_gen_count - post_gt20missing_probe_count, "\n")
+    
+    # Finally remove cross reactive probes (from the maxprobes library)
+    xloci <- maxprobes::xreactive_probes(array_type = "450K")
+    rows_to_keep <- !rownames(methyl_subset) %in% xloci
+    methyl_subset <- methyl_subset[rows_to_keep, ]
+    post_crossreactive_probe_count <- dim(SummarizedExperiment::assay(methyl_subset))[1]
+    cat("Number of cross reactive probes removed: ", post_gt20missing_probe_count - post_crossreactive_probe_count, "\n")
+    
+    # Remove any probes that are on sex chromosomes (X and Y)
+    methyl_filtered <- methyl_subset[!SummarizedExperiment::rowData(methyl_subset)$chrm_A %in% c("chrX", "chrY"), ]
+    final_count <- dim(SummarizedExperiment::assay(methyl_filtered))[1]
+    cat("Number of sex chromosome probes removed: ", post_crossreactive_probe_count - final_count, "\n")
+    
+    cat("Number of CpG sites after all filtering: ", final_count, "\n")
+    
+    # Return list of results
+    list(
+        filtered_data = methyl_filtered, 
+        initial_count = initial_count, 
+        final_count = final_count,
+        post_na_count = post_na_count,
+        post_nonCpG_count = post_nonCpG_count,
+        post_snp_common_count = post_snp_common_count,
+        post_snp_GMAF1_count = post_snp_GMAF1_count,
+        post_mask_gen_count = post_mask_gen_count,
+        post_gt20missing_probe_count = post_gt20missing_probe_count,
+        post_crossreactive_probe_count = post_crossreactive_probe_count
+    )
+}
+
+methyl_filtered <- filter_probes(BRCA_methyl)
+
+BRCA_methyl_filtered <- methyl_filtered$filtered_data
+# Check that the metadata associated with a randomly selected probe is the same after filtering
+cat("Randomly Selected probe metadata is the same after filtering: ", 
+    identical(SummarizedExperiment::rowData(BRCA_methyl_filtered)["cg16619049", ], 
+              SummarizedExperiment::rowData(BRCA_methyl)["cg16619049", ]))
+
+cat("Randomly Selected probe methylation values are the same after filtering: ", 
+    identical(SummarizedExperiment::assay(BRCA_methyl_filtered)["cg16619049", ], 
+              SummarizedExperiment::assay(BRCA_methyl)["cg16619049", ]))
+
+```
+
+## Filtering Visualization
+Here, we plot the number of probes (CpG sites) removed during each step of the
+filtering process. 
+
+Its important to note this calculates the number of probes removed at each STEP, 
+not necessarily the number of original probes that would be dropped from filtering 
+the category. 
+
+For example, in the BRCA project we had 8657 probes removed for having >20%
+missing values. This occurs after the removal of the ALL NA probes, and thus does
+not represent the # of probes with >20% missing values but just the remaining probes
+at the step of the filtering. 
+
+Likewise, there are roughly 39,000 cross reactive probes but only the remaining cross reactive
+probes are removed by that filtering step (2784), meaning the remaining were already removed
+
+```{r Plot of filtered probes}
+plot_removed_probes <- function(filtered_data) {
+    # Extract counts from the filtered_data list
+    initial_count <- filtered_data$initial_count
+    post_na_count <- filtered_data$post_na_count
+    post_nonCpG_count <- filtered_data$post_nonCpG_count
+    post_snp_common_count <- filtered_data$post_snp_common_count
+    post_snp_GMAF1_count <- filtered_data$post_snp_GMAF1_count
+    post_mask_gen_count <- filtered_data$post_mask_gen_count
+    post_gt20missing_probe_count <- filtered_data$post_gt20missing_probe_count
+    post_crossreactive_probe_count <- filtered_data$post_crossreactive_probe_count
+    final_count <- filtered_data$final_count
+
+    removed_counts <- c(
+        initial_count - post_na_count,
+        post_na_count - post_nonCpG_count,
+        post_nonCpG_count - post_snp_common_count,
+        post_snp_common_count - post_snp_GMAF1_count,
+        post_snp_GMAF1_count - post_mask_gen_count,
+        post_mask_gen_count - post_gt20missing_probe_count,
+        post_gt20missing_probe_count - post_crossreactive_probe_count,
+        post_crossreactive_probe_count - final_count
+    )
+
+    data_to_plot <- data.frame(
+        Step = c("All NAs", "Non-CpG", "SNP Common", "SNP GMAF>1%", "MASK_general", ">20% Missing Values", "Cross-reactive probes", "ChrX/Y"),
+        Probes_Removed = removed_counts
+    )
+
+    # Sort data from largest to smallest number of probes removed
+    data_to_plot <- data_to_plot[order(-data_to_plot$Probes_Removed),]
+
+    # Create the plot
+    ggplot2::ggplot(data_to_plot, ggplot2::aes(x = reorder(Step, -Probes_Removed), y = Probes_Removed, fill = Step)) +
+        ggplot2::geom_bar(stat = "identity") +
+        ggplot2::geom_text(ggplot2::aes(label = Probes_Removed), vjust = -0.3, color = "black", size = 3.5) +
+        ggplot2::scale_fill_brewer(palette = "Set3") +
+        ggplot2::theme_minimal() +
+        ggplot2::labs(title = "Number of Probes Removed at Each Filtering Step", 
+             x = "Filtering Step", y = "Number of Probes Removed") +
+        ggplot2::theme(legend.title = ggplot2::element_blank(), legend.position = "bottom") + 
+        ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1)) # Rotate x-axis labels
+}
+
+# Example usage
+plot_removed_probes(methyl_filtered)
+
+
+#rds_to_Save <- methyl_filtered$filtered_data
+#saveRDS(rds_to_Save, "/restricted/projectnb/agedisease/projects/pancancer_aging/data/methylation/filtered_SummarizedExperiments/TCGA-BRCA_methylation.rds" )
+```
+
+## Comment on Normalization
+The TCGA DNA methylation data (level 3 beta values) were processed using the Sesame pipeline, 
+which is  designed to  reduce both inter- and intra-array technical variations, 
+including probe type biases and batch effects. Given the comprehensive preprocessing by Sesame,  
+additional normalization should not be necessary at this step.
+
+Papers that start from the level 3 beta values do not mention any normalization steps. 
+
+```{r Normalization check}
+# Function to plot beta-value distributions for different probe types with random sampling
+plot_beta_distributions_by_type_sampled <- function(methyl_data, sample_size = 10000) {
+  # Extract beta values
+  beta_values <- SummarizedExperiment::assay(methyl_data)
+
+  # Extract probe types from rowData
+  probe_types <- SummarizedExperiment::rowData(methyl_data)$designType
+
+  # Randomly sample probes
+  sampled_indices <- sample(nrow(SummarizedExperiment::assay(methyl_data)), sample_size)
+
+  # Filter beta values and probe types based on sampled indices
+  sampled_beta_values <- beta_values[sampled_indices, ]
+  sampled_probe_types <- probe_types[sampled_indices]
+  
+  # Convert to long format
+  sampled_beta_values_long <- reshape2::melt(sampled_beta_values)
+  sampled_beta_values_long$Type <- sampled_probe_types
+
+  # Ensure there are at least two types before plotting
+  if (length(unique(sampled_beta_values_long$Type)) < 2) {
+    stop("Not enough probe types for comparison. Please check your data.")
+  }
+
+  # Plot distributions
+  ggplot2::ggplot(sampled_beta_values_long, ggplot2::aes(x = value, fill = Type)) +
+    ggplot2::geom_density(alpha = 0.5) +
+    ggplot2::labs(title = "Sampled Beta Value Distributions by Probe Type",
+         x = "Beta Value", y = "Density",
+         fill = "Probe Type") +
+    ggplot2::scale_fill_brewer(palette = "Set1") +  # Use a specific palette
+    ggplot2::theme_minimal()
+}
+
+# Example usage with a sample size of 100,000 probes
+plot_beta_distributions_by_type_sampled(BRCA_methyl_filtered, sample_size = 100000)
+
+```
+
+## M-Values versus Beta-Values
+Here we plot the distributions of the beta values and M-values. 
+```{r}
+set.seed(123)  # For reproducibility
+
+# Extract M-values and Beta-values
+m_values <- SummarizedExperiment::assay(BRCA_methyl_filtered, "M-values")
+b_values <- SummarizedExperiment::assay(BRCA_methyl_filtered, "Beta-values")
+
+# Sample M-values
+sampled_m_values <- m_values[sample(nrow(m_values), 10000), ]
+sampled_m_values_long <- reshape2::melt(sampled_m_values, na.rm = TRUE, value.name = "M_value")
+
+# Plot M-values
+ggplot2::ggplot(sampled_m_values_long, ggplot2::aes(x = M_value)) +
+    ggplot2::geom_histogram(bins = 50, fill = "blue", color = "black") +
+    ggplot2::theme_minimal() +
+    ggplot2::labs(title = "Distribution of Sampled M-values", x = "M-value", y = "Frequency")
+
+# Sample Beta-values
+sampled_b_values <- b_values[sample(nrow(b_values), 10000), ]
+sampled_b_values_long <- reshape2::melt(sampled_b_values, na.rm = TRUE, value.name = "Beta_value")
+
+# Plot Beta-values
+ggplot2::ggplot(sampled_b_values_long, ggplot2::aes(x = Beta_value)) +
+    ggplot2::geom_histogram(bins = 50, fill = "red", color = "black") +
+    ggplot2::theme_minimal() +
+    ggplot2::labs(title = "Distribution of Sampled Beta-values", x = "Beta-value", y = "Frequency")
+
+```
+
+
+
+## Apply Filtering to all TCGA projects
+Here we apply the two defined functions to all TCGA projects to perform filtering.
+  - Filter probes
+  - Calculate M-Values and add them as a second assay in Summarized Experiment Object
+
+Note: A different number of probes are removed from each project. 
+
+This code block outputs the now filtered SummarizedExperiment objects to the following directory
+- /restricted/projectnb/agedisease/projects/pancancer_aging_pbock/data/methylation/processed_SummarizedExperiments
+
+and the histogram visualization of removed probes to: 
+- /restricted/projectnb/agedisease/projects/pancancer_aging_pbock/data/methylation/preprocessing_plots
+
+```{r filter SEs}
+# Creates a list of all files ending in .rds in se_directory
+file_list <- list.files(path = se_directory, pattern = "*.rds", full.names = TRUE)
+
+# Loop through each file
+for (file_path in file_list) {
+    cat("Filtering and saving ", file_path)
+  
+    # Read the SummarizedExperiment object
+    se_obj <- readRDS(file_path)
+
+    # Apply filter_probes function
+    filtered_result <- filter_probes(se_obj)
+
+    # Define new file names for the output
+    file_name <- basename(file_path)
+    new_file_path <- file.path(output_directory, file_name)
+    plot_file_path <- file.path(plot_path, sub("\\.rds$", "_FilteringSummary.png", file_name))
+    
+    # Add M-values and save SummarizedExperiment object
+    new_se <- filtered_result$filtered_data
+    #new_se <- calc_mvals(new_se)
+    saveRDS(new_se, new_file_path)
+
+    # Generate and save the plot
+    ggplot2::ggsave(plot_file_path, plot = plot_removed_probes(filtered_result), width = 10, height = 8)
+}
+```
+
+
+## Session Info
+```{r}
+sessionInfo()
+```

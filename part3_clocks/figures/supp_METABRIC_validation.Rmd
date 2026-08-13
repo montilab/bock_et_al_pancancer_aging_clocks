@@ -1,0 +1,1675 @@
+---
+title: "METABRIC Validation — Common Gene Universe (clean)"
+subtitle: "Processing → ssGSEA → elastic-net clock → ClockSHAP → figures → OS → diagnostics"
+author: "Payton Bock — Monti Lab"
+date:   "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: united
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  # Canonical pipeline location (matches 01_processing + 02_aging_clock)
+  proc_dir: "/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/manuscript_analyses/results/derived/GTEx/BRCA__BREAST"
+
+  # Raw external data sources (processed inline)
+  scanb_se_rds:      "/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/data/GTEx/scanbe_se.rds"
+  metabric_eset_rds: "/restricted/projectnb/montilab-p/CBMrepositoryData/METABRIC/ESets/metabric_GE_ESet.rds"
+
+  # TP53 sources (used only for heatmap annotation in Panel C)
+  metabric_tp53_tsv: "/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/manuscript_analyses/data/metadata/METABRIC_TP53_cBioPortal.tsv"
+  scanb_tp53_tsv:    "/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/manuscript_analyses/data/metadata/SCANB-mutation-info.tsv"
+
+  # TCGA-BRCA clinical (for stacked OS analysis in Panels E + F)
+  clinical_csv: "/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/manuscript_analyses/data/survival/2018_TCGA-IntegratedClinical.csv"
+
+  # Output directory for figures
+  fig_out_dir: "/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/manuscript_analyses/results/figures/supplemental-METABRIC"
+
+  # Clock training
+  feature_set: "PC"
+  seed: 2026
+  n_folds: 10
+  alpha_grid: NULL              # NULL → seq(0, 1, by = 0.1)
+  lambda_min_exp: -4
+  lambda_max_exp: 2
+  n_lambda: 60
+  lambda_choice: "lambda.1se"
+
+  # Behavior
+  verbose: true
+
+  # Panel A — PCA cohort balancing
+  # SCAN-B is the largest cohort (~6k tumors) and dominates both the variance
+  # structure of the joint PCA and the visual density on the plot. To get a
+  # more balanced cross-cohort view, randomly subsample SCAN-B to this many
+  # samples before fitting the PCA. Set to NULL (or any non-finite number)
+  # to use all SCAN-B samples.
+  panelA_scanb_subsample_n: 1500
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+set.seed(params$seed)
+```
+
+```{r libs}
+suppressPackageStartupMessages({
+  library(SummarizedExperiment)
+  library(edgeR)
+  library(GSVA)
+  library(msigdbr)
+  library(stringr)
+  library(dplyr)
+  library(tibble)
+  library(tidyr)
+  library(ggplot2)
+  library(purrr)
+  library(broom)
+  library(scales)
+  library(glmnet)
+  library(survival)
+  library(AnnotationDbi)
+  library(org.Hs.eg.db)
+  library(ClockSHAP)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(grid)
+  library(forcats)
+})
+
+vcat <- function(...) if (isTRUE(params$verbose)) cat(..., "\n")
+```
+
+# Overview
+
+End-to-end replication of the BRCA aging-clock framework with **GTEx, TCGA, SCAN-B, and METABRIC scored on a common gene universe**.
+
+Pipeline:
+
+1. Load canonical GTEx/TCGA logCPM and metadata (output of `01_processing_clean_template`)
+2. Process SCAN-B SE (raw counts → logCPM → symbol-collapsed)
+3. Process METABRIC ESet (microarray log-intensity → symbol-collapsed); native `Pam50_SUBTYPE` retained as-is
+4. Compute intersection of gene symbols available in all four cohorts (common universe)
+5. Hallmark ssGSEA per cohort on the common universe
+6. Retrain elastic-net clock on GTEx
+7. Apply clock to TCGA / SCAN-B / METABRIC; compute GTEx-anchored deviation
+8. Run ClockSHAP with GTEx as reference
+9. Build manuscript figure panels (A: PCA, B: anchored age, C: heatmaps, D: PAM50 deviation, G: pathway × PAM50)
+10. Overall survival (Cox + KM) stacked across TCGA-BRCA + SCAN-B + METABRIC: Panels E (forest) + F (KM by deviation tertile)
+11. Stability diagnostics: Hallmark coverage, original-vs-retrained clock comparison, METABRIC composition
+
+# 1. Load canonical GTEx + TCGA
+
+```{r load_canonical}
+proc_dir <- params$proc_dir
+stopifnot(dir.exists(proc_dir))
+
+logcpm_gtex_sym <- readRDS(file.path(proc_dir, "logcpm_gtex_sym-PC.rds"))
+logcpm_nt_sym   <- readRDS(file.path(proc_dir, "logcpm_nt_sym-PC.rds"))
+logcpm_pt_sym   <- readRDS(file.path(proc_dir, "logcpm_pt_sym-PC.rds"))
+metadata        <- readRDS(file.path(proc_dir, "sample_metadata.rds"))
+
+vcat("GTEx logCPM:",    paste(dim(logcpm_gtex_sym), collapse = " x "))
+vcat("TCGA-NAT logCPM:", paste(dim(logcpm_nt_sym),   collapse = " x "))
+vcat("TCGA-PT logCPM:", paste(dim(logcpm_pt_sym),   collapse = " x "))
+```
+
+# 2. Process SCAN-B (counts → logCPM, symbol-collapsed)
+
+Same logic as `supp_SCANB_replication_BRCA_clock`: best replicate per Sample by ALIGNED_PAIRS, primary invasive tumors only, edgeR logCPM, Ensembl → SYMBOL collapse by mean.
+
+```{r scanb_process}
+scanb <- readRDS(params$scanb_se_rds)
+
+# Best replicate per Sample, invasive primary tumors only
+cd <- as.data.frame(colData(scanb))
+cd$run_id <- rownames(cd)
+
+best_replicates <- cd |>
+  group_by(Sample) |>
+  slice_max(order_by = ALIGNED_PAIRS, n = 1, with_ties = FALSE) |>
+  ungroup()
+
+scanb_best <- scanb[, best_replicates$run_id]
+
+cd2 <- as.data.frame(colData(scanb_best))
+is_normal <- cd2$SpecimenType %in% "Normal"
+is_ln     <- cd2$SpecimenType %in% "LN"
+is_dcis   <- cd2$OpBiopsy.InvCa %in% "In situ only"
+drop <- is_normal | is_ln | is_dcis
+drop[is.na(drop)] <- FALSE
+scanb_tumor <- scanb_best[, !drop]
+
+# Add age_years (5-year binned)
+age_col <- "Age..5.year.range..e.g...35.31.35...40.36.40...45.41.45..etc.."
+colData(scanb_tumor)$age_years <- as.numeric(colData(scanb_tumor)[[age_col]])
+
+# Counts → logCPM
+logcpm_scanb <- edgeR::cpm(assay(scanb_tumor, "counts"), log = TRUE, prior.count = 1)
+
+# Ensembl → SYMBOL, collapse duplicates by mean
+.ensembl_to_symbol <- function(ensembl_ids) {
+  bare <- sub("\\.\\d+$", "", ensembl_ids)
+  syms <- AnnotationDbi::mapIds(
+    org.Hs.eg.db, keys = bare, keytype = "ENSEMBL",
+    column = "SYMBOL", multiVals = "first"
+  )
+  names(syms) <- ensembl_ids
+  syms
+}
+
+.collapse_to_symbols <- function(mat, symbols) {
+  keep <- !is.na(symbols) & symbols != ""
+  mat <- mat[keep, , drop = FALSE]
+  symbols <- symbols[keep]
+  summed <- rowsum(mat, group = symbols)
+  counts <- table(symbols)[rownames(summed)]
+  sweep(summed, 1, as.numeric(counts), "/")
+}
+
+syms_scanb       <- .ensembl_to_symbol(rownames(logcpm_scanb))
+logcpm_scanb_sym <- .collapse_to_symbols(logcpm_scanb, syms_scanb)
+
+vcat("SCAN-B symbol-level logCPM:", paste(dim(logcpm_scanb_sym), collapse = " x "))
+```
+
+# 3. Process METABRIC (microarray, symbol-collapsed)
+
+```{r metabric_process}
+mb_eset <- readRDS(params$metabric_eset_rds)
+
+metabric_se <- SummarizedExperiment(
+  assays  = list(intensity = Biobase::exprs(mb_eset)),
+  colData = as.data.frame(Biobase::pData(mb_eset)),
+  rowData = as.data.frame(Biobase::fData(mb_eset))
+)
+
+colData(metabric_se)$age_years <- as.numeric(colData(metabric_se)$AGE_AT_DIAGNOSIS)
+
+mb_expr <- assay(metabric_se, "intensity")
+mb_expr <- mb_expr[rowSums(is.na(mb_expr)) == 0, , drop = FALSE]  # GSVA needs complete rows
+
+mb_syms          <- as.character(rowData(metabric_se)[rownames(mb_expr), "Hugo_Symbol"])
+logcpm_metab_sym <- .collapse_to_symbols(mb_expr, mb_syms)
+
+vcat("METABRIC symbol-level (microarray log-intensity):", paste(dim(logcpm_metab_sym), collapse = " x "))
+```
+
+# 4. Common gene universe across all four cohorts
+
+```{r common_universe}
+universe_common <- Reduce(intersect, list(
+  rownames(logcpm_gtex_sym),
+  rownames(logcpm_nt_sym),
+  rownames(logcpm_pt_sym),
+  rownames(logcpm_scanb_sym),
+  rownames(logcpm_metab_sym)
+))
+
+cohort_sizes <- tibble::tibble(
+  cohort  = c("GTEx","TCGA-NAT","TCGA-PT","SCAN-B","METABRIC"),
+  n_genes = c(
+    nrow(logcpm_gtex_sym), nrow(logcpm_nt_sym), nrow(logcpm_pt_sym),
+    nrow(logcpm_scanb_sym), nrow(logcpm_metab_sym)
+  )
+)
+cohort_sizes
+vcat("Common universe size:", length(universe_common))
+
+logcpm_gtex_c  <- logcpm_gtex_sym  [universe_common, , drop = FALSE]
+logcpm_nt_c    <- logcpm_nt_sym    [universe_common, , drop = FALSE]
+logcpm_pt_c    <- logcpm_pt_sym    [universe_common, , drop = FALSE]
+logcpm_scanb_c <- logcpm_scanb_sym [universe_common, , drop = FALSE]
+logcpm_metab_c <- logcpm_metab_sym [universe_common, , drop = FALSE]
+
+stopifnot(identical(rownames(logcpm_gtex_c), rownames(logcpm_metab_c)))
+```
+
+# 5. Hallmark ssGSEA on the common universe
+
+`alpha = 0.25`, `normalize = FALSE` (matches `01_processing`). RNA-seq cohorts (GTEx + TCGA-NAT + TCGA-PT + SCAN-B) are scored together; METABRIC scored separately because microarray log-intensity has a different distribution from logCPM.
+
+```{r run_ssgsea}
+hallmark_sets <- local({
+  nice <- function(x) x |>
+    str_remove("^HALLMARK_") |>
+    str_replace_all("_", " ") |>
+    str_to_title()
+  hall_raw <- msigdbr(species = "Homo sapiens", category = "H")
+  split(hall_raw$gene_symbol, nice(hall_raw$gs_name))
+})
+
+run_ssgsea <- function(expr_mat) {
+  param <- ssgseaParam(
+    exprData  = expr_mat,
+    geneSets  = hallmark_sets,
+    minSize   = 1,
+    maxSize   = Inf,
+    alpha     = 0.25,
+    normalize = FALSE
+  )
+  gsva(param, verbose = FALSE)
+}
+
+# Combine all RNA-seq cohorts into one ssGSEA call
+expr_rnaseq   <- cbind(logcpm_gtex_c, logcpm_nt_c, logcpm_pt_c, logcpm_scanb_c)
+scores_rnaseq <- run_ssgsea(expr_rnaseq)
+
+n_g <- ncol(logcpm_gtex_c); n_n <- ncol(logcpm_nt_c); n_p <- ncol(logcpm_pt_c)
+scores_gtex  <- scores_rnaseq[, seq_len(n_g), drop = FALSE]
+scores_nt    <- if (n_n > 0) scores_rnaseq[, seq.int(n_g + 1, n_g + n_n), drop = FALSE] else scores_rnaseq[, 0, drop = FALSE]
+scores_pt    <- scores_rnaseq[, seq.int(n_g + n_n + 1, n_g + n_n + n_p), drop = FALSE]
+scores_scanb <- scores_rnaseq[, -(seq_len(n_g + n_n + n_p)), drop = FALSE]
+
+scores_metab <- run_ssgsea(logcpm_metab_c)
+
+vcat("ssGSEA dims | GTEx:", paste(dim(scores_gtex), collapse=" x "),
+     " | NAT:", paste(dim(scores_nt), collapse=" x "),
+     " | PT:", paste(dim(scores_pt), collapse=" x "),
+     " | SCAN-B:", paste(dim(scores_scanb), collapse=" x "),
+     " | METABRIC:", paste(dim(scores_metab), collapse=" x "))
+```
+
+# 6. Train elastic-net clock on GTEx
+
+Mirrors `02_aging_clock_clean_template_elnet`: age-stratified 10-fold CV, search over alpha × lambda, MAE objective.
+
+```{r train_clock}
+meta_gtex <- metadata[colnames(scores_gtex), , drop = FALSE]
+x_gtex <- t(scores_gtex)
+y_gtex <- meta_gtex$age_years
+keep_train <- is.finite(y_gtex)
+x_gtex <- x_gtex[keep_train, , drop = FALSE]
+y_gtex <- y_gtex[keep_train]
+names(y_gtex) <- rownames(x_gtex)
+
+# Stratified folds by age decile
+k <- params$n_folds
+age_bin <- dplyr::ntile(y_gtex, 10)
+foldid <- integer(length(y_gtex))
+for (b in sort(unique(age_bin))) {
+  idx <- which(age_bin == b)
+  foldid[idx] <- sample(rep(seq_len(k), length.out = length(idx)))
+}
+
+alpha_grid <- as.numeric(params$alpha_grid)
+alpha_grid <- alpha_grid[is.finite(alpha_grid)]
+if (length(alpha_grid) == 0) alpha_grid <- seq(0, 1, by = 0.1)
+alpha_grid <- sort(unique(alpha_grid))
+
+lambda_grid <- 10 ^ seq(params$lambda_min_exp, params$lambda_max_exp, length.out = params$n_lambda)
+get_idx <- function(cvfit, lam) which.min(abs(cvfit$lambda - lam))
+
+tune_list <- vector("list", length(alpha_grid))
+names(tune_list) <- as.character(alpha_grid)
+
+for (i in seq_along(alpha_grid)) {
+  a <- alpha_grid[i]
+  cvfit_a <- cv.glmnet(
+    x = x_gtex, y = y_gtex,
+    alpha = a, family = "gaussian",
+    foldid = foldid,
+    type.measure = "mae",
+    lambda = lambda_grid,
+    standardize = TRUE, intercept = TRUE
+  )
+  idx_min <- get_idx(cvfit_a, cvfit_a$lambda.min)
+  idx_1se <- get_idx(cvfit_a, cvfit_a$lambda.1se)
+  tune_list[[i]] <- list(
+    alpha = a, cvfit = cvfit_a,
+    lambda_min = cvfit_a$lambda[idx_min], mae_min = cvfit_a$cvm[idx_min], nzero_min = cvfit_a$nzero[idx_min],
+    lambda_1se = cvfit_a$lambda[idx_1se], mae_1se = cvfit_a$cvm[idx_1se], nzero_1se = cvfit_a$nzero[idx_1se]
+  )
+}
+
+tune_tbl <- bind_rows(lapply(tune_list, function(z) tibble(
+  alpha=z$alpha, lambda.min=z$lambda_min, MAE.min=z$mae_min, nzero.min=z$nzero_min,
+  lambda.1se=z$lambda_1se, MAE.1se=z$mae_1se, nzero.1se=z$nzero_1se
+))) %>% arrange(alpha)
+
+metric_col <- if (params$lambda_choice == "lambda.min") "MAE.min" else "MAE.1se"
+lambda_col <- if (params$lambda_choice == "lambda.min") "lambda.min" else "lambda.1se"
+nzero_col  <- if (params$lambda_choice == "lambda.min") "nzero.min" else "nzero.1se"
+best_row    <- tune_tbl %>% dplyr::slice(which.min(.data[[metric_col]]))
+best_alpha  <- best_row$alpha
+best_lambda <- best_row[[lambda_col]]
+best_mae    <- best_row[[metric_col]]
+best_nzero  <- best_row[[nzero_col]]
+
+vcat("Best clock | alpha=", best_alpha, " lambda=", signif(best_lambda,4),
+     " MAE=", signif(best_mae,4), " nzero=", best_nzero)
+
+enet_model <- glmnet(
+  x = x_gtex, y = y_gtex,
+  alpha = best_alpha, family = "gaussian", lambda = best_lambda,
+  standardize = TRUE, intercept = TRUE
+)
+
+# Training scalers (for ClockSHAP-standardized form)
+x_center <- if (!is.null(enet_model$xm)) enet_model$xm else colMeans(x_gtex, na.rm = TRUE)
+x_scale  <- if (!is.null(enet_model$xs)) enet_model$xs else apply(x_gtex, 2, sd, na.rm = TRUE)
+x_scale[!is.finite(x_scale) | x_scale == 0] <- 1
+if (is.null(names(x_center))) names(x_center) <- colnames(x_gtex)
+if (is.null(names(x_scale)))  names(x_scale)  <- colnames(x_gtex)
+
+feat <- colnames(x_gtex)
+```
+
+# 7. Apply clock + GTEx-anchored deviation
+
+GTEx anchoring: predicted − (β0 + β1 × age), where (β0, β1) come from `lm(predicted ~ age)` on GTEx only. For a linear clock this is identical to ClockSHAP's deviation.
+
+```{r predict_all}
+predict_clock <- function(scores_pxs, label) {
+  X <- t(scores_pxs[feat, , drop = FALSE])
+  pred <- as.numeric(predict(enet_model, newx = X, s = best_lambda))
+  names(pred) <- rownames(X)
+  list(X = X, pred = pred, label = label)
+}
+
+pred_gtex_l  <- predict_clock(scores_gtex,  "GTEx")
+pred_nt_l    <- predict_clock(scores_nt,    "TCGA-NAT")
+pred_pt_l    <- predict_clock(scores_pt,    "TCGA-PT")
+pred_scanb_l <- predict_clock(scores_scanb, "SCAN-B")
+pred_metab_l <- predict_clock(scores_metab, "METABRIC")
+
+# GTEx anchoring line
+age_gtex_vec <- y_gtex[names(pred_gtex_l$pred)]
+ok_g <- complete.cases(pred_gtex_l$pred, age_gtex_vec)
+bias_fit <- lm(pred_gtex_l$pred[ok_g] ~ age_gtex_vec[ok_g])
+beta0 <- coef(bias_fit)[1]; beta1 <- coef(bias_fit)[2]
+vcat("GTEx anchoring | beta0=", signif(beta0,4), " beta1=", signif(beta1,4))
+
+build_df <- function(pred_l, age_vec, cohort_label) {
+  ids <- names(pred_l$pred)
+  age <- as.numeric(age_vec[ids])
+  tibble(
+    sample_id = ids, cohort = cohort_label,
+    age_years = age,
+    predicted = as.numeric(pred_l$pred),
+    pred_anchored = as.numeric(pred_l$pred - beta0 + (1 - beta1) * age),
+    deviation = as.numeric(pred_l$pred - (beta0 + beta1 * age))
+  ) %>% filter(is.finite(age_years), is.finite(predicted))
+}
+
+age_gtex_full  <- setNames(metadata$age_years, rownames(metadata))
+age_nt_full    <- age_gtex_full
+age_pt_full    <- age_gtex_full
+age_scanb_full <- setNames(as.numeric(colData(scanb_tumor)$age_years),  colnames(scanb_tumor))
+age_metab_full <- setNames(as.numeric(colData(metabric_se)$age_years),  colnames(metabric_se))
+
+df_gtex  <- build_df(pred_gtex_l,  age_gtex_full,  "GTEx")
+df_nt    <- build_df(pred_nt_l,    age_nt_full,    "TCGA-NAT")
+df_pt    <- build_df(pred_pt_l,    age_pt_full,    "TCGA-PT")
+df_scanb <- build_df(pred_scanb_l, age_scanb_full, "SCAN-B")
+df_metab <- build_df(pred_metab_l, age_metab_full, "METABRIC")
+
+all_df <- bind_rows(df_gtex, df_nt, df_pt, df_scanb, df_metab) %>%
+  mutate(cohort = factor(cohort, levels = c("GTEx","TCGA-NAT","TCGA-PT","SCAN-B","METABRIC")))
+```
+
+# 8. ClockSHAP per tumor cohort (GTEx as reference)
+
+```{r build_clockshap}
+coef_mat <- as.matrix(coef(enet_model))
+a_orig <- as.numeric(coef_mat[1,1])
+b_orig <- setNames(as.numeric(coef_mat[-1,1]), rownames(coef_mat)[-1])[feat]
+mu     <- x_center[feat]
+sigma  <- x_scale[feat]
+
+beta_cs  <- b_orig * sigma
+alpha_cs <- a_orig + sum(b_orig * mu, na.rm = TRUE)
+
+clock_cs <- ClockSHAP::linear_clock(
+  alpha = as.numeric(alpha_cs),
+  beta  = beta_cs,
+  mu    = mu,
+  sigma = sigma
+)
+
+ref_X <- x_gtex
+ref_age <- y_gtex
+names(ref_age) <- rownames(ref_X)
+ok_r <- is.finite(ref_age)
+reference <- ClockSHAP::fit_reference_profile(
+  features = as.data.frame(ref_X[ok_r, , drop = FALSE]),
+  age      = ref_age[ok_r]
+)
+
+run_cs <- function(scores_pxs, age_vec, label) {
+  X <- t(scores_pxs[feat, , drop = FALSE])
+  ids <- rownames(X)
+  age <- as.numeric(age_vec[ids])
+  names(age) <- ids
+  ok <- is.finite(age)
+  cs <- ClockSHAP::clockshap(
+    features  = X[ok, , drop = FALSE],
+    age       = age[ok],
+    clock     = clock_cs,
+    reference = reference
+  )
+  list(cs = cs, ids = rownames(X[ok, , drop = FALSE]), label = label)
+}
+
+cs_pt    <- run_cs(scores_pt,    age_pt_full,    "TCGA-PT")
+cs_scanb <- run_cs(scores_scanb, age_scanb_full, "SCAN-B")
+cs_metab <- run_cs(scores_metab, age_metab_full, "METABRIC")
+cs_nt    <- run_cs(scores_nt,    age_nt_full,    "TCGA-NAT")
+
+# Sanity: rowSums(phi) ≈ deviation
+sapply(list(PT = cs_pt, SCANB = cs_scanb, METAB = cs_metab, NT = cs_nt),
+       function(o) max(abs(rowSums(o$cs$phi) - o$cs$deviation), na.rm = TRUE))
+```
+
+# 9. TP53 attach (binary, for heatmap annotation only)
+
+We retain a simple Mut/WT TP53 status for SCAN-B and METABRIC purely for the Panel C heatmap annotation column. TCGA's TP53 is already attached in `metadata$TP53` from `01_processing`. No quantitative TP53 analysis is performed in this manuscript.
+
+```{r tp53_attach}
+# METABRIC: cBioPortal MAF; deleterious classes
+mb_mut <- readr::read_tsv(params$metabric_tp53_tsv, show_col_types = FALSE)
+keep_classes_metab <- c(
+  "Missense_Mutation","Nonsense_Mutation",
+  "Frame_Shift_Del","Frame_Shift_Ins",
+  "Splice_Site","Splice_Region",
+  "In_Frame_Del","In_Frame_Ins"
+)
+tp53_mut_metab <- mb_mut |>
+  dplyr::filter(Gene == "TP53", `Mutation Type` %in% keep_classes_metab) |>
+  dplyr::pull(`Sample ID`) |> unique()
+SummarizedExperiment::colData(metabric_se)$TP53 <- ifelse(
+  colnames(metabric_se) %in% tp53_mut_metab, "Mut", "WT"
+)
+
+# SCAN-B: Brueffer 2020 SnpEff
+scanb_mut <- readr::read_tsv(params$scanb_tp53_tsv, comment = "##", show_col_types = FALSE)
+keep_classes_scanb <- c("Missense","Nonsense","Frameshift","Splicing","In-frame indel")
+tp53_mut_scanb <- scanb_mut |>
+  dplyr::filter(gene.symbol == "TP53", SnpEff.Effect.Class %in% keep_classes_scanb) |>
+  dplyr::pull(SAMPLE) |> unique()
+
+scanb_ids_full   <- colnames(scanb_tumor)
+scanb_ids_match  <- sub("\\.k2\\.a\\.t$", "", scanb_ids_full)
+cohort_ids_scanb <- unique(scanb_mut$SAMPLE)
+tp53_vec_scanb <- rep(NA_character_, length(scanb_ids_full))
+names(tp53_vec_scanb) <- scanb_ids_full
+in_cohort_scanb <- scanb_ids_match %in% cohort_ids_scanb
+tp53_vec_scanb[in_cohort_scanb] <- ifelse(
+  scanb_ids_match[in_cohort_scanb] %in% tp53_mut_scanb, "Mut", "WT"
+)
+SummarizedExperiment::colData(scanb_tumor)$TP53 <- tp53_vec_scanb
+
+cat("TP53 attach summary:\n")
+cat("  METABRIC:  Mut=", sum(colData(metabric_se)$TP53 == "Mut"),
+    " | WT=",            sum(colData(metabric_se)$TP53 == "WT"), "\n")
+cat("  SCAN-B:    Mut=", sum(tp53_vec_scanb == "Mut", na.rm = TRUE),
+    " | WT=",            sum(tp53_vec_scanb == "WT",  na.rm = TRUE),
+    " | NA=",            sum(is.na(tp53_vec_scanb)),  "\n")
+cat("  TCGA-BRCA: Mut=", sum(metadata$TP53 == "Mut", na.rm = TRUE),
+    " | WT=",            sum(metadata$TP53 == "WT",  na.rm = TRUE), "\n")
+```
+
+# 10. Figures
+
+```{r fig_setup}
+fig_out_dir <- params$fig_out_dir
+dir.create(fig_out_dir, recursive = TRUE, showWarnings = FALSE)
+
+cohort_cols_full <- c(
+  "GTEx"     = "#4daf4a",
+  "TCGA-NAT" = "#377eb8",
+  "TCGA-PT"  = "#e41a1c",
+  "SCAN-B"   = "#fdae6b",
+  "METABRIC" = "#984ea3"
+)
+cohort_labels_full <- c(
+  "GTEx"     = "GTEx-Breast",
+  "TCGA-NAT" = "TCGA-BRCA NAT",
+  "TCGA-PT"  = "TCGA-BRCA Tumor",
+  "SCAN-B"   = "SCAN-B Tumor",
+  "METABRIC" = "METABRIC Tumor"
+)
+```
+
+## Panel A — PCA on Hallmark ssGSEA (common universe)
+
+PCA on the per-cohort Hallmark ssGSEA score matrices (all five cohorts
+scored against the **common gene universe** — section 4/5 output). Because
+every cohort here was scored against the *same* gene set, residual
+separation along the leading PCs reflects platform + biology, not
+gene-availability mismatch. SCAN-B is randomly subsampled before fitting
+(controlled by `params$panelA_scanb_subsample_n`, default 1500) so its
+~6k samples don't dominate either the variance decomposition or the
+plot density. Save dimensions: 200 × 150 mm (matches companion METABRIC
+supplement Panel A).
+
+```{r panelA}
+cohort_scores_list <- list(
+  "GTEx"     = scores_gtex,
+  "TCGA-NAT" = scores_nt,
+  "TCGA-PT"  = scores_pt,
+  "SCAN-B"   = scores_scanb,
+  "METABRIC" = scores_metab
+)
+cohort_scores_list <- cohort_scores_list[vapply(cohort_scores_list, ncol, integer(1)) > 0]
+
+# Subsample SCAN-B before the PCA so its ~6k samples don't dominate either the
+# variance structure or the dot density on the plot. Other cohorts pass through
+# unchanged. NULL or non-finite param = no subsampling.
+scanb_n_target <- suppressWarnings(as.numeric(params$panelA_scanb_subsample_n))
+if ("SCAN-B" %in% names(cohort_scores_list) &&
+    is.finite(scanb_n_target) && scanb_n_target > 0) {
+  scanb_full_n <- ncol(cohort_scores_list[["SCAN-B"]])
+  if (scanb_full_n > scanb_n_target) {
+    keep_idx <- sort(sample.int(scanb_full_n, size = scanb_n_target))
+    cohort_scores_list[["SCAN-B"]] <-
+      cohort_scores_list[["SCAN-B"]][, keep_idx, drop = FALSE]
+    vcat(sprintf("Panel A: SCAN-B downsampled %d -> %d for PCA",
+                 scanb_full_n, scanb_n_target))
+  } else {
+    vcat(sprintf("Panel A: SCAN-B has %d samples, below target %d — using all",
+                 scanb_full_n, scanb_n_target))
+  }
+}
+
+# All cohorts share the same Hallmark row set (common universe), but intersect
+# defensively in case a pathway dropped out due to size filters.
+common_paths <- Reduce(intersect, lapply(cohort_scores_list, rownames))
+vcat("PCA cohorts: ", paste(names(cohort_scores_list), collapse = ", "),
+     " | shared Hallmarks: ", length(common_paths),
+     " | samples per cohort: ",
+     paste(sprintf("%s=%d", names(cohort_scores_list),
+                   vapply(cohort_scores_list, ncol, integer(1))),
+           collapse = ", "))
+
+combined_mat <- do.call(cbind, lapply(cohort_scores_list,
+                                      function(s) s[common_paths, , drop = FALSE]))
+cohort_vec <- unlist(mapply(
+  function(name, s) rep(name, ncol(s)),
+  names(cohort_scores_list), cohort_scores_list,
+  SIMPLIFY = FALSE
+), use.names = FALSE)
+
+pca_fit <- prcomp(t(combined_mat), center = TRUE, scale. = TRUE)
+ve <- round(100 * pca_fit$sdev^2 / sum(pca_fit$sdev^2), 1)
+
+pc_df <- as.data.frame(pca_fit$x[, 1:2]) %>%
+  dplyr::mutate(cohort = factor(
+    cohort_vec,
+    levels = intersect(names(cohort_cols_full), unique(cohort_vec))
+  ))
+
+p_panelA <- ggplot(pc_df, aes(x = PC1, y = PC2, colour = cohort)) +
+  geom_point(alpha = 0.5, size = 1.5) +
+  scale_colour_manual(values = cohort_cols_full, labels = cohort_labels_full) +
+  labs(
+    x = paste0("PC1 (", ve[1], "%)"),
+    y = paste0("PC2 (", ve[2], "%)")
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(
+    legend.title     = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.title       = element_text(size = 15),
+    axis.text        = element_text(size = 13),
+    legend.text      = element_text(size = 13)
+  ) +
+  guides(colour = guide_legend(override.aes = list(alpha = 1, size = 3)))
+
+p_panelA
+
+ggsave(
+  filename = file.path(fig_out_dir, "PanelA_PCA_Hallmark_ssGSEA.pdf"),
+  plot     = p_panelA,
+  width    = 3, height = 3, units = "in"
+)
+```
+
+## Panel B — Anchored predicted age vs chronological age
+
+```{r panelB}
+panelB_df <- all_df %>%
+  dplyr::select(cohort, age_years, pred_anchored) %>%
+  dplyr::filter(complete.cases(age_years, pred_anchored))
+
+table(panelB_df$cohort)
+
+p_panelB <- ggplot(panelB_df, aes(x = age_years, y = pred_anchored, colour = cohort)) +
+  geom_point(aes(alpha = cohort), size = 1.2) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 1.1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "black") +
+  scale_colour_manual(values = cohort_cols_full, labels = cohort_labels_full) +
+  scale_alpha_manual(
+    values = c("GTEx" = 0.08, "TCGA-NAT" = 0.08, "TCGA-PT" = 0.08,
+               "SCAN-B" = 0.04, "METABRIC" = 0.06),
+    guide  = "none"
+  ) +
+  scale_x_continuous(breaks = c(0, 20, 40, 60, 80)) +
+  scale_y_continuous(breaks = c(0, 20, 40, 60, 80)) +
+  labs(x = "Chronological age (years)", y = "GTEx-anchored age (years)") +
+  theme_minimal(base_size = 17) +
+  theme(
+    legend.title      = element_blank(),
+    panel.grid.minor  = element_blank(),
+    axis.ticks        = element_line(),
+    axis.ticks.length = unit(2, "mm"),
+    axis.title        = element_text(size = 17),
+    axis.text         = element_text(size = 15),
+    legend.text       = element_text(size = 15)
+  )
+
+p_panelB
+
+ggsave(
+  filename = file.path(fig_out_dir, "PanelB_anchored_age_5cohorts.pdf"),
+  plot     = p_panelB,
+  width    = 220 / 25.4, height = 130 / 25.4, units = "in"
+)
+```
+
+## Representative ClockSHAP waterfall (TCGA-BRCA)
+
+Single TCGA-BRCA tumor in middle-deviation range with readable top-N |phi|
+bars. Preserved here as a useful diagnostic; not included in the lettered
+panel sequence (no corresponding panel in the companion METABRIC supplement).
+
+```{r waterfall}
+pick_pretty_waterfall_sample <- function(cs, top_n = 10,
+                                         dev_q = c(0.20, 0.80),
+                                         min_bar = 2.5) {
+  stopifnot(inherits(cs, "clockshap"))
+  phi <- cs$phi
+  ids <- rownames(phi)
+  if (is.null(ids)) stop("ClockSHAP object has no rownames for phi.", call. = FALSE)
+
+  ok  <- is.finite(cs$deviation) & is.finite(cs$expected) & is.finite(cs$predicted)
+  phi <- phi[ok, , drop = FALSE]; dev <- cs$deviation[ok]; ids <- ids[ok]
+
+  lo <- unname(stats::quantile(dev, dev_q[1], na.rm = TRUE))
+  hi <- unname(stats::quantile(dev, dev_q[2], na.rm = TRUE))
+  keep <- dev >= lo & dev <= hi
+
+  phi2 <- phi[keep, , drop = FALSE]
+  ids2 <- ids[keep]
+  if (nrow(phi2) == 0) stop("No samples left after dev_q filtering.", call. = FALSE)
+
+  top_abs  <- t(apply(abs(phi2), 1, function(v) sort(v, decreasing = TRUE)[seq_len(top_n)]))
+  min_top  <- apply(top_abs, 1, min)
+  mean_top <- rowMeans(top_abs)
+  cand <- which(min_top >= min_bar)
+  if (length(cand) == 0) cand <- seq_len(nrow(phi2))
+  ids2[cand[which.max(mean_top[cand])]]
+}
+
+sample_id <- pick_pretty_waterfall_sample(cs = cs_pt$cs, top_n = 10,
+                                          dev_q = c(0.20, 0.80), min_bar = 2.5)
+cat("Representative BRCA sample:", sample_id, "\n")
+
+p_waterfall <- ClockSHAP::plot_clockshap_waterfall(
+  x                   = cs_pt$cs,
+  sample              = sample_id,
+  top_n               = 8,
+  show_age_labels     = TRUE,
+  show_delta_label    = TRUE,
+  show_effect_labels  = TRUE,
+  x_axis_title        = "Clock Age (years)",
+  y_axis_title        = NULL,
+  deviation_label     = "Age-Matched Deviation = {value} yr",
+  expected_age_label  = "Expected Age (GTEx)\n{value} yr",
+  predicted_age_label = "Tumor Predicted Age\n{value} yr",
+  effect_label        = "{value}"
+) +
+  theme(
+    axis.title.x = element_text(size = 13),
+    axis.text.x  = element_text(size = 11),
+    axis.text.y  = element_text(size = 11),
+    plot.margin  = margin(t = 20, r = 10, b = 10, l = 10)
+  )
+
+p_waterfall
+
+ggsave(
+  filename = file.path(fig_out_dir, "ClockSHAP_waterfall_representative_TCGABRCA.pdf"),
+  plot     = p_waterfall,
+  width    = 180 / 25.4, height = 130 / 25.4, units = "in"
+)
+```
+
+## Panel C — ClockSHAP heatmaps (TCGA-BRCA + SCAN-B + METABRIC)
+
+Three heatmaps with shared color scales and annotation palette. TCGA-BRCA holds row labels and legends; SCAN-B and METABRIC inherit BRCA's hierarchical row order.
+
+```{r panelC_build}
+build_phi_mat <- function(cs_obj) {
+  phi <- cs_obj$cs$phi
+  dev <- cs_obj$cs$deviation
+  ids <- rownames(phi)
+  ok <- is.finite(dev)
+  phi <- phi[ok, , drop = FALSE]; dev <- dev[ok]; ids <- ids[ok]
+  ord <- order(dev, decreasing = FALSE)
+  phi <- phi[ord, , drop = FALSE]; dev <- dev[ord]; ids <- ids[ord]
+  mat <- t(phi); colnames(mat) <- ids
+  mat <- mat[rowSums(abs(mat), na.rm = TRUE) != 0, , drop = FALSE]
+  rownames(mat)[rownames(mat) == "Reactive Oxygen Species Pathway"] <- "ROS Pathway"
+  list(mat = mat, dev = dev, ids = ids)
+}
+
+brca_b  <- build_phi_mat(cs_pt)
+scanb_b <- build_phi_mat(cs_scanb)
+metab_b <- build_phi_mat(cs_metab)
+
+# Cluster on BRCA — others inherit the row ordering
+hc_brca        <- hclust(dist(brca_b$mat))
+brca_row_order <- rownames(brca_b$mat)[hc_brca$order]
+scanb_b$mat <- scanb_b$mat[intersect(brca_row_order, rownames(scanb_b$mat)), , drop = FALSE]
+metab_b$mat <- metab_b$mat[intersect(brca_row_order, rownames(metab_b$mat)), , drop = FALSE]
+
+# Shared color scales
+all_dev <- c(brca_b$dev, scanb_b$dev, metab_b$dev)
+dev_col_fun <- circlize::colorRamp2(
+  c(min(all_dev, na.rm = TRUE), 0, max(all_dev, na.rm = TRUE)),
+  c("darkblue", "white", "darkred")
+)
+phi_lim <- max(as.numeric(stats::quantile(
+  c(abs(brca_b$mat), abs(scanb_b$mat), abs(metab_b$mat)),
+  probs = 0.99, na.rm = TRUE
+)), 1e-6)
+phi_col_fun <- circlize::colorRamp2(
+  c(-phi_lim, 0, phi_lim),
+  c("steelblue", "white", "firebrick")
+)
+
+# Shared annotation palettes
+pam_cols_shared <- c(
+  Basal="#d73027", Her2="#fc8d59", LumA="#4575b4", LumB="#91bfdb",
+  `Normal-Like`="#cccccc", Unclassified="grey70"
+)
+tp53_cols_shared <- c(WT = "grey85", Mut = "black", Unknown = "white")
+pam_levels_full  <- names(pam_cols_shared)
+tp53_levels_full <- names(tp53_cols_shared)
+
+clean_pam <- function(x) {
+  x[is.na(x) | x == "" | x == "NC"] <- "Unclassified"
+  factor(dplyr::recode(x, "Normal" = "Normal-Like"), levels = pam_levels_full)
+}
+clean_tp53 <- function(x) {
+  x[is.na(x) | x == ""] <- "Unknown"
+  factor(x, levels = tp53_levels_full)
+}
+
+pam_brca_ann   <- clean_pam (as.character(metadata[brca_b$ids, "Subtype_Selected"]))
+tp53_brca_ann  <- clean_tp53(as.character(metadata[brca_b$ids, "TP53"]))
+pam_scanb_ann  <- clean_pam (as.character(SummarizedExperiment::colData(scanb_tumor)[scanb_b$ids, "SSP.PAM50"]))
+tp53_scanb_ann <- clean_tp53(as.character(SummarizedExperiment::colData(scanb_tumor)[scanb_b$ids, "TP53"]))
+pam_metab_ann  <- clean_pam (as.character(SummarizedExperiment::colData(metabric_se)[metab_b$ids, "Pam50_SUBTYPE"]))
+tp53_metab_ann <- clean_tp53(as.character(SummarizedExperiment::colData(metabric_se)[metab_b$ids, "TP53"]))
+```
+
+```{r panelC_brca}
+ha_brca <- ComplexHeatmap::HeatmapAnnotation(
+  Deviation = brca_b$dev,
+  PAM50     = pam_brca_ann,
+  TP53      = tp53_brca_ann,
+  col = list(Deviation = dev_col_fun, PAM50 = pam_cols_shared, TP53 = tp53_cols_shared),
+  annotation_label = list(Deviation = "Deviation (yr)", PAM50 = "PAM50", TP53 = "TP53"),
+  annotation_height  = unit(c(3, 3, 3), "mm"),
+  annotation_name_gp = gpar(fontsize = 13),
+  annotation_legend_param = list(
+    Deviation = list(title_gp = gpar(fontsize = 13), labels_gp = gpar(fontsize = 12)),
+    PAM50     = list(title_gp = gpar(fontsize = 13), labels_gp = gpar(fontsize = 12),
+                     at = pam_levels_full,  labels = pam_levels_full),
+    TP53      = list(title_gp = gpar(fontsize = 13), labels_gp = gpar(fontsize = 12),
+                     at = tp53_levels_full, labels = tp53_levels_full)
+  )
+)
+
+ht_panelC_brca <- ComplexHeatmap::Heatmap(
+  brca_b$mat,
+  name              = "ClockSHAP (yr)",
+  col               = phi_col_fun,
+  top_annotation    = ha_brca,
+  show_row_names    = TRUE,
+  row_names_gp      = gpar(fontsize = 13),
+  show_column_names = FALSE,
+  cluster_rows      = hc_brca,
+  cluster_columns   = FALSE,
+  show_heatmap_legend  = TRUE,
+  heatmap_legend_param = list(title_gp = gpar(fontsize = 13), labels_gp = gpar(fontsize = 12))
+)
+
+ht_panelC_brca
+
+out_file <- file.path(fig_out_dir, "PanelC_BRCA_ClockSHAP_heatmap.pdf")
+grDevices::pdf(out_file, width = 190 / 25.4, height = 160 / 25.4)
+ComplexHeatmap::draw(ht_panelC_brca,
+                     heatmap_legend_side = "right",
+                     annotation_legend_side = "right",
+                     merge_legends = TRUE)
+grDevices::dev.off()
+```
+
+```{r panelC_scanb}
+ha_scanb <- ComplexHeatmap::HeatmapAnnotation(
+  Deviation = scanb_b$dev,
+  PAM50     = pam_scanb_ann,
+  TP53      = tp53_scanb_ann,
+  col = list(Deviation = dev_col_fun, PAM50 = pam_cols_shared, TP53 = tp53_cols_shared),
+  annotation_height = unit(c(3, 3, 3), "mm"),
+  show_annotation_name = FALSE,
+  show_legend = c(Deviation = FALSE, PAM50 = FALSE, TP53 = FALSE)
+)
+
+ht_panelC_scanb <- ComplexHeatmap::Heatmap(
+  scanb_b$mat, name = "ClockSHAP (yr)", col = phi_col_fun,
+  top_annotation = ha_scanb,
+  show_row_names = FALSE, show_column_names = FALSE,
+  cluster_rows = FALSE, cluster_columns = FALSE,
+  show_heatmap_legend = FALSE
+)
+
+ht_panelC_scanb
+
+out_file <- file.path(fig_out_dir, "PanelC_SCANB_ClockSHAP_heatmap.pdf")
+grDevices::pdf(out_file, width = 110 / 25.4, height = 160 / 25.4)
+ComplexHeatmap::draw(ht_panelC_scanb)
+grDevices::dev.off()
+```
+
+```{r panelC_metab}
+ha_metab <- ComplexHeatmap::HeatmapAnnotation(
+  Deviation = metab_b$dev,
+  PAM50     = pam_metab_ann,
+  TP53      = tp53_metab_ann,
+  col = list(Deviation = dev_col_fun, PAM50 = pam_cols_shared, TP53 = tp53_cols_shared),
+  annotation_height = unit(c(3, 3, 3), "mm"),
+  show_annotation_name = FALSE,
+  show_legend = c(Deviation = FALSE, PAM50 = FALSE, TP53 = FALSE)
+)
+
+ht_panelC_metab <- ComplexHeatmap::Heatmap(
+  metab_b$mat, name = "ClockSHAP (yr)", col = phi_col_fun,
+  top_annotation = ha_metab,
+  show_row_names = FALSE, show_column_names = FALSE,
+  cluster_rows = FALSE, cluster_columns = FALSE,
+  show_heatmap_legend = FALSE
+)
+
+ht_panelC_metab
+
+out_file <- file.path(fig_out_dir, "PanelC_METABRIC_ClockSHAP_heatmap.pdf")
+grDevices::pdf(out_file, width = 110 / 25.4, height = 160 / 25.4)
+ComplexHeatmap::draw(ht_panelC_metab)
+grDevices::dev.off()
+```
+
+## Panel D — PAM50 deviation across cohorts
+
+3 cohort rows × 1 PAM50 column. Adjacent Normal (TCGA NAT) included as leftmost reference. Kruskal-Wallis omnibus across the 5 tumor subtypes (NAT excluded from the test — visual anchor only).
+
+```{r panelD_build}
+ids_brca_d <- rownames(cs_pt$cs$phi)
+ids_scanb_d <- rownames(cs_scanb$cs$phi)
+ids_metab_d <- rownames(cs_metab$cs$phi)
+ids_nat_d   <- rownames(cs_nt$cs$phi)
+scanb_cd    <- as.data.frame(SummarizedExperiment::colData(scanb_tumor))
+metab_cd    <- as.data.frame(SummarizedExperiment::colData(metabric_se))
+
+clean_pam_str <- function(x) {
+  x <- as.character(x); x[is.na(x) | x == "" | x == "NC"] <- NA_character_
+  dplyr::recode(x, "Normal" = "Normal-Like")
+}
+
+pam50_levels_D <- c("Adjacent Normal", "Normal-Like", "LumA", "LumB", "Her2", "Basal")
+
+panelD_df <- bind_rows(
+  tibble(cohort = "TCGA-BRCA", group = "Adjacent Normal",
+         deviation = as.numeric(cs_nt$cs$deviation)),
+  tibble(cohort = "TCGA-BRCA", group = clean_pam_str(metadata[ids_brca_d, "Subtype_Selected"]),
+         deviation = as.numeric(cs_pt$cs$deviation)),
+  tibble(cohort = "SCAN-B",    group = clean_pam_str(scanb_cd[ids_scanb_d, "SSP.PAM50"]),
+         deviation = as.numeric(cs_scanb$cs$deviation)),
+  tibble(cohort = "METABRIC",  group = clean_pam_str(metab_cd[ids_metab_d, "Pam50_SUBTYPE"]),
+         deviation = as.numeric(cs_metab$cs$deviation))
+) %>%
+  filter(group %in% pam50_levels_D, is.finite(deviation)) %>%
+  mutate(
+    cohort = factor(cohort, levels = c("TCGA-BRCA", "SCAN-B", "METABRIC")),
+    group  = factor(group,  levels = pam50_levels_D)
+  )
+
+panelD_df %>% dplyr::count(cohort, group) %>% arrange(cohort, group)
+```
+
+```{r panelD_tests}
+fmt_p <- function(p) {
+  if (!is.finite(p)) return("p = NA")
+  if (p < 2.2e-16) return("p < 2.2e-16")
+  paste0("p = ", formatC(p, format = "e", digits = 2))
+}
+
+panelD_pvals <- panelD_df %>%
+  group_by(cohort) %>%
+  group_modify(~ {
+    d <- .x %>% filter(group != "Adjacent Normal") %>% mutate(group = droplevels(group))
+    if (length(unique(d$group)) < 2) return(tibble(p_value = NA_real_))
+    tibble(p_value = suppressWarnings(kruskal.test(deviation ~ group, data = d)$p.value))
+  }) %>%
+  ungroup() %>%
+  rowwise() %>%
+  mutate(p_label = paste0("Kruskal-Wallis ", fmt_p(p_value))) %>%
+  ungroup()
+
+panelD_pvals
+```
+
+```{r panelD_plot}
+pam50_pal_D <- c(
+  "Adjacent Normal" = "#777777",
+  "Normal-Like"     = "#cccccc",
+  "LumA"            = "#4575b4",
+  "LumB"            = "#91bfdb",
+  "Her2"            = "#fc8d59",
+  "Basal"           = "#d73027"
+)
+
+# NAT separator on TCGA-BRCA only
+nat_sep_df <- tibble(
+  cohort = factor("TCGA-BRCA", levels = c("TCGA-BRCA", "SCAN-B", "METABRIC")),
+  x      = 1.5
+)
+
+# Position p-value labels at top of shared y
+y_max <- max(panelD_df$deviation, na.rm = TRUE)
+y_min <- min(panelD_df$deviation, na.rm = TRUE)
+y_label_pos <- y_max + 0.05 * (y_max - y_min)
+
+panelD_pvals <- panelD_pvals %>%
+  mutate(
+    deviation = y_label_pos,
+    group     = factor("Normal-Like", levels = pam50_levels_D)
+  )
+
+p_panelD <- ggplot(panelD_df, aes(x = group, y = deviation, fill = group)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_vline(data = nat_sep_df, aes(xintercept = x),
+             linetype = "dotted", colour = "grey50", inherit.aes = FALSE) +
+  geom_jitter(width = 0.18, alpha = 0.18, size = 0.7, colour = "grey25") +
+  geom_boxplot(width = 0.6, outlier.shape = NA, alpha = 0.85) +
+  scale_fill_manual(values = pam50_pal_D, guide = "none") +
+  facet_grid(cols = vars(cohort), scales = "free_x", space = "free_x") +
+  geom_text(data = panelD_pvals,
+            aes(x = -Inf, y = deviation, label = p_label),
+            hjust = -0.05, vjust = 1, size = 3, inherit.aes = FALSE) +
+  labs(x = NULL, y = "Age-matched deviation (years)") +
+  theme_minimal(base_size = 9) +
+   theme(
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.x = element_blank(),
+    strip.text         = element_text(size = 9, face = "bold"),
+    strip.background   = element_rect(fill = "grey95", colour = NA),
+    axis.title.y       = element_text(size = 9),
+    axis.text.x        = element_text(size = 8, angle = 30, hjust = 1),
+    axis.text.y        = element_text(size = 9),
+    plot.margin        = margin(10, 10, 10, 10)
+  )
+
+p_panelD
+
+ggsave(
+  filename = file.path(fig_out_dir, "PanelD_PAM50_deviation.pdf"),
+  plot     = p_panelD,
+  width    = 7.5, height = 2.5, units = "in"
+)
+```
+
+## Panel G — Pathway × PAM50 (3 cohorts)
+
+Mean ClockSHAP contribution by PAM50 subtype for the six driver pathways.
+NAT shown as a grey square at the leftmost x-position. Save dimensions
+match companion METABRIC supplement Panel G (7 × 5 in).
+
+```{r panelG}
+poi_pathways <- c(
+  "G2m Checkpoint",
+  "Glycolysis",
+  "Myogenesis",
+  "P53 Pathway",
+  "Wnt Beta Catenin Signaling",
+  "Unfolded Protein Response"
+)
+
+pam50_order <- c("Adjacent Normal", "Normal-Like", "LumA", "LumB", "Her2", "Basal")
+
+build_phi_long <- function(cs_obj, pam_vec, age_vec, cohort_label, poi) {
+  phi <- cs_obj$cs$phi
+  ids <- rownames(phi)
+  poi_avail <- intersect(colnames(phi), poi)
+  pam <- as.character(pam_vec[ids])
+  pam[is.na(pam) | pam == "" | pam == "NC"] <- "Unclassified"
+  pam <- dplyr::recode(pam, "Normal" = "Normal-Like")
+  as.data.frame(phi[, poi_avail, drop = FALSE]) %>%
+    tibble::rownames_to_column("sample_id") %>%
+    tidyr::pivot_longer(-sample_id, names_to = "pathway", values_to = "phi") %>%
+    dplyr::mutate(
+      PAM50     = pam[match(sample_id, ids)],
+      age_years = as.numeric(age_vec[sample_id]),
+      cohort    = cohort_label
+    )
+}
+
+pam_pt    <- setNames(as.character(metadata$Subtype_Selected),       rownames(metadata))
+pam_scanb <- setNames(as.character(colData(scanb_tumor)$SSP.PAM50),  colnames(scanb_tumor))
+pam_metab <- setNames(as.character(colData(metabric_se)$Pam50_SUBTYPE), colnames(metabric_se))
+
+phi_long_c <- bind_rows(
+  build_phi_long(cs_pt,    pam_pt,    age_pt_full,    "TCGA-BRCA", poi_pathways),
+  build_phi_long(cs_scanb, pam_scanb, age_scanb_full, "SCAN-B",    poi_pathways),
+  build_phi_long(cs_metab, pam_metab, age_metab_full, "METABRIC",  poi_pathways)
+) %>%
+  filter(PAM50 %in% pam50_order)
+
+# NAT as Adjacent Normal
+nat_long <- as.data.frame(cs_nt$cs$phi[, intersect(colnames(cs_nt$cs$phi), poi_pathways), drop = FALSE]) %>%
+  tibble::rownames_to_column("sample_id") %>%
+  tidyr::pivot_longer(-sample_id, names_to = "pathway", values_to = "phi") %>%
+  mutate(
+    PAM50     = "Adjacent Normal",
+    age_years = as.numeric(age_nt_full[sample_id]),
+    cohort    = "TCGA-BRCA"
+  )
+
+phi_long_c <- bind_rows(phi_long_c, nat_long) %>%
+  mutate(
+    pathway = factor(pathway, levels = poi_pathways),
+    PAM50   = factor(PAM50,   levels = pam50_order),
+    cohort  = factor(cohort,  levels = c("TCGA-BRCA", "SCAN-B", "METABRIC"))
+  )
+
+phi_subtype_means <- phi_long_c %>%
+  group_by(cohort, pathway, PAM50) %>%
+  summarise(n = n(),
+            mean_phi = mean(phi, na.rm = TRUE),
+            sd_phi   = sd(phi,   na.rm = TRUE),
+            se_phi   = sd_phi / sqrt(n),
+            .groups  = "drop")
+
+cohort_cols_traj <- c(
+  "TCGA-BRCA" = "#7b3294",
+  "SCAN-B"    = "#e66101",
+  "METABRIC"  = "#1f78b4"
+)
+
+p_panelG <- ggplot(phi_subtype_means, aes(x = PAM50, y = mean_phi, group = cohort)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey55") +
+  geom_vline(xintercept = 1.5, linetype = "dotted", colour = "grey70") +
+  geom_line(data = phi_subtype_means %>% filter(PAM50 != "Adjacent Normal"),
+            aes(colour = cohort), linewidth = 0.7, alpha = 0.85) +
+  geom_point(data = phi_subtype_means %>% filter(PAM50 != "Adjacent Normal"),
+             aes(colour = cohort), shape = 16, size = 2.6) +
+  geom_point(data = phi_subtype_means %>% filter(PAM50 == "Adjacent Normal"),
+             shape = 15, size = 3.2, colour = "#777777") +
+  scale_x_discrete(limits = pam50_order, drop = FALSE) +
+  scale_colour_manual(values = cohort_cols_traj, name = NULL) +
+  facet_wrap(~ pathway, scales = "free_y", ncol = 3) +
+  labs(x = "Tissue category", y = "Mean ClockSHAP contribution (years)") +
+  theme_minimal(base_size = 10) +
+  theme(
+    strip.text         = element_text(face = "bold"),
+    strip.background   = element_rect(fill = "grey95", colour = NA),
+    panel.grid.major.x = element_blank(),
+    axis.text.x        = element_text(face = "bold", size = 7.5, angle = 25, hjust = 1),
+    legend.position    = "bottom"
+  )
+
+p_panelG
+
+ggsave(
+  filename = file.path(fig_out_dir, "PanelG_pathway_phi_by_pam50_3cohorts.pdf"),
+  plot     = p_panelG,
+  width    = 7.5, height = 4, units = "in"
+)
+```
+
+# 11. Overall survival across TCGA-BRCA + SCAN-B + METABRIC (Panels E + F)
+
+Stacked OS analysis matching the companion METABRIC supplement. Three cohorts
+share `Surv(time, event) ~ age + deviation` Cox models (Panel E) and
+deviation-tertile KM curves administratively censored at SCAN-B's natural max
+follow-up (Panel F). Time normalized to days across all three cohorts
+(METABRIC `OS_MONTHS` × 30.4375).
+
+## 11.1 — Load TCGA-BRCA clinical + helpers
+
+```{r load_clinical_helpers}
+stopifnot(file.exists(params$clinical_csv))
+clinical <- utils::read.csv(
+  params$clinical_csv,
+  na.strings        = c("NA", "", "#N/A"),
+  stringsAsFactors  = FALSE,
+  check.names       = TRUE
+)
+
+get_patient12 <- function(x) substr(as.character(x), 1, 12)
+
+# Canonical PAM50 ordering for survival (no NAT — tumors only)
+pam50_surv <- c("Normal-Like", "LumA", "LumB", "Her2", "Basal", "Unclassified")
+
+harmonize_pam50 <- function(x) {
+  x <- as.character(x)
+  x[is.na(x) | x == "" | x == "NC"] <- "Unclassified"
+  x <- dplyr::recode(x, "Normal" = "Normal-Like")
+  factor(x, levels = pam50_surv)
+}
+
+# Survival helper — matches companion supplement's Cox extractor
+cox_term <- function(df, formula_str, term_name) {
+  fit <- survival::coxph(stats::as.formula(formula_str), data = df)
+  co  <- summary(fit)$coefficients
+  if (!term_name %in% rownames(co)) return(NULL)
+  tibble::tibble(
+    HR      = exp(co[term_name, "coef"]),
+    CI_low  = exp(co[term_name, "coef"] - 1.96 * co[term_name, "se(coef)"]),
+    CI_high = exp(co[term_name, "coef"] + 1.96 * co[term_name, "se(coef)"]),
+    p_value = co[term_name, "Pr(>|z|)"]
+  )
+}
+```
+
+## 11.2 — Assemble per-cohort survival data frames
+
+```{r assemble_surv}
+# TCGA-BRCA: deviation/age from cs_pt, OS from TCGA-IntegratedClinical
+ids_brca_s <- rownames(cs_pt$cs$phi)
+tum_brca <- tibble::tibble(
+  sample_id = ids_brca_s,
+  age_years = cs_pt$cs$age,
+  Deviation = cs_pt$cs$deviation,
+  PAM50     = harmonize_pam50(metadata[ids_brca_s, "Subtype_Selected"])
+) %>%
+  dplyr::mutate(patient12 = get_patient12(metadata[sample_id, "tcga.tcga_barcode"]))
+
+clin2 <- clinical %>%
+  dplyr::mutate(patient12 = get_patient12(bcr_patient_barcode)) %>%
+  dplyr::distinct(patient12, .keep_all = TRUE)
+
+surv_brca <- tum_brca %>%
+  dplyr::left_join(clin2, by = "patient12") %>%
+  dplyr::mutate(
+    time   = suppressWarnings(as.numeric(OS.time)),
+    event  = suppressWarnings(as.numeric(OS)) == 1,
+    cohort = "TCGA-BRCA"
+  ) %>%
+  dplyr::filter(is.finite(time), !is.na(event), is.finite(age_years),
+                is.finite(Deviation), !is.na(PAM50), PAM50 != "Unclassified") %>%
+  dplyr::mutate(PAM50 = factor(droplevels(factor(PAM50)), levels = pam50_surv))
+
+# SCAN-B: OS_days and OS_event are expected to be present in colData(scanb_tumor).
+# If your raw scanbe_se.rds uses different column names (e.g. Patient.OS.event /
+# OverallSurvivalDays), map them to OS_days/OS_event upstream — section 2 — and
+# re-run. The check below makes the failure mode obvious if they're missing.
+scanb_cd_surv <- as.data.frame(SummarizedExperiment::colData(scanb_tumor))
+stopifnot(
+  "SCAN-B colData must contain OS_days and OS_event columns" =
+    all(c("OS_days", "OS_event") %in% colnames(scanb_cd_surv))
+)
+ids_scanb_s <- rownames(cs_scanb$cs$phi)
+
+surv_scanb <- tibble::tibble(
+  sample_id = ids_scanb_s,
+  age_years = cs_scanb$cs$age,
+  Deviation = cs_scanb$cs$deviation,
+  PAM50     = harmonize_pam50(scanb_cd_surv[ids_scanb_s, "SSP.PAM50"]),
+  time      = as.numeric(scanb_cd_surv[ids_scanb_s, "OS_days"]),
+  event     = as.numeric(scanb_cd_surv[ids_scanb_s, "OS_event"]) > 0,
+  cohort    = "SCAN-B"
+) %>%
+  dplyr::filter(is.finite(time), !is.na(event), is.finite(age_years),
+                is.finite(Deviation), !is.na(PAM50), PAM50 != "Unclassified") %>%
+  dplyr::mutate(PAM50 = factor(droplevels(factor(PAM50)), levels = pam50_surv))
+
+# METABRIC: OS_MONTHS -> days; OS_STATUS parsed to boolean
+ids_metab_s  <- rownames(cs_metab$cs$phi)
+mb_cd_surv   <- as.data.frame(SummarizedExperiment::colData(metabric_se))
+raw_event_mb <- as.character(mb_cd_surv[ids_metab_s, "OS_STATUS"])
+
+surv_metab <- tibble::tibble(
+  sample_id = ids_metab_s,
+  age_years = cs_metab$cs$age,
+  Deviation = cs_metab$cs$deviation,
+  PAM50     = harmonize_pam50(mb_cd_surv[ids_metab_s, "Pam50_SUBTYPE"]),
+  time      = as.numeric(mb_cd_surv[ids_metab_s, "OS_MONTHS"]) * 30.4375,
+  event     = dplyr::case_when(
+    grepl("DECEASED", raw_event_mb, ignore.case = TRUE) ~ TRUE,
+    grepl("LIVING",   raw_event_mb, ignore.case = TRUE) ~ FALSE,
+    TRUE                                                ~ NA
+  ),
+  cohort    = "METABRIC"
+) %>%
+  dplyr::filter(is.finite(time), !is.na(event), is.finite(age_years),
+                is.finite(Deviation), !is.na(PAM50), PAM50 != "Unclassified") %>%
+  dplyr::mutate(PAM50 = factor(droplevels(factor(PAM50)), levels = pam50_surv))
+
+cohort_surv_summary <- dplyr::bind_rows(
+  surv_brca  %>% dplyr::summarise(cohort = "TCGA-BRCA (OS)", n = dplyr::n(), events = sum(event)),
+  surv_scanb %>% dplyr::summarise(cohort = "SCAN-B (OS)",    n = dplyr::n(), events = sum(event)),
+  surv_metab %>% dplyr::summarise(cohort = "METABRIC (OS)",  n = dplyr::n(), events = sum(event))
+)
+knitr::kable(cohort_surv_summary, caption = "OS cohort sizes after filtering.")
+```
+
+## 11.3 — Panel E — Cox forest, 3 cohorts stacked
+
+Aggregate `age + Deviation`, PAM50-adjusted aggregate, and within-subtype
+rows for each cohort. HR < 1 in blue (youthward = worse), HR > 1 in red
+(aged-like = worse). Save dimensions: 4 × 6.75 in (matches companion
+supplement Panel E — main figure 4 × 4.5 in for 2 rows, scaled ×1.5 for
+the third cohort row).
+
+```{r panelE_table}
+run_aggregate_set <- function(df, cohort_label) {
+  rows <- list()
+
+  rows[[1]] <- cox_term(
+    df, "survival::Surv(time, event) ~ age_years + Deviation", "Deviation"
+  ) %>% dplyr::mutate(model = "All tumors",
+                      n = nrow(df), events = sum(df$event))
+
+  if (nlevels(droplevels(df$PAM50)) > 1) {
+    rows[[2]] <- cox_term(
+      df, "survival::Surv(time, event) ~ age_years + Deviation + PAM50", "Deviation"
+    ) %>% dplyr::mutate(model = "All tumors (PAM50-adjusted)",
+                        n = nrow(df), events = sum(df$event))
+  }
+
+  sub_rows <- purrr::map_dfr(levels(droplevels(df$PAM50)), function(s) {
+    d <- dplyr::filter(df, PAM50 == s)
+    if (nrow(d) < 5 || sum(d$event) < 2) return(NULL)
+    res <- cox_term(
+      d, "survival::Surv(time, event) ~ age_years + Deviation", "Deviation"
+    )
+    if (is.null(res)) return(NULL)
+    res %>% dplyr::mutate(
+      model = paste("Subtype:", s),
+      n = nrow(d), events = sum(d$event)
+    )
+  })
+
+  out <- dplyr::bind_rows(rows, sub_rows)
+  if (nrow(out) == 0) return(out)
+  out %>%
+    dplyr::mutate(
+      cohort = cohort_label,
+      sig    = ifelse(p_value < 0.05, "p < 0.05", "p ≥ 0.05"),
+      hr_dir = ifelse(HR < 1, "Youthful deviation, increased risk",
+                              "Less-youthful deviation, increased risk")
+    ) %>%
+    dplyr::select(cohort, model, n, events, HR, CI_low, CI_high, p_value, sig, hr_dir)
+}
+
+panelE_tbl <- dplyr::bind_rows(
+  run_aggregate_set(surv_brca,  "TCGA-BRCA (OS)"),
+  run_aggregate_set(surv_scanb, "SCAN-B (OS)"),
+  run_aggregate_set(surv_metab, "METABRIC (OS)")
+)
+
+knitr::kable(panelE_tbl, digits = 4,
+             caption = "Panel E — OS Cox forest, 3 cohorts.")
+```
+
+```{r panelE_plot, fig.width=4.5, fig.height=6}
+panelE_df <- panelE_tbl %>%
+  dplyr::mutate(
+    label  = model,
+    cohort = factor(cohort, levels = c("TCGA-BRCA (OS)", "SCAN-B (OS)", "METABRIC (OS)")),
+    hr_dir = factor(hr_dir,
+                    levels = c("Youthful deviation, increased risk",
+                               "Less-youthful deviation, increased risk"))
+  ) %>%
+  dplyr::group_by(cohort) %>%
+  dplyr::mutate(label = factor(label, levels = rev(unique(label)))) %>%
+  dplyr::ungroup()
+
+hr_pal <- c(
+  "Youthful deviation, increased risk"      = "#2c7bb6",  # blue
+  "Less-youthful deviation, increased risk" = "#d7191c"   # red
+)
+
+p_panelE <- ggplot(panelE_df, aes(x = HR, y = label, colour = hr_dir)) +
+  geom_errorbarh(aes(xmin = CI_low, xmax = CI_high), height = 0.2, linewidth = 0.55) +
+  geom_point(aes(shape = sig), size = 2.6) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey55") +
+  scale_x_log10() +
+  scale_shape_manual(values = c("p < 0.05" = 19, "p ≥ 0.05" = 1), name = NULL) +
+  scale_colour_manual(values = hr_pal, name = NULL) +
+  facet_wrap(~ cohort, scales = "fixed", nrow = 1) +
+  labs(
+    x = "HR per +1 yr of Deviation, age-adjusted (log scale)",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 9) +
+  theme(
+    strip.text         = element_text(face = "bold", size = 8),
+    strip.background   = element_rect(fill = "grey95", colour = NA),
+    panel.grid.major.y = element_blank(),
+    legend.position    = "bottom",
+    legend.box         = "horizontal",
+    legend.spacing.y   = unit(1, "pt"),
+    legend.margin      = margin(0, 0, 0, 0),
+    legend.text        = element_text(size = 8),
+    axis.text          = element_text(size = 8),
+    axis.title         = element_text(size = 9),
+    plot.margin        = margin(4, 4, 4, 4)
+  )
+
+p_panelE
+
+ggsave(
+  filename = file.path(fig_out_dir, "PanelE_OS_forest_3cohorts.pdf"),
+  plot     = p_panelE,
+  width    = 7.5, height = 2.5, units = "in"
+)
+```
+
+## 11.4 — Panel F — KM by deviation tertile, 3 cohorts stacked
+
+Within-cohort deviation tertiles. T1 = most youthward, T3 = least youthward.
+Truncated at SCAN-B's natural max follow-up; log-rank also administratively
+censored at that horizon so plot and test cover the same patient-time window.
+Save dimensions: 3 × 6.75 in.
+
+```{r panelF_data}
+add_dev_tertile <- function(df) {
+  qs <- stats::quantile(df$Deviation, probs = c(0, 1/3, 2/3, 1), na.rm = TRUE)
+  df$dev_tertile <- cut(
+    df$Deviation, breaks = qs,
+    labels = c("T1: Most youthful", "T2: Middle", "T3: Least youthful"),
+    include.lowest = TRUE
+  )
+  df
+}
+
+km_data <- dplyr::bind_rows(
+  add_dev_tertile(surv_brca)  %>% dplyr::mutate(cohort = "TCGA-BRCA (OS)"),
+  add_dev_tertile(surv_scanb) %>% dplyr::mutate(cohort = "SCAN-B (OS)"),
+  add_dev_tertile(surv_metab) %>% dplyr::mutate(cohort = "METABRIC (OS)")
+) %>%
+  dplyr::mutate(
+    cohort      = factor(cohort, levels = c("TCGA-BRCA (OS)", "SCAN-B (OS)", "METABRIC (OS)")),
+    dev_tertile = factor(dev_tertile,
+                         levels = c("T1: Most youthful", "T2: Middle", "T3: Least youthful"))
+  )
+
+# Truncation horizon = SCAN-B's natural max follow-up (the limiting cohort).
+x_max <- km_data %>%
+  dplyr::filter(cohort == "SCAN-B (OS)") %>%
+  dplyr::pull(time) %>%
+  max(na.rm = TRUE) / 365.25
+
+trunc_data <- function(d, t_max_years) {
+  t_max_days <- t_max_years * 365.25
+  d %>% dplyr::mutate(
+    event = event & time <= t_max_days,
+    time  = pmin(time, t_max_days)
+  )
+}
+
+km_data_view <- trunc_data(km_data, x_max)
+
+km_curves <- km_data_view %>%
+  dplyr::group_by(cohort, dev_tertile) %>%
+  dplyr::group_modify(function(d, .) {
+    if (nrow(d) < 5 || sum(d$event) < 1) return(tibble::tibble())
+    fit <- survival::survfit(survival::Surv(time, event) ~ 1, data = d)
+    tibble::tibble(time = fit$time, surv = fit$surv,
+                   n_risk = fit$n.risk, n_event = fit$n.event)
+  }) %>%
+  dplyr::ungroup()
+
+# Per-cohort log-rank on truncated data
+lr_brca  <- survival::survdiff(
+  survival::Surv(time, event) ~ dev_tertile,
+  data = dplyr::filter(km_data_view, cohort == "TCGA-BRCA (OS)")
+)
+lr_scanb <- survival::survdiff(
+  survival::Surv(time, event) ~ dev_tertile,
+  data = dplyr::filter(km_data_view, cohort == "SCAN-B (OS)")
+)
+lr_metab <- survival::survdiff(
+  survival::Surv(time, event) ~ dev_tertile,
+  data = dplyr::filter(km_data_view, cohort == "METABRIC (OS)")
+)
+
+lr_p <- function(sd) 1 - stats::pchisq(sd$chisq, length(sd$n) - 1)
+
+logrank_tbl <- tibble::tibble(
+  cohort         = c("TCGA-BRCA (OS)", "SCAN-B (OS)", "METABRIC (OS)"),
+  log_rank_chisq = c(lr_brca$chisq, lr_scanb$chisq, lr_metab$chisq),
+  p_value        = c(lr_p(lr_brca), lr_p(lr_scanb), lr_p(lr_metab))
+)
+knitr::kable(
+  logrank_tbl, digits = 4,
+  caption = sprintf(
+    "Panel F unadjusted log-rank test by deviation tertile, per cohort (administratively censored at %.2f years to match SCAN-B follow-up).",
+    x_max
+  )
+)
+```
+
+```{r panelF_plot, fig.width=4.5, fig.height=6.5}
+logrank_labels <- logrank_tbl %>%
+  dplyr::mutate(
+    cohort  = factor(cohort, levels = c("TCGA-BRCA (OS)", "SCAN-B (OS)", "METABRIC (OS)")),
+    p_label = dplyr::case_when(
+      p_value < 0.001 ~ "log-rank p < 0.001",
+      TRUE            ~ sprintf("log-rank p = %.3f", p_value)
+    )
+  )
+
+p_panelF <- ggplot(km_curves, aes(x = time / 365.25, y = surv, colour = dev_tertile)) +
+  geom_step(linewidth = 0.85) +
+  scale_colour_manual(
+    values = c("T1: Most youthful"  = "#2c7bb6",
+               "T2: Middle"         = "grey45",
+               "T3: Least youthful" = "#d7191c"),
+    name = "Deviation tertile"
+  ) +
+  facet_wrap(~ cohort, ncol = 1) +
+  geom_text(
+    data        = logrank_labels,
+    aes(label = p_label),
+    x = -Inf, y = -Inf, hjust = -0.1, vjust = -0.8,
+    inherit.aes = FALSE, size = 3.4, colour = "grey20"
+  ) +
+  coord_cartesian(xlim = c(0, x_max), ylim = c(0, 1)) +
+  labs(
+    x = "Time (years)",
+    y = "Survival probability"
+  ) +
+  theme_minimal(base_size = 9) +
+  theme(
+    strip.text         = element_text(face = "bold", size = 8),
+    strip.background   = element_rect(fill = "grey95", colour = NA),
+    legend.position    = "bottom",
+    legend.text        = element_text(size = 8),
+    legend.title       = element_text(size = 9),
+    legend.spacing.y   = unit(1, "pt"),
+    legend.margin      = margin(0, 0, 0, 0),
+    axis.text          = element_text(size = 8),
+    axis.title         = element_text(size = 9),
+    plot.margin        = margin(4, 4, 4, 4)
+  )
+
+p_panelF
+
+ggsave(
+  filename = file.path(fig_out_dir, "PanelF_OS_KM_tertile_3cohorts.pdf"),
+  plot     = p_panelF,
+  width    = 3, height = 6.75, units = "in"
+)
+```
+
+# 12. Stability diagnostics
+
+## 12.1 Hallmark coverage in the common universe
+
+```{r diag_hallmark_coverage}
+hallmark_sizes <- tibble(
+  pathway = names(hallmark_sets),
+  n_total = vapply(hallmark_sets, length, integer(1))
+)
+
+count_present <- function(universe) {
+  vapply(hallmark_sets, function(g) sum(g %in% universe), integer(1))
+}
+
+retained_pathways <- names(b_orig)[b_orig != 0]
+top_contrib       <- names(sort(abs(b_orig), decreasing = TRUE))[1:10]
+
+coverage_tbl <- hallmark_sizes %>%
+  mutate(
+    n_gtex     = count_present(rownames(logcpm_gtex_sym)),
+    n_tcga_pt  = count_present(rownames(logcpm_pt_sym)),
+    n_scanb    = count_present(rownames(logcpm_scanb_sym)),
+    n_metab    = count_present(rownames(logcpm_metab_sym)),
+    n_common   = count_present(universe_common),
+    pct_common = round(100 * n_common / n_total, 1),
+    retained_in_clock = pathway %in% retained_pathways,
+    top10_contrib     = pathway %in% top_contrib
+  ) %>%
+  arrange(pct_common)
+
+cat("Coverage in common universe:\n")
+cat("  Median %:    ", round(median(coverage_tbl$pct_common), 1), "\n")
+cat("  Min %:       ", round(min(coverage_tbl$pct_common), 1),
+    " (", coverage_tbl$pathway[which.min(coverage_tbl$pct_common)], ")\n", sep = "")
+cat("  # < 60%:     ", sum(coverage_tbl$pct_common < 60), " of 50\n")
+cat("  # < 80%:     ", sum(coverage_tbl$pct_common < 80), " of 50\n")
+
+cat("\nClock-retained pathways — coverage in common universe:\n")
+cat("  Median %:    ", round(median(coverage_tbl$pct_common[coverage_tbl$retained_in_clock]), 1), "\n")
+cat("  Min %:       ", round(min(coverage_tbl$pct_common[coverage_tbl$retained_in_clock]), 1), "\n")
+
+print(coverage_tbl)
+```
+
+## 12.2 Original (full universe) vs retrained (common universe) clock comparison
+
+```{r diag_clock_comparison}
+orig_clock_path <- file.path(proc_dir, "clock_and_RAA_objects-PC.rds")
+stopifnot(file.exists(orig_clock_path))
+orig_clock <- readRDS(orig_clock_path)
+
+required_slots <- c("feature_names", "tuning", "enet_model", "clock_raw")
+stopifnot(length(setdiff(required_slots, names(orig_clock))) == 0)
+
+orig_alpha  <- orig_clock$tuning$best_alpha
+orig_lambda <- orig_clock$tuning$best_lambda
+orig_b      <- orig_clock$clock_raw$beta
+orig_a      <- orig_clock$clock_raw$alpha
+orig_feats  <- orig_clock$feature_names
+
+orig_metric_col <- if (orig_clock$tuning$lambda_choice == "lambda.min") "MAE.min" else "MAE.1se"
+orig_mae <- orig_clock$tuning$tune_table %>%
+  dplyr::filter(abs(alpha - orig_alpha) < 1e-9) %>%
+  dplyr::pull(.data[[orig_metric_col]])
+
+new_alpha  <- best_alpha
+new_lambda <- best_lambda
+new_b      <- b_orig
+new_a      <- a_orig
+new_mae    <- best_mae
+new_feats  <- feat
+
+# Hyperparameter table
+hp_tbl <- tibble(
+  metric = c("alpha", "lambda", "intercept",
+             paste0("CV MAE (", orig_clock$tuning$lambda_choice, ")"),
+             "n features (Hallmarks)",
+             "n retained (nonzero)"),
+  original  = c(signif(orig_alpha, 3),  signif(orig_lambda, 4),  signif(orig_a, 4),
+                signif(orig_mae, 4),    length(orig_feats),       sum(orig_b != 0)),
+  retrained = c(signif(new_alpha, 3),   signif(new_lambda, 4),   signif(new_a, 4),
+                signif(new_mae, 4),     length(new_feats),        sum(new_b != 0))
+)
+cat("Hyperparameter & training-fit comparison:\n")
+print(hp_tbl)
+
+# Coefficient agreement
+all_paths <- union(orig_feats, new_feats)
+comp <- tibble(
+  pathway   = all_paths,
+  orig_coef = as.numeric(orig_b[all_paths]),
+  new_coef  = as.numeric(new_b[all_paths])
+) %>%
+  mutate(
+    orig_coef = ifelse(is.na(orig_coef), 0, orig_coef),
+    new_coef  = ifelse(is.na(new_coef),  0, new_coef),
+    in_orig   = orig_coef != 0,
+    in_new    = new_coef  != 0,
+    sign_agree = sign(orig_coef) == sign(new_coef)
+  )
+
+both_retained   <- sum(comp$in_orig & comp$in_new)
+either_retained <- sum(comp$in_orig | comp$in_new)
+jaccard_retained <- both_retained / either_retained
+
+cat("\nPathway-set agreement:\n")
+cat("  Retained in both:           ", both_retained, "\n")
+cat("  Retained in original only:  ", sum(comp$in_orig & !comp$in_new), "\n")
+cat("  Retained in retrained only: ", sum(!comp$in_orig & comp$in_new), "\n")
+cat("  Jaccard (retained set):     ", round(jaccard_retained, 3), "\n")
+
+shared <- comp %>% filter(in_orig & in_new)
+spearman_shared <- cor(shared$orig_coef, shared$new_coef, method = "spearman")
+sign_concord_shared <- mean(shared$sign_agree)
+
+cat("\nCoefficient agreement on shared retained pathways (n=", nrow(shared), "):\n", sep = "")
+cat("  Spearman:                   ", round(spearman_shared, 3), "\n")
+cat("  Sign concordance:           ", round(sign_concord_shared, 3), "\n")
+
+# Coefficient scatter
+ggplot(comp, aes(orig_coef, new_coef)) +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "grey60") +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "grey60") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey40") +
+  geom_point(aes(color = case_when(
+    in_orig &  in_new ~ "Both",
+    in_orig & !in_new ~ "Original only",
+    !in_orig &  in_new ~ "Retrained only",
+    TRUE ~ "Neither"
+  )), size = 2.5, alpha = 0.85) +
+  scale_color_manual(values = c(
+    Both = "#1f78b4", `Original only` = "#e31a1c",
+    `Retrained only` = "#33a02c", Neither = "grey85"
+  ), name = NULL) +
+  labs(
+    x = "Coefficient — original clock (GTEx ∩ TCGA universe)",
+    y = "Coefficient — retrained clock (common universe)",
+    title = "Pathway coefficients: original vs retrained"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+## 12.3 METABRIC sample composition audit
+
+```{r diag_metabric_composition}
+mb_cd_diag <- as.data.frame(colData(metabric_se))
+cat("METABRIC colData dimensions: ", paste(dim(mb_cd_diag), collapse = " x "), "\n\n")
+
+for (col in c("CANCER_TYPE_DETAILED", "HISTOLOGICAL_SUBTYPE",
+              "SAMPLE_TYPE", "Pam50_SUBTYPE")) {
+  if (col %in% colnames(mb_cd_diag)) {
+    cat("\n--- ", col, " ---\n", sep = "")
+    print(table(mb_cd_diag[[col]], useNA = "ifany"))
+  }
+}
+```
+
+# Session info
+
+```{r}
+sessionInfo()
+```

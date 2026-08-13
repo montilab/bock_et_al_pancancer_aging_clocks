@@ -1,0 +1,1719 @@
+---
+title: "Supplementary analyses — SCAN-B verification of the BRCA aging clock"
+author: "Pan-cancer aging project"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: united
+    toc: true
+    toc_float: true
+    code_folding: hide
+    css: /restricted/projectnb/agedisease/projects/pancancer_aging_pbock/manuscript_analyses/R/style.css
+params:
+  # ---------------------------
+  # Analysis identifiers
+  # ---------------------------
+  tcga_project: "BRCA"
+  gtex_project: "BREAST"
+  feature_set: "PC"   # "PC" = protein-coding universe
+
+  # ---------------------------
+  # Where the official pipeline objects live
+  # (Steps 01–04 outputs)
+  # ---------------------------
+  out_root: "/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/manuscript_analyses/results/derived/GTEx"
+
+  # ---------------------------
+  # SCAN-B input
+  # ---------------------------
+  scanb_se_rds: "/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/data/GTEx/scanbe_se.rds"
+  scanb_counts_assay: "counts"  # assay name in scanb SE
+
+  # ---------------------------
+  # Figure output directory (DO NOT WRITE unless save_figures = TRUE)
+  # ---------------------------
+  fig_dir: "/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/manuscript_analyses/results/figures/supplemental"
+  save_figures: true
+
+  # ---------------------------
+  # Rmd behavior
+  # ---------------------------
+  eval_default: true  # set TRUE once you're ready to run
+  seed: 2026
+---
+
+<!--
+This Rmd is a *template* for SCAN-B verification of the BRCA GTEx-trained clock.
+
+Per your request:
+  - Everything runs by default (params$eval_default = TRUE).
+  - Figure saving is enabled by default (params$save_figures = TRUE).
+  - Each plot has its own dedicated chunk so you can promote/demote plots for the supplement
+    (set eval=TRUE or comment out).
+
+Focus is on reproducing Figure 3-style panels from fig3_BRCA_deep_dive:
+  - processing (SCAN-B -> ssGSEA Hallmark)
+  - applying the BRCA clock
+  - calibration / GTEx anchoring
+  - ClockSHAP explanations
+  - survival analyses (aligned to the “03” logic, adapted for SCAN-B endpoints)
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  eval = isTRUE(params$eval_default)
+)
+set.seed(params$seed)
+```
+
+## Libraries
+
+```{r}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(tidyr)
+  library(purrr)
+  library(stringr)
+  library(ggplot2)
+  library(grid)            # unit()
+  library(scales)
+
+  library(SummarizedExperiment)
+  library(edgeR)
+  library(msigdbr)
+  library(GSVA)
+
+  library(glmnet)
+
+  library(AnnotationDbi)
+  library(org.Hs.eg.db)
+
+  library(ClockSHAP)
+  library(ComplexHeatmap)
+  library(circlize)
+
+  library(survival)
+  library(broom)
+})
+```
+
+## Global paths + helpers
+
+```{r}
+analysis_id <- paste0(params$tcga_project, "__", params$gtex_project)
+suffix      <- paste0("-", params$feature_set)
+proc_dir    <- file.path(params$out_root, analysis_id)
+
+clock_rds      <- file.path(proc_dir, paste0("clock_and_RAA_objects", suffix, ".rds"))
+metadata_rds   <- file.path(proc_dir, "sample_metadata.rds")
+scores_gtex_rds <- file.path(proc_dir, paste0("ssgsea_scores_gtex", suffix, ".rds"))
+scores_nt_rds   <- file.path(proc_dir, paste0("ssgsea_scores_nt",   suffix, ".rds"))
+scores_pt_rds   <- file.path(proc_dir, paste0("ssgsea_scores_pt",   suffix, ".rds"))
+clockshap_rds   <- file.path(proc_dir, paste0("clockshap_objects",  suffix, ".rds"))
+
+FIG_DIR <- params$fig_dir
+
+stopifnot(file.exists(clock_rds), file.exists(metadata_rds), file.exists(scores_gtex_rds))
+```
+
+## Load official BRCA (GTEx-trained) clock objects (Steps 02–04)
+
+```{r}
+clock_results <- readRDS(clock_rds)
+metadata      <- readRDS(metadata_rds)
+scores_gtex   <- readRDS(scores_gtex_rds)
+
+scores_nt <- if (file.exists(scores_nt_rds)) readRDS(scores_nt_rds) else NULL
+scores_pt <- if (file.exists(scores_pt_rds)) readRDS(scores_pt_rds) else NULL
+
+# Prefer Step-04 ClockSHAP bundle if available (contains clock + reference)
+clockshap_bundle <- if (file.exists(clockshap_rds)) readRDS(clockshap_rds) else NULL
+
+feat <- clock_results$feature_names
+stopifnot(all(feat %in% rownames(scores_gtex)))
+```
+
+## Fit GTEx reference line (for anchoring + residuals)
+
+```{r}
+pred_gtex <- clock_results$pred$GTEx
+age_gtex  <- clock_results$age$GTEx[names(pred_gtex)]
+
+ok_g <- complete.cases(pred_gtex, age_gtex)
+pred_gtex <- pred_gtex[ok_g]
+age_gtex  <- age_gtex[ok_g]
+
+bias_fit <- lm(pred_gtex ~ age_gtex)
+beta0 <- coef(bias_fit)[1]
+beta1 <- coef(bias_fit)[2]
+
+c(beta0 = beta0, beta1 = beta1, n_gtex = length(pred_gtex))
+```
+
+## SCAN-B processing (counts → logCPM → Hallmark ssGSEA)
+
+This block mirrors the SCAN-B processing logic used in your original validation script (05_SCANB_Validation_PC), but is kept minimal and scoped to what is needed for Fig 3-style plots.
+
+```{r}
+# 0) Hallmark gene sets (same naming convention as pipeline steps)
+.hallmark_sets <- local({
+  nice <- function(x) x |>
+    stringr::str_remove("^HALLMARK_") |>
+    stringr::str_replace_all("_", " ") |>
+    stringr::str_to_title()
+  hall_raw <- msigdbr::msigdbr(species = "Homo sapiens", category = "H")
+  split(hall_raw$gene_symbol, nice(hall_raw$gs_name))
+})
+
+.to_logcpm <- function(se, assay_name = "counts") {
+  stopifnot(assay_name %in% SummarizedExperiment::assayNames(se))
+  edgeR::cpm(SummarizedExperiment::assay(se, assay_name), log = TRUE, prior.count = 1)
+}
+
+.ensembl_to_symbol <- function(ensembl_ids) {
+  bare <- sub("\\.\\d+$", "", ensembl_ids)
+  syms <- AnnotationDbi::mapIds(
+    org.Hs.eg.db,
+    keys = bare,
+    keytype = "ENSEMBL",
+    column = "SYMBOL",
+    multiVals = "first"
+  )
+  names(syms) <- ensembl_ids
+  syms
+}
+
+.collapse_to_symbols <- function(logcpm, symbols) {
+  keep <- !is.na(symbols) & symbols != ""
+  logcpm  <- logcpm[keep, , drop = FALSE]
+  symbols <- symbols[keep]
+  summed  <- rowsum(logcpm, group = symbols)
+  counts  <- table(symbols)[rownames(summed)]
+  sweep(summed, 1, as.numeric(counts), "/")
+}
+
+.run_ssgsea <- function(expr_sym_gxs, hallmark_sets = .hallmark_sets) {
+  param <- GSVA::ssgseaParam(
+    exprData  = expr_sym_gxs,
+    geneSets  = hallmark_sets,
+    minSize   = 1,
+    maxSize   = Inf,
+    alpha     = 0.25,
+    normalize = FALSE
+  )
+  GSVA::gsva(param, verbose = FALSE)
+}
+
+process_scanb_for_clock <- function(se,
+                                    assay_name = "counts",
+                                    id_type = c("ensembl", "symbol")) {
+  id_type <- match.arg(id_type)
+
+  logcpm <- .to_logcpm(se, assay_name)
+
+  if (id_type == "ensembl") {
+    syms <- .ensembl_to_symbol(rownames(logcpm))
+    logcpm_sym <- .collapse_to_symbols(logcpm, syms)
+  } else {
+    logcpm_sym <- .collapse_to_symbols(logcpm, rownames(logcpm))
+  }
+
+  ssgsea_pxs <- .run_ssgsea(logcpm_sym)
+
+  list(
+    logcpm_sym = logcpm_sym,
+    ssgsea_pxs = ssgsea_pxs
+  )
+}
+```
+
+### Load + filter SCAN-B SE (best replicate per sample; invasive tumors)
+
+```{r}
+stopifnot(file.exists(params$scanb_se_rds))
+scanb <- readRDS(params$scanb_se_rds)
+
+cd <- as.data.frame(SummarizedExperiment::colData(scanb))
+cd$run_id <- rownames(cd)
+
+# Best replicate: highest ALIGNED_PAIRS per Sample (same as 05 script)
+best_replicates <- cd |>
+  dplyr::group_by(Sample) |>
+  dplyr::slice_max(order_by = ALIGNED_PAIRS, n = 1, with_ties = FALSE) |>
+  dplyr::ungroup()
+
+scanb_best <- scanb[, best_replicates$run_id]
+
+# Filter to match TCGA BRCA: invasive primary tumors only
+cd2 <- as.data.frame(SummarizedExperiment::colData(scanb_best))
+
+is_normal <- cd2$SpecimenType %in% "Normal"
+is_ln     <- cd2$SpecimenType %in% "LN"
+is_dcis   <- cd2$OpBiopsy.InvCa %in% "In situ only"
+drop <- is_normal | is_ln | is_dcis
+drop[is.na(drop)] <- FALSE
+
+scanb_tumor <- scanb_best[, !drop]
+
+# Add age_years (SCAN-B has 5-year binned age)
+age_col <- "Age..5.year.range..e.g...35.31.35...40.36.40...45.41.45..etc.."
+stopifnot(age_col %in% colnames(SummarizedExperiment::colData(scanb_tumor)))
+SummarizedExperiment::colData(scanb_tumor)$age_years <- as.numeric(
+  SummarizedExperiment::colData(scanb_tumor)[[age_col]]
+)
+
+summary(SummarizedExperiment::colData(scanb_tumor)$age_years)
+```
+
+### Compute Hallmark ssGSEA for SCAN-B
+
+```{r}
+scanb_proc <- process_scanb_for_clock(
+  se = scanb_tumor,
+  assay_name = params$scanb_counts_assay,
+  id_type = "ensembl"
+)
+
+scanb_scores_pxs <- scanb_proc$ssgsea_pxs
+stopifnot(all(feat %in% rownames(scanb_scores_pxs)))
+```
+
+## Apply BRCA clock to SCAN-B (raw predictions + GTEx-anchored residuals)
+
+```{r}
+X_scanb <- t(scanb_scores_pxs[feat, , drop = FALSE])
+scanb_ids <- rownames(X_scanb)
+
+scanb_age <- as.numeric(SummarizedExperiment::colData(scanb_tumor)[scanb_ids, "age_years"])
+names(scanb_age) <- scanb_ids
+
+pred_scanb_raw <- as.numeric(predict(
+  clock_results$enet_model,
+  newx = X_scanb,
+  s = clock_results$tuning$best_lambda
+))
+names(pred_scanb_raw) <- scanb_ids
+
+scanb_pred_df <- tibble::tibble(
+  sample_id = scanb_ids,
+  age_years = scanb_age[scanb_ids],
+  predicted = pred_scanb_raw[scanb_ids]
+) %>%
+  dplyr::filter(is.finite(age_years), is.finite(predicted)) %>%
+  dplyr::mutate(
+    # Anchored prediction (Fig 3A style)
+    pred_anchored = predicted - beta0 + (1 - beta1) * age_years,
+    # GTEx-anchored residual / deviation
+    dev_gtex = predicted - (beta0 + beta1 * age_years)
+  )
+
+scanb_pred_df %>% dplyr::slice_head(n = 5)
+```
+
+## ClockSHAP for SCAN-B (GTEx reference)
+
+```{r}
+# Prefer using Step-04 bundle (ensures identical reference + clock parameterization)
+if (!is.null(clockshap_bundle)) {
+  clock_cs <- clockshap_bundle$clock
+  reference <- clockshap_bundle$reference
+} else {
+  # Fallback: build ClockSHAP objects from Step-02 saved parameters + GTEx features
+  cs <- clock_results$clock_cs
+  if (is.null(names(cs$beta)))  names(cs$beta)  <- feat
+  if (is.null(names(cs$mu)))    names(cs$mu)    <- feat
+  if (is.null(names(cs$sigma))) names(cs$sigma) <- feat
+
+  clock_cs <- ClockSHAP::linear_clock(
+    alpha = cs$alpha,
+    beta  = cs$beta[feat],
+    mu    = cs$mu[feat],
+    sigma = cs$sigma[feat]
+  )
+
+  X_gtex <- t(scores_gtex[feat, , drop = FALSE])
+  age_g <- as.numeric(metadata[rownames(X_gtex), "age_years"])
+  keep_g <- is.finite(age_g)
+
+  reference <- ClockSHAP::fit_reference_profile(
+    features = as.data.frame(X_gtex[keep_g, , drop = FALSE]),
+    age      = age_g[keep_g]
+  )
+}
+
+# ClockSHAP requires complete age
+ok_scanb <- is.finite(scanb_pred_df$age_years) & scanb_pred_df$age_years > 0
+X_scanb_cs <- X_scanb[scanb_pred_df$sample_id[ok_scanb], , drop = FALSE]
+age_scanb_cs <- scanb_pred_df$age_years[ok_scanb]
+
+cs_scanb <- ClockSHAP::clockshap(
+  features  = X_scanb_cs,
+  age       = age_scanb_cs,
+  clock     = clock_cs,
+  reference = reference
+)
+
+# Invariant check
+max_abs_err <- max(abs(rowSums(cs_scanb$phi) - cs_scanb$deviation), na.rm = TRUE)
+max_abs_err
+```
+
+## Proof block (optional): GTEx-anchored residual equals ClockSHAP deviation
+
+```{r}
+sid <- rownames(cs_scanb$phi)
+
+pred_cs <- cs_scanb$predicted; names(pred_cs) <- sid
+exp_cs  <- cs_scanb$expected;  names(exp_cs)  <- sid
+age_cs  <- cs_scanb$age;       names(age_cs)  <- sid
+
+proof_df <- tibble::tibble(
+  sample_id = sid,
+  age       = as.numeric(age_cs[sid]),
+  predicted = as.numeric(pred_cs[sid]),
+  expected  = as.numeric(exp_cs[sid]),
+  dev_shap  = as.numeric(pred_cs[sid] - exp_cs[sid])
+) %>%
+  dplyr::filter(complete.cases(age, predicted, expected, dev_shap)) %>%
+  dplyr::mutate(dev_gtex_resid = predicted - (beta0 + beta1 * age))
+
+c(
+  cor_dev_shap_vs_gtex_resid = cor(proof_df$dev_shap, proof_df$dev_gtex_resid),
+  max_abs_diff = max(abs(proof_df$dev_shap - proof_df$dev_gtex_resid), na.rm = TRUE)
+)
+```
+
+# Supplemental panels (Fig 3-style)
+
+## Platform diagnostic — PCA in Hallmark ssGSEA space
+
+Cross-cohort PCA on Hallmark ssGSEA scores for GTEx, TCGA-BRCA NAT,
+TCGA-BRCA PT, and SCAN-B. Shows where SCAN-B sits relative to the
+training reference (GTEx) and to TCGA-BRCA in pathway-score space.
+NAT and PT are included if their saved score files are present; the
+PCA proceeds with whatever cohorts are available.
+
+```{r supp_pca_hallmark_space}
+mat_list <- list(
+  "GTEx"     = scores_gtex,
+  "TCGA-NAT" = scores_nt,
+  "TCGA-PT"  = scores_pt,
+  "SCAN-B"   = scanb_scores_pxs
+)
+mat_list <- mat_list[!vapply(mat_list, is.null, logical(1))]
+
+# Restrict to the Hallmark set shared across all included cohorts
+pathways_common <- Reduce(intersect, lapply(mat_list, rownames))
+stopifnot(length(pathways_common) > 0)
+
+combined_mat <- do.call(
+  cbind,
+  lapply(mat_list, function(m) m[pathways_common, , drop = FALSE])
+)
+cohort_vec <- rep(names(mat_list), vapply(mat_list, ncol, integer(1)))
+
+pca_fit <- stats::prcomp(t(combined_mat), center = TRUE, scale. = TRUE)
+ve <- round(100 * pca_fit$sdev^2 / sum(pca_fit$sdev^2), 1)
+
+cohort_levels_pca <- intersect(
+  c("GTEx", "TCGA-NAT", "TCGA-PT", "SCAN-B"),
+  unique(cohort_vec)
+)
+
+pc_df <- as.data.frame(pca_fit$x[, 1:2]) %>%
+  dplyr::mutate(cohort = factor(cohort_vec, levels = cohort_levels_pca))
+
+# Sample counts per cohort included in the PCA
+pca_n_tbl <- pc_df %>% dplyr::count(cohort, name = "n_samples")
+knitr::kable(pca_n_tbl, caption = "Hallmark PCA: samples per cohort.")
+
+cohort_cols_pca <- c(
+  "GTEx"     = "#4daf4a",
+  "TCGA-NAT" = "#984ea3",
+  "TCGA-PT"  = "#377eb8",
+  "SCAN-B"   = "#fdae6b"
+)
+
+p_supp_pca <- ggplot2::ggplot(
+  pc_df,
+  ggplot2::aes(x = PC1, y = PC2, colour = cohort)
+) +
+  ggplot2::geom_point(alpha = 0.5, size = 1.5) +
+  ggplot2::scale_colour_manual(values = cohort_cols_pca) +
+  ggplot2::labs(
+    x = paste0("PC1 (", ve[1], "%)"),
+    y = paste0("PC2 (", ve[2], "%)")
+  ) +
+  ggplot2::theme_minimal(base_size = 17) +
+  ggplot2::theme(
+    legend.title      = ggplot2::element_blank(),
+    panel.grid.minor  = ggplot2::element_blank(),
+    axis.ticks        = ggplot2::element_line(),
+    axis.ticks.length = grid::unit(2, "mm"),
+    axis.title        = ggplot2::element_text(size = 17),
+    axis.text         = ggplot2::element_text(size = 15),
+    legend.text       = ggplot2::element_text(size = 15)
+  )
+
+p_supp_pca
+```
+
+```{r supplementary_scanb_hallmark_pca_save}
+if (isTRUE(params$save_figures)) {
+  out_dir <- FIG_DIR
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  ggsave(
+    filename = file.path(out_dir, "supplementary_scanb_hallmark_pca.pdf"),
+    plot   = p_supp_pca,
+    width  = 210 / 25.4,
+    height = 150 / 25.4,
+    units  = "in"
+  )
+
+  message("Saved: ", file.path(out_dir, "supplementary_scanb_hallmark_pca.pdf"))
+} else {
+  message("save_figures=FALSE; skipping save: supplementary_scanb_hallmark_pca.pdf")
+}
+```
+
+## Supp Fig 3A — Anchored predicted age vs chronological age (GTEx vs SCAN-B)
+
+```{r suppfig3A_anchored_pred_age}
+## -------------------------------------------------------------
+## Supp Fig 3A: Age vs GTEx-anchored predicted age
+##   Anchoring uses GTEx-only fit: pred ~ age
+## -------------------------------------------------------------
+
+# GTEx plotting df
+gtex_df <- tibble::tibble(
+  cohort = "GTEx",
+  age_years = as.numeric(age_gtex),
+  pred_anchored = as.numeric(pred_gtex - beta0 + (1 - beta1) * age_gtex)
+) %>%
+  dplyr::filter(complete.cases(age_years, pred_anchored))
+
+# SCAN-B plotting df
+scanb_df <- scanb_pred_df %>%
+  dplyr::transmute(
+    cohort = "SCAN-B",
+    age_years,
+    pred_anchored
+  )
+
+plot_df <- dplyr::bind_rows(gtex_df, scanb_df) %>%
+  dplyr::mutate(cohort = factor(cohort, levels = c("GTEx", "SCAN-B")))
+
+cols <- c("GTEx" = "#4daf4a", "SCAN-B" = "#fdae6b")
+
+p_supp3A <- ggplot(plot_df, aes(x = age_years, y = pred_anchored, colour = cohort)) +
+  geom_point(alpha = 0.25, size = 1.2) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 1.1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "black") +
+  scale_colour_manual(values = cols) +
+  labs(
+    x = "Chronological age (years)",
+    y = "GTEx-anchored age (years)"
+  ) +
+  theme_minimal(base_size = 17) +
+  theme(
+    legend.title      = element_blank(),
+    panel.grid.minor  = element_blank(),
+    axis.ticks        = element_line(),
+    axis.ticks.length = unit(2, "mm"),
+    axis.title        = element_text(size = 17),
+    axis.text         = element_text(size = 15),
+    legend.text       = element_text(size = 15)
+  )
+
+p_supp3A
+
+```
+
+```{r supplementary_scanb_age_vs_anchored_pred_save}
+if (isTRUE(params$save_figures)) {
+  out_dir <- FIG_DIR
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  ggsave(
+    filename = file.path(out_dir, "supplementary_scanb_age_vs_anchored_pred.pdf"),
+    plot   = p_supp3A,
+    width  = 210 / 25.4,
+    height = 120 / 25.4,
+    units  = "in"
+  )
+
+  message("Saved: ", file.path(out_dir, "supplementary_scanb_age_vs_anchored_pred.pdf"))
+} else {
+  message("save_figures=FALSE; skipping save: supplementary_scanb_age_vs_anchored_pred.pdf")
+}
+```
+
+
+## Supplementary anchored-age comparison including TCGA-BRCA
+
+```{r supplementary_anchored_age_with_brca}
+## -------------------------------------------------------------
+## Supplementary anchored-age comparison: GTEx vs TCGA-BRCA vs SCAN-B
+##   Uses the GTEx-only anchoring fit from the official BRCA clock
+## -------------------------------------------------------------
+
+brca_df <- tibble::tibble(
+  cohort = "TCGA-BRCA",
+  age_years = as.numeric(clock_results$age$Tumour),
+  pred_anchored = as.numeric(clock_results$pred$Tumour - beta0 + (1 - beta1) * clock_results$age$Tumour)
+) %>%
+  dplyr::filter(complete.cases(age_years, pred_anchored))
+
+plot_df_with_brca <- dplyr::bind_rows(gtex_df, brca_df, scanb_df) %>%
+  dplyr::mutate(cohort = factor(cohort, levels = c("GTEx", "TCGA-BRCA", "SCAN-B")))
+
+cols_with_brca <- c(
+  "GTEx" = "#4daf4a",
+  "TCGA-BRCA" = "#377eb8",
+  "SCAN-B" = "#fdae6b"
+)
+
+p_supplementary_anchored_age_with_brca <- ggplot(
+  plot_df_with_brca,
+  aes(x = age_years, y = pred_anchored, colour = cohort)
+) +
+  geom_point(alpha = 0.22, size = 1.2) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 1.1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "black") +
+  scale_colour_manual(values = cols_with_brca) +
+  labs(
+    x = "Chronological age (years)",
+    y = "GTEx-anchored age (years)"
+  ) +
+  theme_minimal(base_size = 17) +
+  theme(
+    legend.title      = element_blank(),
+    panel.grid.minor  = element_blank(),
+    axis.ticks        = element_line(),
+    axis.ticks.length = unit(2, "mm"),
+    axis.title        = element_text(size = 17),
+    axis.text         = element_text(size = 15),
+    legend.text       = element_text(size = 15)
+  )
+
+p_supplementary_anchored_age_with_brca
+```
+
+```{r supplementary_anchored_age_with_brca_save, eval=FALSE}
+out_dir <- FIG_DIR
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+ggsave(
+  filename = file.path(out_dir, "supplementary_anchored_age_with_brca.pdf"),
+  plot   = p_supplementary_anchored_age_with_brca,
+  width  = 210 / 25.4,
+  height = 120 / 25.4,
+  units  = "in"
+)
+
+message("Saved: ", file.path(out_dir, "supplementary_anchored_age_with_brca.pdf"))
+```
+
+## Supp Fig 3B — ClockSHAP deviation by PAM50 subtype (SCAN-B)
+
+```{r suppfig3B_dev_by_pam50}
+## -------------------------------------------------------------
+## Supp Fig 3B: Deviation (predicted − expected) by PAM50 subtype
+## -------------------------------------------------------------
+
+sid <- rownames(cs_scanb$phi)
+delta_scanb <- as.numeric(cs_scanb$deviation)
+
+pam50 <- as.character(SummarizedExperiment::colData(scanb_tumor)[sid, "SSP.PAM50"])
+pam50[is.na(pam50) | pam50 == ""] <- "Unclassified"
+
+df <- tibble::tibble(
+  sample_id = sid,
+  DeltaAge  = delta_scanb,
+  PAM50     = pam50
+) %>%
+  dplyr::filter(is.finite(DeltaAge), !is.na(PAM50)) %>%
+  dplyr::mutate(
+    PAM50 = dplyr::recode(PAM50, "Normal" = "Normal-Like"),
+    PAM50 = factor(PAM50, levels = c("Normal-Like", "LumA", "LumB", "Her2", "Basal", "Unclassified"))
+  )
+
+pal_pam50 <- c(
+  "Normal-Like" = "#cccccc",
+  LumA          = "#4575b4",
+  LumB          = "#91bfdb",
+  Her2          = "#fc8d59",
+  Basal         = "#d73027",
+  Unclassified  = "grey70"
+)
+
+p_supp3B <- ggplot(df, aes(x = PAM50, y = DeltaAge, fill = PAM50)) +
+  geom_boxplot(width = 0.6, outlier.shape = NA, alpha = 0.85) +
+  geom_jitter(width = 0.12, alpha = 0.35, size = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_fill_manual(values = pal_pam50, guide = "none") +
+  labs(
+    x = "PAM50 subtype",
+    y = "Age-matched deviation (years)"
+  ) +
+  theme_minimal(base_size = 18) +
+  theme(
+    axis.title.x = element_text(size = 18),
+    axis.title.y = element_text(size = 18),
+    axis.text.x  = element_text(size = 16),
+    axis.text.y  = element_text(size = 15),
+    plot.margin  = margin(10, 10, 10, 10)
+  )
+
+p_supp3B
+
+# Optional omnibus test annotation
+kw <- kruskal.test(DeltaAge ~ PAM50, data = df)
+kw
+
+kw_p <- kw$p.value
+kw_label <- if (is.finite(kw_p) && kw_p < 2.2e-16) {
+  "Kruskal–Wallis p < 2.2e−16"
+} else {
+  paste0("Kruskal–Wallis p = ", signif(kw_p, 3))
+}
+
+ymax <- max(df$DeltaAge, na.rm = TRUE)
+ymin <- min(df$DeltaAge, na.rm = TRUE)
+ypad <- 0.06 * (ymax - ymin)
+
+p_supp3B_kw <- p_supp3B +
+  annotate(
+    "text",
+    x = Inf, y = ymax + ypad,
+    label = kw_label,
+    hjust = 1.05, vjust = 1,
+    size = 6
+  ) +
+  coord_cartesian(clip = "off") +
+  theme(plot.margin = margin(t = 10, r = 10, b = 10, l = 10))
+
+p_supp3B_kw
+
+```
+
+```{r supplementary_scanb_deltaage_by_pam50_kw_save, eval=FALSE}
+if (isTRUE(params$save_figures)) {
+  out_dir <- FIG_DIR
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  ggsave(
+    filename = file.path(out_dir, "supplementary_scanb_deltaage_by_pam50_kw.pdf"),
+    plot   = p_supp3B_kw,
+    width  = 210 / 25.4,
+    height = 120 / 25.4,
+    units  = "in"
+  )
+
+  message("Saved: ", file.path(out_dir, "supplementary_scanb_deltaage_by_pam50_kw.pdf"))
+} else {
+  message("save_figures=FALSE; skipping save: supplementary_scanb_deltaage_by_pam50_kw.pdf")
+}
+```
+
+## Supp Fig 3C — ClockSHAP waterfall for one representative SCAN-B tumor
+
+```{r suppfig3C_waterfall}
+## -------------------------------------------------------------
+## Supp Fig 3C: ClockSHAP waterfall (choose a readable tumor)
+## -------------------------------------------------------------
+
+pick_pretty_waterfall_sample <- function(cs, top_n = 10,
+                                        dev_q = c(0.20, 0.80),
+                                        min_bar = 2.5) {
+  stopifnot(inherits(cs, "clockshap"))
+  phi <- cs$phi
+  ids <- rownames(phi)
+  if (is.null(ids)) stop("ClockSHAP object has no rownames for phi.", call. = FALSE)
+
+  ok <- is.finite(cs$deviation) & is.finite(cs$expected) & is.finite(cs$predicted)
+  phi <- phi[ok, , drop = FALSE]
+  dev <- cs$deviation[ok]
+  ids <- ids[ok]
+
+  lo <- unname(stats::quantile(dev, dev_q[1], na.rm = TRUE))
+  hi <- unname(stats::quantile(dev, dev_q[2], na.rm = TRUE))
+  keep <- dev >= lo & dev <= hi
+
+  phi2 <- phi[keep, , drop = FALSE]
+  ids2 <- ids[keep]
+  if (nrow(phi2) == 0) stop("No samples left after dev_q filtering.", call. = FALSE)
+
+  top_abs <- t(apply(abs(phi2), 1, function(v) sort(v, decreasing = TRUE)[seq_len(top_n)]))
+  min_top  <- apply(top_abs, 1, min)
+  mean_top <- rowMeans(top_abs)
+
+  cand <- which(min_top >= min_bar)
+  if (length(cand) == 0) cand <- seq_len(nrow(phi2))
+  ids2[cand[which.max(mean_top[cand])]]
+}
+
+sample_id <- pick_pretty_waterfall_sample(
+  cs = cs_scanb,
+  top_n = 10,
+  dev_q = c(0.20, 0.80),
+  min_bar = 2.5
+)
+
+pt_summary <- tibble::tibble(
+  sample_id = sample_id,
+  age       = cs_scanb$age[match(sample_id, rownames(cs_scanb$phi))],
+  predicted = cs_scanb$predicted[match(sample_id, rownames(cs_scanb$phi))],
+  expected  = cs_scanb$expected[match(sample_id, rownames(cs_scanb$phi))],
+  deviation = cs_scanb$deviation[match(sample_id, rownames(cs_scanb$phi))]
+)
+pt_summary
+
+p_supp3C <- ClockSHAP::plot_clockshap_waterfall(
+  x = cs_scanb,
+  sample = sample_id,
+  top_n = 10,
+  show_age_labels = TRUE,
+  show_delta_label = TRUE,
+  show_effect_labels = TRUE,
+  x_axis_title = "Clock Age (years)",
+  y_axis_title = NULL,
+  deviation_label = "Age-Matched Deviation = {value} yr",
+  expected_age_label = "Expected Age (GTEx)\n{value} yr",
+  predicted_age_label = "SCAN-B Predicted Age\n{value} yr",
+  effect_label = "{value}"
+)
+
+p_supp3C
+
+```
+
+```{r supplementary_scanb_clockshap_waterfall_save, eval=FALSE}
+if (isTRUE(params$save_figures)) {
+  out_dir <- FIG_DIR
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  ggsave(
+    filename = file.path(out_dir, "supplementary_scanb_clockshap_waterfall.pdf"),
+    plot   = p_supp3C,
+    width  = 210 / 25.4,
+    height = 120 / 25.4,
+    units  = "in"
+  )
+
+  message("Saved: ", file.path(out_dir, "supplementary_scanb_clockshap_waterfall.pdf"))
+} else {
+  message("save_figures=FALSE; skipping save: supplementary_scanb_clockshap_waterfall.pdf")
+}
+```
+
+## Supp Fig 3D — Heatmap of ClockSHAP contributions across SCAN-B tumors
+
+```{r suppfig3D_heatmap}
+## -------------------------------------------------------------
+## Supp Fig 3D: ClockSHAP heatmap (SCAN-B), ordered by deviation
+##   Rows = pathways (Hallmarks), Columns = tumors
+## -------------------------------------------------------------
+
+phi <- cs_scanb$phi
+dev <- cs_scanb$deviation
+ids <- rownames(phi)
+stopifnot(!is.null(ids), length(dev) == nrow(phi))
+
+ok <- is.finite(dev)
+phi_ok <- phi[ok, , drop = FALSE]
+dev_ok <- dev[ok]
+ids_ok <- ids[ok]
+
+ord <- order(dev_ok, decreasing = FALSE)
+phi_ord <- phi_ok[ord, , drop = FALSE]
+dev_ord <- dev_ok[ord]
+ids_ord <- ids_ok[ord]
+
+mat <- t(phi_ord)
+colnames(mat) <- ids_ord
+mat <- mat[rowSums(abs(mat), na.rm = TRUE) != 0, , drop = FALSE]
+
+rownames(mat)[rownames(mat) == "Reactive Oxygen Species Pathway"] <- "ROS Pathway"
+
+# Column annotations: PAM50 (if available)
+pam <- as.character(SummarizedExperiment::colData(scanb_tumor)[ids_ord, "SSP.PAM50"])
+pam[is.na(pam) | pam == ""] <- "Unclassified"
+pam <- dplyr::recode(pam, "Normal" = "Normal-Like")
+
+pam_cols <- c(
+  Basal        = "#d73027",
+  Her2         = "#fc8d59",
+  LumA         = "#4575b4",
+  LumB         = "#91bfdb",
+  `Normal-Like`= "#cccccc",
+  Unclassified = "grey70"
+)
+
+# Optional extra annotation(s) if present
+extra_ann <- list()
+extra_cols <- list()
+cd <- as.data.frame(SummarizedExperiment::colData(scanb_tumor))
+
+if ("TP53" %in% colnames(cd)) {
+  tp53 <- as.character(SummarizedExperiment::colData(scanb_tumor)[ids_ord, "TP53"])
+  extra_ann$TP53 <- tp53
+  extra_cols$TP53 <- c(WT = "grey85", Mut = "black")
+}
+
+dev_col_fun <- circlize::colorRamp2(
+  c(min(dev_ord, na.rm = TRUE), 0, max(dev_ord, na.rm = TRUE)),
+  c("darkblue", "white", "darkred")
+)
+
+ann_args <- c(
+  list(
+    Deviation = dev_ord,
+    PAM50     = pam
+  ),
+  extra_ann,
+  list(
+    col = c(
+      list(
+        Deviation = dev_col_fun,
+        PAM50     = pam_cols
+      ),
+      extra_cols
+    ),
+    annotation_label = c(
+      Deviation = "Deviation (yr)",
+      PAM50     = "PAM50",
+      setNames(names(extra_ann), names(extra_ann))
+    ),
+    annotation_height = unit(rep(3, 2 + length(extra_ann)), "mm"),
+    annotation_name_gp = gpar(fontsize = 13),
+    annotation_legend_param = list(
+      Deviation = list(
+        title_gp  = gpar(fontsize = 13),
+        labels_gp = gpar(fontsize = 12)
+      ),
+      PAM50 = list(
+        title_gp  = gpar(fontsize = 13),
+        labels_gp = gpar(fontsize = 12)
+      )
+    )
+  )
+)
+
+ha <- do.call(ComplexHeatmap::HeatmapAnnotation, ann_args)
+
+phi_lim <- as.numeric(stats::quantile(abs(mat), probs = 0.99, na.rm = TRUE))
+phi_lim <- max(phi_lim, 1e-6)
+
+phi_col_fun <- circlize::colorRamp2(
+  c(-phi_lim, 0, phi_lim),
+  c("steelblue", "white", "firebrick")
+)
+
+ht_supp3D <- ComplexHeatmap::Heatmap(
+  mat,
+  name              = "ClockSHAP (yr)",
+  col               = phi_col_fun,
+  top_annotation    = ha,
+  show_row_names    = TRUE,
+  row_names_gp      = gpar(fontsize = 13),
+  show_column_names = FALSE,
+  cluster_rows      = TRUE,
+  cluster_columns   = FALSE,
+  heatmap_legend_param = list(
+    title_gp  = gpar(fontsize = 13),
+    labels_gp = gpar(fontsize = 12)
+  )
+)
+
+ht_supp3D
+
+```
+
+```{r supplementary_scanb_clockshap_heatmap_save}
+if (isTRUE(params$save_figures)) {
+  out_dir <- FIG_DIR
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  out_file <- file.path(out_dir, "supplementary_scanb_clockshap_heatmap.pdf")
+
+  grDevices::pdf(out_file, width = 190 / 25.4, height = 160 / 25.4)
+  ComplexHeatmap::draw(
+    ht_supp3D,
+    heatmap_legend_side    = "right",
+    annotation_legend_side = "right",
+    merge_legends          = TRUE
+  )
+  grDevices::dev.off()
+
+  message("Saved: ", out_file)
+} else {
+  message("save_figures=FALSE; skipping save: supplementary_scanb_clockshap_heatmap.pdf")
+}
+```
+
+
+
+## Replication summary metrics (BRCA vs SCAN-B)
+
+These optional blocks provide simple quantitative summaries of how closely SCAN-B reproduces key BRCA (TCGA-PT) structures:
+
+- **Pathway-level ClockSHAP directionality** (mean signed effect per pathway across tumors)
+- **PAM50 association with deviation** (median deviation per subtype)
+
+```{r replication_load_cs_pt, include=FALSE}
+## -------------------------------------------------------------
+## Build / load TCGA BRCA PT ClockSHAP object (for comparisons)
+## -------------------------------------------------------------
+
+cs_pt <- NULL
+
+# Prefer Step-04 clockshap bundle if present (fast + faithful)
+if (!is.null(clockshap_bundle) && !is.null(clockshap_bundle$pt) && inherits(clockshap_bundle$pt, "clockshap")) {
+  cs_pt <- clockshap_bundle$pt
+} else {
+  # Fallback: compute from saved PT ssGSEA scores
+  if (is.null(scores_pt)) {
+    stop("scores_pt is NULL; cannot construct TCGA BRCA PT ClockSHAP object.", call. = FALSE)
+  }
+  if (is.null(clock_cs) || is.null(reference)) {
+    stop("clock_cs/reference not available; cannot construct TCGA BRCA PT ClockSHAP object.", call. = FALSE)
+  }
+
+  X_pt <- t(scores_pt[feat, , drop = FALSE])
+  ids_pt <- rownames(X_pt)
+
+  if (!all(ids_pt %in% rownames(metadata))) {
+    stop("Cannot compute BRCA PT ClockSHAP: metadata is missing some PT sample IDs.", call. = FALSE)
+  }
+
+  age_pt <- as.numeric(metadata[ids_pt, "age_years"])
+  ok_pt <- is.finite(age_pt)
+
+  cs_pt <- ClockSHAP::clockshap(
+    features  = X_pt[ok_pt, , drop = FALSE],
+    age       = age_pt[ok_pt],
+    clock     = clock_cs,
+    reference = reference
+  )
+}
+
+stopifnot(inherits(cs_pt, "clockshap"))
+
+# Quick invariant check
+max_abs_err_pt <- max(abs(rowSums(cs_pt$phi) - cs_pt$deviation), na.rm = TRUE)
+max_abs_err_pt
+```
+
+
+## Supp Fig 3B2 — Deviation by PAM50 subtype (TCGA BRCA vs SCAN-B)
+
+This is a side-by-side visualization of the PAM50–deviation structure in **TCGA BRCA (PT)** versus **SCAN-B tumors**.
+
+```{r suppfig3B2_dev_by_pam50_brca_vs_scanb}
+## -------------------------------------------------------------
+## Supp Fig 3B2: Deviation by PAM50 (BRCA vs SCAN-B), side-by-side
+## -------------------------------------------------------------
+
+stopifnot(inherits(cs_pt, "clockshap"), inherits(cs_scanb, "clockshap"))
+
+# ---- SCAN-B ----
+sid_s <- rownames(cs_scanb$phi)
+dev_s <- as.numeric(cs_scanb$deviation)
+
+pam_s <- as.character(SummarizedExperiment::colData(scanb_tumor)[sid_s, "SSP.PAM50"])
+pam_s[is.na(pam_s) | pam_s == ""] <- "Unclassified"
+pam_s <- dplyr::recode(pam_s, "Normal" = "Normal-Like")
+
+df_scanb_pam <- tibble::tibble(
+  cohort    = "SCAN-B",
+  sample_id = sid_s,
+  PAM50     = pam_s,
+  DeltaAge  = dev_s
+) %>%
+  dplyr::filter(is.finite(DeltaAge), !is.na(PAM50))
+
+# ---- TCGA BRCA (PT) ----
+sid_b <- rownames(cs_pt$phi)
+dev_b <- as.numeric(cs_pt$deviation)
+
+# Try to find the PAM50 column used in Fig3_BRCA_deep_dive
+pam_candidates <- c(
+  "Subtype_Selected",
+  "PAM50",
+  "PAM50_Subtype",
+  "PAM50.Subtype",
+  "PAM50_call",
+  "pam50"
+)
+pam_col <- intersect(pam_candidates, colnames(metadata))[1]
+
+if (length(pam_col) == 0 || is.na(pam_col)) {
+  stop(
+    "Could not find a PAM50 subtype column in `metadata`. Looked for: ",
+    paste(pam_candidates, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+pam_b <- as.character(metadata[sid_b, pam_col])
+pam_b[is.na(pam_b) | pam_b == ""] <- "Unclassified"
+pam_b <- dplyr::recode(pam_b, "Normal" = "Normal-Like")
+
+df_brca_pam <- tibble::tibble(
+  cohort    = "TCGA BRCA (PT)",
+  sample_id = sid_b,
+  PAM50     = pam_b,
+  DeltaAge  = dev_b
+) %>%
+  dplyr::filter(is.finite(DeltaAge), !is.na(PAM50))
+
+# ---- Combine + plot ----
+df_both <- dplyr::bind_rows(df_brca_pam, df_scanb_pam) %>%
+  dplyr::mutate(
+    cohort = factor(cohort, levels = c("TCGA BRCA (PT)", "SCAN-B")),
+    PAM50  = factor(PAM50, levels = c("Normal-Like", "LumA", "LumB", "Her2", "Basal", "Unclassified"))
+  )
+
+pal_pam50 <- c(
+  "Normal-Like" = "#cccccc",
+  LumA          = "#4575b4",
+  LumB          = "#91bfdb",
+  Her2          = "#fc8d59",
+  Basal         = "#d73027",
+  Unclassified  = "grey70"
+)
+
+p_supp3B2 <- ggplot2::ggplot(df_both, ggplot2::aes(x = PAM50, y = DeltaAge, fill = PAM50)) +
+  ggplot2::geom_boxplot(width = 0.6, outlier.shape = NA, alpha = 0.85) +
+  ggplot2::geom_jitter(width = 0.12, alpha = 0.25, size = 0.8) +
+  ggplot2::geom_hline(yintercept = 0, linetype = "dashed") +
+  ggplot2::facet_grid(. ~ cohort) +
+  ggplot2::scale_fill_manual(values = pal_pam50, guide = "none") +
+  ggplot2::labs(
+    x = "PAM50 subtype",
+    y = "Age-matched deviation (years)"
+  ) +
+  ggplot2::theme_minimal(base_size = 18) +
+  ggplot2::theme(
+    axis.title.x = ggplot2::element_text(size = 18),
+    axis.title.y = ggplot2::element_text(size = 18),
+    axis.text.x  = ggplot2::element_text(size = 12.5),
+    axis.text.y  = ggplot2::element_text(size = 15),
+    strip.text.x = ggplot2::element_text(size = 15),
+    plot.margin  = ggplot2::margin(10, 10, 10, 10)
+  )
+
+p_supp3B2
+```
+
+```{r supplementary_brca_vs_scanb_deltaage_by_pam50_save}
+if (isTRUE(params$save_figures)) {
+  out_dir <- FIG_DIR
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  ggsave(
+    filename = file.path(out_dir, "supplementary_brca_vs_scanb_deltaage_by_pam50.pdf"),
+    plot   = p_supp3B2,
+    width  = 240 / 25.4,
+    height = 140 / 25.4,
+    units  = "in"
+  )
+
+  message("Saved: ", file.path(out_dir, "supplementary_brca_vs_scanb_deltaage_by_pam50.pdf"))
+} else {
+  message("save_figures=FALSE; skipping save: supplementary_brca_vs_scanb_deltaage_by_pam50.pdf")
+}
+```
+
+## Fig 3E-style coupling check (SCAN-B validation cohort)
+
+This reproduces the **program-resolved coupling** visualization logic used for Fig 3E (contribution = *w × β_tumor*), using:
+- **GTEx** as the reference aging direction in feature space (via β_z in GTEx), and
+- **SCAN-B tumors** as the validation tumor cohort.
+
+```{r suppfig3H_coupling_fig3E_style}
+## -------------------------------------------------------------
+## Fig 3E-style coupling plot (SCAN-B vs GTEx)
+##   Contribution per pathway: w_k * beta_{SCANB,k} in Z-space
+##   Bar color: GTEx aging direction in Z-space
+## -------------------------------------------------------------
+
+# --- Helper functions (minimal subset from coupling template) ---
+fit_slope <- function(y, age) {
+  ok <- complete.cases(y, age)
+  y <- as.numeric(y[ok])
+  age <- as.numeric(age[ok])
+  if (length(y) < 3) return(tibble::tibble(n = length(y), intercept = NA_real_, slope = NA_real_))
+  fit <- stats::lm(y ~ age)
+  tibble::tibble(n = length(y), intercept = unname(stats::coef(fit)[1]), slope = unname(stats::coef(fit)[2]))
+}
+
+standardize_like_clock <- function(X, mu, sigma) {
+  stopifnot(all(colnames(X) %in% names(mu)), all(colnames(X) %in% names(sigma)))
+  mu2 <- mu[colnames(X)]
+  sd2 <- sigma[colnames(X)]
+  if (any(!is.finite(sd2)) || any(sd2 == 0)) stop("Non-finite or zero sigma in clock; cannot standardize.")
+  Z <- sweep(X, 2, mu2, "-")
+  Z <- sweep(Z, 2, sd2, "/")
+  Z
+}
+
+col_slopes_vs_age <- function(Z, age) {
+  ok <- is.finite(age) & (rowSums(!is.finite(Z)) == 0)
+  Z <- Z[ok, , drop = FALSE]
+  age <- as.numeric(age[ok])
+  if (nrow(Z) < 3) return(setNames(rep(NA_real_, ncol(Z)), colnames(Z)))
+
+  age_c <- age - mean(age)
+  den <- sum(age_c^2)
+  if (!is.finite(den) || den == 0) return(setNames(rep(NA_real_, ncol(Z)), colnames(Z)))
+
+  Z_c <- sweep(Z, 2, colMeans(Z), "-")
+  slopes <- colSums(Z_c * age_c) / den
+  setNames(as.numeric(slopes), colnames(Z))
+}
+
+# --- Clock parameters in standardized space (Step 02 contract) ---
+cs <- clock_results$clock_cs
+feat <- clock_results$feature_names
+
+w   <- cs$beta;  if (is.null(names(w)))   names(w)   <- feat
+mu  <- cs$mu;    if (is.null(names(mu)))  names(mu)  <- feat
+sig <- cs$sigma; if (is.null(names(sig))) names(sig) <- feat
+
+# --- Build GTEx feature matrix (samples × pathways) aligned to Step-02 ages ---
+pred_gtex_raw <- clock_results$pred$GTEx
+age_gtex_raw  <- clock_results$age$GTEx[names(pred_gtex_raw)]
+
+ok_g <- complete.cases(age_gtex_raw) & is.finite(age_gtex_raw)
+age_gtex_raw <- age_gtex_raw[ok_g]
+
+ids_gtex <- intersect(names(age_gtex_raw), colnames(scores_gtex))
+X_gtex <- t(scores_gtex[feat, ids_gtex, drop = FALSE])
+age_g  <- as.numeric(age_gtex_raw[ids_gtex])
+
+# --- Use SCAN-B tumor features already prepared for the clock ---
+# (X_scanb_cs is samples × pathways, age_scanb_cs is numeric)
+stopifnot(exists("X_scanb_cs"), exists("age_scanb_cs"))
+X_s <- X_scanb_cs
+a_s <- as.numeric(age_scanb_cs)
+
+# --- Z-space standardization + slopes ---
+Z_g <- standardize_like_clock(X_gtex, mu = mu, sigma = sig)
+Z_s <- standardize_like_clock(X_s,    mu = mu, sigma = sig)
+
+beta_z_gtex  <- col_slopes_vs_age(Z_g, age_g)
+beta_z_scanb <- col_slopes_vs_age(Z_s, a_s)
+
+contrib_tbl <- tibble::tibble(
+  pathway     = feat,
+  weight_w    = as.numeric(w[feat]),
+  beta_z_scanb = as.numeric(beta_z_scanb[feat]),
+  beta_z_gtex  = as.numeric(beta_z_gtex[feat])
+) %>%
+  dplyr::mutate(
+    contrib = weight_w * beta_z_scanb,
+    contrib = ifelse(abs(weight_w) < 1e-12, 0, contrib)
+  )
+
+# --- Identity check: sum_k w_k * beta_k == slope(predicted ~ age) in raw space ---
+pred_s_raw <- as.numeric(cs$alpha + Z_s %*% as.numeric(w[feat]))
+gamma_scanb_raw <- fit_slope(pred_s_raw, a_s)$slope
+gamma_from_decomp <- sum(contrib_tbl$contrib, na.rm = TRUE)
+
+tibble::tibble(
+  gamma_scanb_raw = gamma_scanb_raw,
+  gamma_from_decomp = gamma_from_decomp,
+  abs_diff = abs(gamma_scanb_raw - gamma_from_decomp)
+)
+
+# --- Fig 3E-style plot ---
+top_n <- 25
+gtex_beta_eps <- 0.0
+neutral_band <- 0.002
+eps_w <- 1e-12
+
+plot_df <- contrib_tbl %>%
+  dplyr::filter(is.finite(weight_w), abs(weight_w) >= eps_w, is.finite(contrib)) %>%
+  dplyr::mutate(
+    abs_contrib = abs(contrib),
+    gtex_age_dir = dplyr::case_when(
+      beta_z_gtex >  gtex_beta_eps ~ "Increase with age",
+      beta_z_gtex < -gtex_beta_eps ~ "Decrease with age",
+      TRUE ~ "Flat / ~0"
+    ),
+    coupling_section = dplyr::case_when(
+      contrib >=  neutral_band ~ "Coupled",
+      contrib <= -neutral_band ~ "Inverted",
+      TRUE ~ "Near 0"
+    )
+  ) %>%
+  dplyr::arrange(dplyr::desc(abs_contrib)) %>%
+  dplyr::slice_head(n = top_n) %>%
+  dplyr::mutate(
+    coupling_section = factor(coupling_section, levels = c("Coupled", "Near 0", "Inverted"))
+  ) %>%
+  dplyr::arrange(contrib) %>%
+  dplyr::mutate(pathway = factor(pathway, levels = pathway))
+
+x_lim <- max(abs(plot_df$contrib), na.rm = TRUE)
+x_lim <- if (is.finite(x_lim)) x_lim * 1.05 else 1
+
+p_supp3H_coupling <- ggplot2::ggplot(plot_df, ggplot2::aes(x = contrib, y = pathway, fill = gtex_age_dir)) +
+  ggplot2::geom_col(width = 0.8) +
+  ggplot2::geom_vline(xintercept = 0, linewidth = 0.3) +
+  ggplot2::facet_grid(
+    coupling_section ~ .,
+    scales = "free_y",
+    space  = "free_y",
+    drop   = TRUE
+  ) +
+  ggplot2::scale_fill_manual(
+    values = c(
+      "Increase with age" = "red3",
+      "Decrease with age" = "blue3",
+      "Flat / ~0"                = "grey70"
+    )
+  ) +
+  ggplot2::coord_cartesian(xlim = c(-x_lim, x_lim), clip = "off") +
+  ggplot2::labs(
+    x = "Pathway contribution to coupling",
+    y = NULL,
+    fill = "Aging Direction (GTEx)"
+  ) +
+  ggplot2::theme_bw(base_size = 13) +
+  ggplot2::theme(
+    legend.position = "right",
+    legend.title = ggplot2::element_text(size = 14),
+    legend.text  = ggplot2::element_text(size = 13),
+    axis.title.x = ggplot2::element_text(size = 15),
+    axis.text.x  = ggplot2::element_text(size = 11),
+    axis.text.y  = ggplot2::element_text(size = 13),
+    strip.background = ggplot2::element_rect(fill = "grey95", color = NA),
+    strip.text.y.right = ggplot2::element_text(angle = -90, size = 16, face = "bold"),
+    strip.text.y.left  = ggplot2::element_blank(),
+    strip.placement = "outside",
+    panel.spacing.y = grid::unit(3, "pt"),
+    plot.margin = ggplot2::margin(5.5, 28, 5.5, 5.5, unit = "pt")
+  )
+
+p_supp3H_coupling
+```
+
+```{r supplementary_scanb_coupling_fig3e_style_save}
+if (isTRUE(params$save_figures)) {
+  out_dir <- FIG_DIR
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  ggsave(
+    filename = file.path(out_dir, "supplementary_scanb_coupling_fig3e_style.pdf"),
+    plot   = p_supp3H_coupling,
+    width  = 210 / 25.4,
+    height = 180 / 25.4,
+    units  = "in"
+  )
+
+  message("Saved: ", file.path(out_dir, "supplementary_scanb_coupling_fig3e_style.pdf"))
+} else {
+  message("save_figures=FALSE; skipping save: supplementary_scanb_coupling_fig3e_style.pdf")
+}
+```
+
+
+
+## Survival (SCAN-B) — replicate “03” style (Cox; per +1 year tumor-intra RAA)
+
+This follows the spirit of `03_deltaAge_clean_template.Rmd` (Cox models of tumor-intra residuals), adapted to SCAN-B columns in `colData(scanb_tumor)`.
+
+**Key choice:** for “tumor-intra RAA” in SCAN-B, we use residuals from `lm(predicted ~ age)` **within SCAN-B tumors**.
+
+```{r}
+# SCAN-B tumor-intra residuals: ŷ = a + b*Age within SCAN-B
+df_intra <- scanb_pred_df %>%
+  dplyr::filter(is.finite(age_years), is.finite(predicted))
+
+fit_scanb_intra <- lm(predicted ~ age_years, data = df_intra)
+aS <- coef(fit_scanb_intra)[1]
+bS <- coef(fit_scanb_intra)[2]
+
+df_intra <- df_intra %>%
+  dplyr::mutate(
+    RAA_intra = predicted - (aS + bS * age_years)
+  )
+
+c(aS = aS, bS = bS)
+```
+
+```{r surv_helpers}
+run_survival_scanb <- function(time_col, event_col, title_text,
+                               adjust_pam50 = TRUE,
+                               min_events = 10) {
+
+  ids <- df_intra$sample_id
+  cd <- SummarizedExperiment::colData(scanb_tumor)
+
+  stopifnot(time_col %in% colnames(cd), event_col %in% colnames(cd))
+
+  df <- tibble::tibble(
+    sample_id = ids,
+    RAA_T     = df_intra$RAA_intra,
+    age_years = df_intra$age_years,
+    time      = as.numeric(cd[ids, time_col]),
+    event     = as.numeric(cd[ids, event_col]),
+    PAM50     = as.character(cd[ids, "SSP.PAM50"])
+  ) %>%
+    dplyr::filter(is.finite(RAA_T), is.finite(age_years), is.finite(time), !is.na(event)) %>%
+    dplyr::mutate(
+      event = as.integer(event > 0),
+      PAM50 = dplyr::case_when(
+        is.na(PAM50) ~ "Unclassified",
+        PAM50 == ""  ~ "Unclassified",
+        TRUE ~ PAM50
+      ),
+      PAM50 = factor(PAM50, levels = c("Normal","LumA","LumB","Her2","Basal","Unclassified"))
+    )
+
+  if (sum(df$event) < min_events) {
+    warning("Not enough events for ", title_text, ": ", sum(df$event), " < ", min_events)
+    return(NULL)
+  }
+
+  # Global model(s)
+  fit_basic <- coxph(Surv(time, event) ~ RAA_T + age_years, data = df)
+  fits <- list(basic = fit_basic)
+
+  if (isTRUE(adjust_pam50)) {
+    fit_pam50 <- coxph(Surv(time, event) ~ RAA_T + age_years + PAM50, data = df)
+    fits$pam50 <- fit_pam50
+  }
+
+  # Per-subtype models (within PAM50)
+  tbl_sub <- purrr::map_df(levels(df$PAM50), function(s) {
+    d <- dplyr::filter(df, PAM50 == s)
+    if (nrow(d) < 15 || length(unique(d$event)) < 2) return(NULL)
+    f <- survival::coxph(survival::Surv(time, event) ~ RAA_T + age_years, data = d)
+    broom::tidy(f) %>%
+      dplyr::filter(term == "RAA_T") %>%
+      dplyr::mutate(model = paste("Subtype:", s), n = nrow(d), events = sum(d$event))
+  })
+
+  # Assemble forest-table
+  tbl <- dplyr::bind_rows(
+    broom::tidy(fit_basic) %>%
+      dplyr::filter(term == "RAA_T") %>%
+      dplyr::mutate(model = "All tumors (RAA + Age)", n = nrow(df), events = sum(df$event)),
+    if (isTRUE(adjust_pam50)) broom::tidy(fit_pam50) %>%
+      dplyr::filter(term == "RAA_T") %>%
+      dplyr::mutate(model = "All tumors + PAM50", n = nrow(df), events = sum(df$event)),
+    tbl_sub
+  ) %>%
+    dplyr::mutate(
+      HR    = exp(estimate),
+      lower = exp(estimate - 1.96 * std.error),
+      upper = exp(estimate + 1.96 * std.error),
+      sig   = ifelse(p.value < .05, "p < 0.05", "p ≥ 0.05"),
+      direction = ifelse(HR < 1, "Lower risk (HR < 1)", "Higher risk (HR > 1)"),
+      label_y = paste0(model, "\n(n=", n, ", events=", events, ")")
+    ) %>%
+    dplyr::mutate(label_y = factor(label_y, levels = rev(label_y)))
+
+  p <- ggplot(tbl, aes(HR, label_y)) +
+    geom_errorbarh(aes(xmin = lower, xmax = upper, colour = direction), height = .20) +
+    geom_point(aes(colour = direction, shape = sig), size = 3) +
+    geom_vline(xintercept = 1, linetype = "dashed") +
+    scale_x_log10(breaks = pretty_breaks(n = 6), labels = label_number(accuracy = 0.01)) +
+    scale_colour_manual(
+      name = "Direction",
+      values = c("Lower risk (HR < 1)" = "#4575b4", "Higher risk (HR > 1)" = "#d73027")
+    ) +
+    scale_shape_manual(name = "Significance", values = c("p < 0.05" = 19, "p ≥ 0.05" = 1)) +
+    labs(
+      x = "Hazard ratio (log scale)",
+      y = NULL
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(panel.grid.major.y = element_blank(), legend.box = "vertical")
+
+  list(data = df, fits = fits, table = tbl, plot = p)
+}
+```
+
+### Supp Fig 3E — Overall survival (OS)
+
+```{r suppfig3E_survival_os}
+os_out <- run_survival_scanb("OS_days", "OS_event", "Overall Survival (OS)")
+os_out$plot
+
+```
+
+```{r supplementary_scanb_os_forest_save, eval=FALSE}
+if (isTRUE(params$save_figures)) {
+  out_dir <- FIG_DIR
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  ggsave(
+    filename = file.path(out_dir, "supplementary_scanb_os_forest.pdf"),
+    plot   = os_out$plot,
+    width  = 180 / 25.4,
+    height = 120 / 25.4,
+    units  = "in"
+  )
+
+  message("Saved: ", file.path(out_dir, "supplementary_scanb_os_forest.pdf"))
+} else {
+  message("save_figures=FALSE; skipping save: supplementary_scanb_os_forest.pdf")
+}
+```
+
+### Supp Fig 3F — Recurrence-free interval (RFi)
+
+```{r suppfig3F_survival_rfi}
+rfi_out <- run_survival_scanb("RFi_days", "RFi_event", "Recurrence-Free Interval (RFi)")
+rfi_out$plot
+
+```
+
+```{r supplementary_scanb_rfi_forest_save, eval=FALSE}
+if (isTRUE(params$save_figures)) {
+  out_dir <- FIG_DIR
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  ggsave(
+    filename = file.path(out_dir, "supplementary_scanb_rfi_forest.pdf"),
+    plot   = rfi_out$plot,
+    width  = 180 / 25.4,
+    height = 120 / 25.4,
+    units  = "in"
+  )
+
+  message("Saved: ", file.path(out_dir, "supplementary_scanb_rfi_forest.pdf"))
+} else {
+  message("save_figures=FALSE; skipping save: supplementary_scanb_rfi_forest.pdf")
+}
+```
+
+```{r}
+scanb_save_dir <- "/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/manuscript_analyses/results/derived/GTEx/BRCA__BREAST"
+dir.create(scanb_save_dir, recursive = TRUE, showWarnings = FALSE)
+
+if (!is.null(rfi_out)) {
+  saveRDS(
+    list(
+      endpoint = "RFi",
+      table = rfi_out$table
+    ),
+    file = file.path(
+      scanb_save_dir,
+      paste0("scanb_rfi_survival_results-", params$feature_set, ".rds")
+    )
+  )
+}
+```
+
+### Supp Fig 3G — Distant recurrence-free interval (DRFi)
+
+```{r suppfig3G_survival_drfi}
+drfi_out <- run_survival_scanb("DRFi_days", "DRFi_event", "Distant Recurrence-Free Interval (DRFi)")
+drfi_out$plot
+
+```
+
+```{r supplementary_scanb_drfi_forest_save, eval=FALSE}
+if (isTRUE(params$save_figures)) {
+  out_dir <- FIG_DIR
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  ggsave(
+    filename = file.path(out_dir, "supplementary_scanb_drfi_forest.pdf"),
+    plot   = drfi_out$plot,
+    width  = 180 / 25.4,
+    height = 120 / 25.4,
+    units  = "in"
+  )
+
+  message("Saved: ", file.path(out_dir, "supplementary_scanb_drfi_forest.pdf"))
+} else {
+  message("save_figures=FALSE; skipping save: supplementary_scanb_drfi_forest.pdf")
+}
+```
+
+
+### Supp Fig 3I — Survival summary across endpoints (combined)
+
+This combines **OS**, **RFi**, and **DRFi** into a single forest-style plot with:
+- **Rows:** global models (all tumors; PAM50-controlled) plus **within-PAM50** subtype models
+- **Three point shapes:** one per endpoint (with 95% CI)
+
+```{r suppfig3I_survival_combined_endpoints}
+os_out2   <- run_survival_scanb("OS_days",   "OS_event",   "Overall Survival (OS)")
+rfi_out2  <- run_survival_scanb("RFi_days",  "RFi_event",  "Recurrence-Free Interval (RFi)")
+drfi_out2 <- run_survival_scanb("DRFi_days", "DRFi_event", "Distant Recurrence-Free Interval (DRFi)")
+
+outs <- list(OS = os_out2, RFi = rfi_out2, DRFi = drfi_out2)
+outs <- outs[!vapply(outs, is.null, logical(1))]
+
+if (length(outs) == 0) {
+  stop("No survival endpoints returned results (all NULL). Check SCAN-B time/event columns and event counts.", call. = FALSE)
+}
+
+tbl_all <- dplyr::bind_rows(lapply(names(outs), function(ep) {
+  outs[[ep]]$table %>%
+    dplyr::mutate(endpoint = ep)
+}))
+
+tbl_all <- tbl_all %>%
+  dplyr::mutate(
+    endpoint = factor(endpoint, levels = c("OS", "RFi", "DRFi")),
+    model_row = dplyr::case_when(
+      model == "All tumors (RAA + Age)" ~ "All tumors",
+      model == "All tumors + PAM50"     ~ "PAM50 controlled",
+      TRUE ~ model
+    )
+  )
+
+# Order: global rows first, then PAM50 subtypes (if present)
+pam_levels <- NULL
+if (length(outs) > 0 && !is.null(outs[[1]]$data) && "PAM50" %in% colnames(outs[[1]]$data)) {
+  pam_levels <- levels(outs[[1]]$data$PAM50)
+}
+sub_lvls <- tbl_all$model_row[grepl("^Subtype:", tbl_all$model_row)] |> unique()
+if (!is.null(pam_levels)) {
+  sub_lvls <- paste("Subtype:", pam_levels)
+  sub_lvls <- sub_lvls[sub_lvls %in% tbl_all$model_row]
+}
+
+tbl_all <- tbl_all %>%
+  dplyr::mutate(
+    model_row = factor(model_row, levels = c("All tumors", "PAM50 controlled", sub_lvls))
+  )
+
+# Print a compact results table
+tbl_all_print <- tbl_all %>%
+  dplyr::select(endpoint, model = model_row, n, events, HR, lower, upper, p.value) %>%
+  dplyr::arrange(endpoint, model)
+
+tbl_all_print
+
+dodge <- ggplot2::position_dodge(width = 0.6)
+
+p_supp3I_surv <- ggplot2::ggplot(
+  tbl_all,
+  ggplot2::aes(x = HR, y = model_row, shape = endpoint, group = endpoint)
+) +
+  ggplot2::geom_errorbarh(
+    ggplot2::aes(xmin = lower, xmax = upper),
+    position = dodge,
+    height = 0.25
+  ) +
+  ggplot2::geom_point(position = dodge, size = 3) +
+  ggplot2::geom_vline(xintercept = 1, linetype = "dashed") +
+  ggplot2::scale_x_log10(
+    breaks = scales::pretty_breaks(n = 6),
+    labels = scales::label_number(accuracy = 0.01)
+  ) +
+  ggplot2::scale_shape_manual(
+    name = "Endpoint",
+    values = c(OS = 16, RFi = 17, DRFi = 15)
+  ) +
+  ggplot2::labs(
+    x = "Hazard ratio (log scale)",
+    y = NULL
+  ) +
+  ggplot2::theme_minimal(base_size = 12) +
+  ggplot2::theme(
+    panel.grid.major.y = ggplot2::element_blank(),
+    legend.position = "right"
+  )
+
+p_supp3I_surv
+```
+
+```{r supplementary_scanb_survival_combined_endpoints_save, eval=FALSE}
+if (isTRUE(params$save_figures)) {
+  out_dir <- FIG_DIR
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  ggsave(
+    filename = file.path(out_dir, "supplementary_scanb_survival_combined_endpoints.pdf"),
+    plot   = p_supp3I_surv,
+    width  = 180 / 25.4,
+    height = 110 / 25.4,
+    units  = "in"
+  )
+
+  message("Saved: ", file.path(out_dir, "supplementary_scanb_survival_combined_endpoints.pdf"))
+} else {
+  message("save_figures=FALSE; skipping save: supplementary_scanb_survival_combined_endpoints.pdf")
+}
+```
+
+## Save SCAN-B inputs for downstream figure scripts
+
+Pulls the ssGSEA matrix and a tidied `coldata` (age, PAM50, all three survival
+endpoints) and writes them to a single `.rds` so the deviation/survival figure
+scripts don't need to re-run SCAN-B preprocessing.
+
+```{r save_scanb_pathway_inputs}
+scanb_cd <- as.data.frame(SummarizedExperiment::colData(scanb_tumor))
+
+# Helper: pull a column if present, else fill NA. Lets the save succeed even
+# if a particular endpoint is missing in some SCAN-B builds.
+pull_col <- function(df, col, type = c("numeric", "character")) {
+  type <- match.arg(type)
+  if (col %in% colnames(df)) {
+    if (type == "numeric") as.numeric(df[[col]]) else as.character(df[[col]])
+  } else {
+    if (type == "numeric") rep(NA_real_, nrow(df)) else rep(NA_character_, nrow(df))
+  }
+}
+
+scanb_inputs <- list(
+  ssgsea_scores = scanb_scores_pxs,
+  coldata = data.frame(
+    sample_id   = rownames(scanb_cd),
+    age_years   = pull_col(scanb_cd, "age_years"),
+    SSP.PAM50   = pull_col(scanb_cd, "SSP.PAM50", "character"),
+
+    # All three survival endpoints
+    OS_days     = pull_col(scanb_cd, "OS_days"),
+    OS_event    = pull_col(scanb_cd, "OS_event"),
+    RFi_days    = pull_col(scanb_cd, "RFi_days"),
+    RFi_event   = pull_col(scanb_cd, "RFi_event"),
+    DRFi_days   = pull_col(scanb_cd, "DRFi_days"),
+    DRFi_event  = pull_col(scanb_cd, "DRFi_event"),
+
+    # NOTE: TP53 is attached downstream in the deviation figure script
+    # (using the Brueffer 2020 mutation TSV). Not saved here.
+
+    row.names   = rownames(scanb_cd),
+    stringsAsFactors = FALSE
+  )
+)
+
+# Sanity check: report event counts per endpoint so you can confirm OS landed
+endpoint_event_counts <- sapply(
+  c("OS_event", "RFi_event", "DRFi_event"),
+  function(col) sum(scanb_inputs$coldata[[col]] > 0, na.rm = TRUE)
+)
+message(
+  "SCAN-B endpoint event counts saved: ",
+  paste(names(endpoint_event_counts), endpoint_event_counts, sep = "=", collapse = " | ")
+)
+
+saveRDS(
+  scanb_inputs,
+  "/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/manuscript_analyses/results/derived/GTEx/BRCA__BREAST/scanb_pathway_inputs.rds"
+)
+```
+
+## Session info
+
+```{r}
+sessionInfo()
+```

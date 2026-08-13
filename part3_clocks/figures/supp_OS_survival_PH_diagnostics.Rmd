@@ -1,0 +1,223 @@
+---
+title: "Supplement: OS survival and proportional-hazards diagnostics for tumor Deviation"
+author: "Pan-can aging pipeline"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: united
+    code_folding: hide
+    toc: true
+    toc_float: true
+params:
+  out_root: "results/derived/GTEx"
+  feature_set: "PC"
+  ph_alpha: 0.05
+  tables_root: "results/tables"
+  verbose: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Purpose
+
+This aggregates the per-cancer overall-survival (OS) results saved by the
+survival script (`survival_deviation_results-<feature_set>.rds`) into a single
+supplementary table. Each per-cancer file already stores the age-adjusted Cox
+hazard ratio for Deviation and the scaled-Schoenfeld (`cox.zph`) proportional-
+hazards diagnostics, so nothing is recomputed here. The table reports the
+hazard ratio per additional year of Deviation alongside the per-coefficient and
+global PH p-values, and flags any cancer where the assumption is not met.
+
+```{r}
+suppressPackageStartupMessages({
+  library(here)
+  library(dplyr)
+  library(tibble)
+  library(knitr)
+  library(reactable)
+})
+
+msg <- function(...) if (isTRUE(params$verbose)) message(...)
+```
+
+## Cancers of interest
+
+These are the cross-cancer emphasis set, each paired with its GTEx tissue of
+origin. Add or remove rows here to change which cancers enter the table.
+
+```{r}
+map <- list(
+  BRCA = "BREAST",
+  LUSC = "LUNG",
+  LUAD = "LUNG",
+  GBM  = "BRAIN",
+  LGG  = "BRAIN",
+  COAD = "COLON"
+)
+```
+
+## Load saved OS results
+
+```{r}
+suffix       <- paste0("-", params$feature_set)
+out_root_abs <- here::here(params$out_root)
+
+os_list <- list()
+
+for (tcga in names(map)) {
+  gtex        <- map[[tcga]]
+  analysis_id <- paste0(tcga, "__", gtex)
+  res_path    <- file.path(out_root_abs, analysis_id,
+                           paste0("survival_deviation_results", suffix, ".rds"))
+
+  if (!file.exists(res_path)) {
+    warning("Missing survival results for ", analysis_id, " (", res_path, "); skipping.")
+    next
+  }
+
+  res <- readRDS(res_path)
+  os  <- res$surv_res_os
+
+  if (is.null(os) || nrow(os) == 0) {
+    warning("No OS result stored for ", analysis_id, "; skipping.")
+    next
+  }
+
+  # tag cancer/tissue so the stacked table is self-describing
+  os$tcga_project <- tcga
+  os$gtex_project <- gtex
+  os_list[[tcga]] <- os
+}
+
+os_all <- dplyr::bind_rows(os_list)
+msg("Loaded OS results for ", nrow(os_all), " cancers.")
+```
+
+## Build the diagnostic table
+
+A cancer is flagged "Violated" if either the Deviation-specific or the global
+Schoenfeld p-value falls below `ph_alpha` (default 0.05). Rows are ordered by
+hazard ratio to mirror the cross-cancer forest.
+
+```{r}
+ph_alpha <- params$ph_alpha
+
+os_table <- os_all %>%
+  dplyr::transmute(
+    Cancer                 = tcga_project,
+    Tissue                 = gtex_project,
+    n                      = n,
+    Events                 = events,
+    HR_per_yr              = HR_per1yr_dev,
+    CI_low                 = CI_low,
+    CI_high                = CI_high,
+    p_value                = p_value,
+    Schoenfeld_p_deviation = zph_dev_p,
+    Schoenfeld_p_global    = zph_global_p,
+    # Flag on the deviation-specific test only: this is the term the HR reports.
+    # The global p is kept visible below but does not drive the flag, since a
+    # global violation can be carried by the age covariate rather than deviation.
+    Deviation_PH = dplyr::if_else(
+      is.finite(zph_dev_p) & zph_dev_p < ph_alpha,
+      "Violated", "Met"
+    )
+  ) %>%
+  dplyr::arrange(HR_per_yr)
+
+# manuscript-facing formatted view
+os_print <- os_table %>%
+  dplyr::mutate(
+    `HR (95% CI)`              = sprintf("%.3f (%.3f\u2013%.3f)", HR_per_yr, CI_low, CI_high),
+    `p`                        = signif(p_value, 3),
+    `Schoenfeld p (deviation)` = signif(Schoenfeld_p_deviation, 3),
+    `Schoenfeld p (global)`    = signif(Schoenfeld_p_global, 3)
+  ) %>%
+  dplyr::select(Cancer, Tissue, n, Events, `HR (95% CI)`, `p`,
+                `Schoenfeld p (deviation)`, `Schoenfeld p (global)`, Deviation_PH)
+```
+
+## Table
+
+```{r}
+reactable::reactable(
+  os_print,
+  searchable = TRUE, resizable = TRUE, striped = TRUE,
+  highlight = TRUE, defaultPageSize = 12
+)
+
+knitr::kable(
+  os_print,
+  caption = "Overall-survival Cox results for tumor Deviation (age-adjusted), with scaled-Schoenfeld proportional-hazards diagnostics."
+)
+```
+
+```{r}
+violated <- os_table$Cancer[os_table$Deviation_PH == "Violated"]
+if (length(violated) == 0) {
+  msg("Deviation-term PH assumption met for all cancers of interest.")
+} else {
+  msg("Deviation-term PH assumption not met for: ", paste(violated, collapse = ", "))
+}
+```
+
+The proportional-hazards assumption for the Deviation term held for all cancers
+of interest except
+`r if (length(violated)) paste(violated, collapse = ", ") else "none"`, whose
+hazard ratio is reported as a time-averaged effect.
+
+## Save table
+
+```{r}
+## Save table
+
+tables_root_abs <- here::here(params$tables_root)
+dir.create(tables_root_abs, recursive = TRUE, showWarnings = FALSE)
+
+fmt_p <- function(x) {
+  ifelse(
+    is.na(x),
+    NA_character_,
+    ifelse(
+      x < 1e-4,
+      format(x, digits = 3, scientific = TRUE, trim = TRUE),
+      format(signif(x, 3), scientific = FALSE, trim = TRUE)
+    )
+  )
+}
+
+os_print <- os_table %>%
+  dplyr::mutate(
+    `HR (95% CI)` = sprintf(
+      "%.3f (%.3f-%.3f)",
+      HR_per_yr, CI_low, CI_high
+    ),
+    `p` = fmt_p(p_value),
+    `Schoenfeld p (deviation)` = fmt_p(Schoenfeld_p_deviation),
+    `Schoenfeld p (global)` = fmt_p(Schoenfeld_p_global)
+  ) %>%
+  dplyr::select(
+    Cancer, Tissue, n, Events, `HR (95% CI)`, `p`,
+    `Schoenfeld p (deviation)`,
+    `Schoenfeld p (global)`,
+    Deviation_PH
+  )
+
+utils::write.csv(
+  os_print,
+  file = file.path(tables_root_abs, "Supplement_OS_PH_diagnostics.csv"),
+  row.names = FALSE
+)
+
+msg(
+  "Saved: ",
+  file.path(tables_root_abs, "Supplement_OS_PH_diagnostics.csv")
+)
+```
+
+## Session info
+
+```{r}
+sessionInfo()
+```

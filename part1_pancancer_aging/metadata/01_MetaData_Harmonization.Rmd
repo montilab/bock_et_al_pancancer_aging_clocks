@@ -1,0 +1,558 @@
+---
+title: "Meta Data Harmonization"
+subtitle: "TCGA PanCancer Aging"
+author: "Payton Bock - Monti Lab"
+date:   "`r format(Sys.Date(), '%B %d, %Y')`"
+params: 
+  dummy: "dummy"
+output:
+  html_document:
+    theme: united
+    code_folding: hide
+    css: style.css
+    toc: true
+    toc_float: true
+---
+
+```{r opts, echo=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+```{r setup}
+#library path
+.libPaths("/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/r-library/")
+
+#Load libraries
+library(vctrs)
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(ggplot2)
+library(tibble)
+library(reactable)
+library(janitor)
+library(dplyr)
+
+#get environmental variables
+PATH <- file.path( Sys.getenv("PCANAGE","/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/")) 
+TCGA <- file.path( Sys.getenv("CBMDATA","/restricted/projectnb/agedisease/CBMrepositoryData/TCGA-GDC"), "TCGA-GDC")
+```
+
+## Script Summary 
+- Retrieves meta data using TCGAbiolinks for all 33 cancer types, cleans it (removing empty columns), and combines them across omics layers. 
+- Calculates survival time and adds its as a meta data column
+- Adds HPV status from a 2022 study (https://doi.org/10.3389/fonc.2022.842060) for 10 applicable cancer types. 
+- Adds tumor subtype information using TCGAbiolinks::PanCancerAtlas_subtypes()
+- Provides table/plot depicting the proportion of samples that have non-NA values for each meta data column. 
+- Saves resulting harmonized meta data as a RDS files. 
+
+## Download clinical data for all projects
+ - GDCquery_clinic(project = "TGCA-TGCT" , type = "Clinical") previously returned an API error,
+ but this issue appears to be fixed now (5/28/2024)
+ 
+```{r Download Clinical Data for all TCGA projects}
+projects <- c(
+  "TCGA-BRCA", "TCGA-OV","TCGA-GBM", "TCGA-LUAD", "TCGA-UCEC", 
+  "TCGA-KIRC", "TCGA-HNSC", "TCGA-LGG", "TCGA-THCA", "TCGA-LUSC", 
+  "TCGA-PRAD", "TCGA-SKCM", "TCGA-COAD", "TCGA-STAD", "TCGA-BLCA", 
+  "TCGA-LIHC", "TCGA-CESC", "TCGA-KIRP", "TCGA-SARC", "TCGA-LAML",
+  "TCGA-ESCA", "TCGA-PAAD", "TCGA-PCPG", "TCGA-READ", "TCGA-TGCT",
+  "TCGA-THYM", "TCGA-KICH", "TCGA-ACC", "TCGA-MESO", "TCGA-UVM", 
+  "TCGA-DLBC", "TCGA-UCS", "TCGA-CHOL"
+)
+meta_data_list <- list()
+
+for (project in projects) {
+  cat("Downloading clinical data for", project, "\n") # Print message to keep track
+  clinical_query = TCGAbiolinks::GDCquery_clinic(project = project, type = "Clinical") 
+  
+  meta_data_list[[project]] <- clinical_query
+}
+#bind rows will combine dataframes by binding column names together
+# and create new columns for columns that dont yet exist
+# will fill in NA for missing values when combining dataframes 
+all_metadata <- dplyr::bind_rows(meta_data_list)
+
+cat("Number of Rows (samples) and Columns (metadata): ", dim(all_metadata))
+```
+
+## Data Cleaning
+Here we clean the combined meta data by dropping columns that are entirely NA and
+set the submitter ID as the rownames. 
+
+The submitter ID is the first 12 characters of the "sample" (referring to the patient). Since we are retrieving sample specific information,
+we can utilize the sample as the rownames of our meta data data. 
+
+See the TCGA code tables for more information: https://gdc.cancer.gov/resources-tcga-users/tcga-code-tables/sample-type-codes
+```{r Data Cleaning}
+# Drop columns that are all NA
+final_metadata_clean <- all_metadata[, !apply(is.na(all_metadata), 2, all)]
+
+#Set sample ID as rownames
+rownames(final_metadata_clean) <- final_metadata_clean$submitter_id
+
+#Check we still have 33 projects
+unique_values_count <- length(unique(final_metadata_clean$project))
+cat("Number of TCGA projects: ",unique_values_count)
+```
+
+Here we print the number of samples per TCGA project and the remaining meta-data columns. 
+```{r}
+# Display the unique values and their counts
+table(final_metadata_clean$project)
+
+names(final_metadata_clean)
+```
+
+Here we check to see if any rows are duplicates and summarizes each remaining meta data column 
+using summary()
+```{r Check Cleaned Data}
+#Should return 0
+cat("Number of duplicate rows : " , anyDuplicated(final_metadata_clean))
+```
+
+Summary of each meta data column (after removing NA columns)
+```{r}
+#Gives summary stats for each column
+summary(final_metadata_clean)
+```
+
+## Check Number of Complete Columns
+Here we determine which metadata columns are not missing any values (to see which
+columns we can use as identifiers)
+```{r check number of complete columns}
+# Find columns with no NA values
+columns_with_no_NAs <- final_metadata_clean[ , apply(final_metadata_clean, 2, function(x) all(!is.na(x) & !is.null(x)))]
+
+# Print names of columns with no NA values
+cat("Meta-data columns with no missing values: ",names(columns_with_no_NAs))
+```
+
+
+## Calculate the survival time
+Here we create an additional column for patient "survival time" using a combination
+of three other meta-data columns: Vital status, days to death, and days to last follow up
+In summary:
+    1. Creates a table with "vital status" as status (Alive vs dead)
+    
+    2. Sets the time as either the days to death (if dead) or days to last follow up which is the "survival time" if the person is still alive
+
+```{r survival stat creation}
+OSdat <- final_metadata_clean[, c("vital_status", "days_to_death", "days_to_last_follow_up")] |>
+  as.data.frame() |>
+  tibble::rownames_to_column("ID") |>
+  dplyr::mutate(
+    status = vital_status, 
+    time = dplyr::if_else(!is.na(days_to_death), days_to_death, days_to_last_follow_up),
+    # Set negative time values to NA
+    time = dplyr::if_else(time < 0, NA_real_, time)
+  ) |>
+  dplyr::select(ID, status, time) |>
+  tibble::column_to_rownames("ID")
+
+# Ensures the rownames are in the same order (samples)
+if (identical(rownames(OSdat), rownames(final_metadata_clean))) {
+  final_metadata_clean$Survival_Time <- OSdat$time
+}
+
+ggplot2::ggplot(final_metadata_clean, ggplot2::aes(x = Survival_Time)) +
+ ggplot2:: geom_histogram(binwidth = 100, fill = "blue", color = "black") +
+  ggplot2::labs(title = "Distribution of Survival Time",
+       x = "Survival Time (days)",
+       y = "Count of Patients") +
+ ggplot2:: theme_minimal()
+
+```
+
+## Add Tumor Subtype Information
+Since we want to use the tumor subtype as a covariate, lets add it to the meta data. 
+This is done using the PanCancerAtlas_subtypes() function. This contains various different categories of subtypes: subtype_m_rna, subtype_dn_ameth, subtype_protein, etc
+
+See more info here: https://bioconductor.org/packages/devel/bioc/vignettes/TCGAbiolinks/inst/doc/subtypes.html
+
+From the website: "The columns “Subtype_Selected” was selected as most prominent subtype classification (from the other columns)" 
+
+This suggests that the "subtype_selected" column contains the molecular subtype information most often used when separating the cancer by subtype
+
+We utilize a created "filtered_subtypes" function to return a data frame that includes:
+1. A standardized version of the subtype data, with cleaned column names.
+2. An id column containing the first 12 characters of each sample ID.
+3. Only rows where the full_id is either 12 characters long or contains -01[ABC] (primary tumor).
+
+This is to allow us to get back to the 12 character sample_id format, allowing us to merge this tumor grade information with our remaining meta data. Some subtypes are related to normal adjacent or metastatic tumors which we are not interested in. 
+
+```{r}
+filtered_subtypes <- function() {
+  TCGAbiolinks::PanCancerAtlas_subtypes() |>
+    janitor::clean_names() |>
+    dplyr::mutate(id = substr(pan_samples_id, 1, 12),
+                  full_id = pan_samples_id) |> # Keep full ID for filtering
+    # Apply custom filter
+    dplyr::filter(nchar(full_id) <= 12 | 
+                  (nchar(full_id) > 12 & grepl("-01[ABC]", full_id))) |>
+    dplyr::select(-full_id) # Drop the full_id column, no longer needed
+}
+
+# Get filtered results
+subtypes_filtered <- filtered_subtypes()
+stopifnot(!duplicated(subtypes_filtered$id))
+
+#merge tumor subtype
+metadata_all_withsubtypes <- merge(final_metadata_clean, subtypes_filtered, by.x = "submitter_id", by.y = "id", all.x = TRUE)
+rownames(metadata_all_withsubtypes) <- metadata_all_withsubtypes$submitter_id
+```
+
+
+## HPV Status
+Next, we add HPV status. 
+
+Stefano mentioned that previous TCGA versions (such as TCGA-2023) has different amounts of HPV positive and negative cancers (more positive for example), but the 2023 HNSC object (/restricted/projectnb/montilab-p/CBMrepositoryData/TCGA/TCGA-2023/RNAseq/esets_postprocessed/TCGA-HNSC_2020-03-22_wLegacyPData_DESeq2_log_eSet.rds) contained additional tumor types/samples (metastatic tumors with -06 suffix, normal adjacent samples with -11). We prioritize information for **primary tumors** only.  
+
+This code retrieves HPV status for the HNSC cohort using the `TCGAbiolinks` package and adds
+it to our meta data table. We also quantify the distribution of HPV status for each cancer type, to emphasize
+we only retrieve HPV status for the HNSC cohort. 
+
+```{r}
+#download relevant HNSC information
+query <- GDCquery( project = "TCGA-HNSC", data.category = "Biospecimen", data.type = "Biospecimen Supplement", data.format = "BCR Biotab" ) 
+
+GDCdownload(query) 
+
+hpv <- GDCprepare(query)$auxiliary_hnsc %>% 
+as.data.frame()
+
+#retrieve relevant columns
+hpv_selected <- hpv |>
+  dplyr::select(bcr_patient_barcode, hpv_status)  # Add any other columns you need here
+
+table(hpv_selected$hpv_status, useNA = "ifany")
+
+# Replace "Indeterminate" with NA in HPV.status column
+hpv_selected <- hpv_selected %>%
+  mutate(hpv_status = na_if(hpv_status, "Indeterminate"))
+
+#rename hpv column
+hpv_selected$HPV.status <- hpv_selected$hpv_status
+hpv_selected$hpv_status <- NULL
+
+
+reactable::reactable(head(hpv_selected))
+
+#merge with existing meta data
+metadata_hpv <- merge(metadata_all_withsubtypes, hpv_selected, by.x = "submitter_id", by.y = "bcr_patient_barcode", all.x = TRUE)
+rownames(metadata_hpv) <- metadata_hpv$submitter_id
+
+
+# Identify projects with available HPV status information
+projects_with_hpv_info <- unique(metadata_hpv$project[!is.na(metadata_hpv$HPV.status)])
+
+# Print the projects
+cat("Projects with HPV status information:",projects_with_hpv_info)
+
+# Create the summary table
+hpv_summary <- metadata_hpv %>%
+  group_by(project) %>%
+  summarise(
+    HPV_positive = sum(HPV.status == "Positive", na.rm = TRUE),
+    HPV_negative = sum(HPV.status == "Negative", na.rm = TRUE),
+    HPV_NA = sum(is.na(HPV.status))
+  )
+
+# View the summary table
+reactable::reactable(hpv_summary, searchable = TRUE)
+```
+
+
+This code is our previous approach to retrieving HPV status, and **is no longer used**!!! 
+The code remains here in case we want to utilize it in the future, primarily for non-HNSC
+cancer type HPV status. 
+
+This information was retrieved from a 2022 study: 
+
+Yu, X. et al. (2022) ‘Comprehensive Analysis of the Carcinogenic Process, Tumor Microenvironment, and Drug Response in HPV-Positive Cancers’, Frontiers in Oncology, 12, p. 842060. Available at: https://doi.org/10.3389/fonc.2022.842060.
+
+Which identified HPV positive cancer types based on HPV expression:
+"HPV expression (normalized reads per million, NRPM) was collected from a previous study (20), and the samples with more than 10 NRPMs were defined as infected by HPV",
+
+With the previous study being: 
+
+Thorsson V, Gibbs DL, Brown SD, Wolf D, ..., Shmulevich I. The Immune Landscape of Cancer. Immunity. 2018 Apr 17;48(4):812-830.e14. doi: 10.1016/j.immuni.2018.03.023. Epub 2018 Apr 5. Erratum in: Immunity. 2019 Aug 20;51(2):411-412. doi: 10.1016/j.immuni.2019.08.004. PMID: 29628290; PMCID: PMC5982584.
+
+
+**Issue**: This paper only contains HPV status information with samples containing drug response information, excluding about ~70 samples. I have tried desperately to find the HPV information for the remaining samples above, to no avail as of now. 
+```{r,eval = FALSE}
+#read file
+hpv_Location <- file.path(TCGA,"metadata/resources/HPV_status_TCGA_2022.csv")
+hpv_Status <- read.csv(hpv_Location, header = TRUE, skip = 1)
+
+# Create the summary table
+hpv_Status$Paper_Study <- hpv_Status$Study
+hpv_summary_original <- hpv_Status %>%
+  group_by(Paper_Study) %>%
+  summarise(
+    HPV_positive = sum(HPV.status == "positive", na.rm = TRUE),
+    HPV_negative = sum(HPV.status == "negative", na.rm = TRUE),
+    HPV_NA = sum(is.na(HPV.status))
+  )
+
+reactable::reactable(hpv_summary_original, searchable = TRUE)
+
+#Subset string to remove suffix (specifying primary tumor)
+hpv_Status <- dplyr::mutate(hpv_Status, id  = substr(SampleBarcode, 1, 12))
+
+#If we have duplicate IDs, stop
+stopifnot(!duplicated(hpv_Status$id))
+
+hpv_Status_selected <- hpv_Status |>
+  dplyr::select(id, HPV.status)  # Add any other columns you need here
+
+# Now perform the merge with metadata_all_withsubtypes
+metadata_final <- merge(metadata_all_withsubtypes, hpv_Status_selected, by.x = "submitter_id", by.y = "id", all.x = TRUE)
+
+# Identify projects with available HPV status information
+projects_with_hpv_info <- unique(metadata_final$project[!is.na(metadata_final$HPV.status)])
+
+# Print the projects
+cat("Projects with HPV status information:",projects_with_hpv_info)
+
+# Create the summary table
+hpv_summary <- metadata_final %>%
+  group_by(project) %>%
+  summarise(
+    HPV_positive = sum(HPV.status == "positive", na.rm = TRUE),
+    HPV_negative = sum(HPV.status == "negative", na.rm = TRUE),
+    HPV_NA = sum(is.na(HPV.status))
+  )
+
+# View the summary table
+reactable::reactable(hpv_summary, searchable = TRUE)
+```
+
+## Tumor Purity
+Next, we add the tumor purity estimates calculated using ABSOLUTE. This data was generated and published as part of TCGA's PanCancerAtlas Publications.
+Link: https://gdc.cancer.gov/about-data/publications/pancanatlas
+
+We select rows whose array ID ends with "-01", which corresponds to primary tumors. We then remove this -01 suffix to match
+the sample ID in the rest of the metadata.  
+
+```{r}
+purity <- read.csv(file.path(TCGA,"metadata/resources/TCGA_mastercalls.abs_tables_JSedit.fixed.txt"), sep ="\t")
+
+# Assuming your data frame is named 'purity'
+purity_filtered <- purity %>%
+  dplyr::filter(grepl("-01$", array)) %>%  # Filter rows where 'array' ends with '-01' followed by any letter
+  dplyr::mutate(array = substr(array, 1, 12)) %>%  # Keep first 12 characters of 'array'
+  dplyr::select(array, purity)  # Select only the 'array' and 'purity' columns
+
+# Count duplicates in the 'array' column
+num_duplicates <- sum(duplicated(purity_filtered$array))
+
+# Print the number of duplicates
+cat("Number of duplicate sample IDs: ", num_duplicates)
+
+
+ggplot2::ggplot(purity_filtered, aes(x = purity)) +
+  geom_histogram(bins = 30, fill = "blue", color = "black") +  # You can adjust the number of bins
+  ggtitle("Histogram of Tumor Purity") +
+  xlab("Tumor Purity") +
+  ylab("Frequency")
+
+head(purity_filtered)
+
+metadata_final <- merge(metadata_hpv, purity_filtered, by.x = "submitter_id", by.y = "array", all.x = TRUE)
+
+# Assuming 'cancer_type' is the column indicating cancer types in 'metadata_final'
+purity_summary <- metadata_final %>%
+  group_by(project) %>%
+  dplyr::summarise(
+    samples_with_purity = sum(!is.na(purity)),
+    samples_without_purity = sum(is.na(purity)),
+    total_samples = n()
+  )
+
+# View the summary table
+reactable::reactable(purity_summary,searchable = TRUE)
+```
+
+## Age Calculation
+Here we standardize the age used for our pancancer analysis. TCGA clinical data has various forms of "age", with the two most common being:
+From (https://docs.gdc.cancer.gov/Data_Dictionary/)
+
+"age_at_diagnosis" : Age at the time of diagnosis expressed in number of days since birth.
+
+"age_at_index" : The patient's age (in years) on the reference or anchor date used during date obfuscation.
+
+The trade off here is that the age_at_diagnosis is in days, a scale that makes regression coefficient interpretation difficult and could effect numerical stability. However, age_in_index has a somewhat confusing description and likely refers to an altered version of the age that has been "Obfuscated" to prevent patient identification. We have a slightly higher number of age_at_index values available compared to age_at_diagnosis, although slight (~98% of all samples have age_at_index, compared to ~97% having age_at_diagnosis)
+
+My solution it to create a new age variable through converting the "age_at_diagnosis" days scale to years, providing the most accurate measurement of age while improving numerical stability and interpretability (also, most TCGA age studies use age_at_diagnosis)
+
+```{r}
+# Convert age_at_diagnosis to years
+metadata_final$Age <- metadata_final$age_at_diagnosis / 365.25
+
+# Remove NA values for plotting without altering the original dataframe
+metadata_for_plot <- na.omit(metadata_final[, c("Age", "age_at_index")])
+
+# Create the plot using ggplot2
+age_comparison_plot <- ggplot2::ggplot(metadata_for_plot, ggplot2::aes(x = Age, y = age_at_index)) +
+  ggplot2::geom_point(alpha = 0.6, color = "blue") +  # Adds points to the plot with partial transparency
+  ggplot2::geom_smooth(method = "lm", se = TRUE, color = "red") +  # Adds a linear regression line with standard error
+  ggplot2::labs(title = "Comparison of Calculated Age and Age at Index",
+                x = "Age (from diagnosis, in years)",
+                y = "Age at Index (in years)") +
+  ggplot2::theme_minimal() +
+  ggplot2::geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "green") +  # Adds a y=x line for reference
+  ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5))  # Centers the plot title
+
+# Display the plot
+print(age_comparison_plot)
+
+# Perform the comparison and calculate percentage without adding columns to metadata_final
+age_rounded <- round(metadata_final$Age)
+age_at_index_rounded <- round(metadata_final$age_at_index)
+identical_ages <- age_rounded == age_at_index_rounded
+
+# Calculate the percentage of identical ages
+identical_percentage <- mean(identical_ages, na.rm = TRUE) * 100  # Convert proportion to percentage and handle NAs
+
+# Print the result
+paste("Percentage of samples where Age is identical to Age at Index:", round(identical_percentage, 2), "%")
+
+# Compute the difference between Age and age_at_index
+differences <- metadata_final$Age - metadata_final$age_at_index
+
+# Calculate the average difference
+average_difference <- mean(differences, na.rm = TRUE)  # Remove NA values for accurate calculation
+
+# Print the average difference
+paste("Average difference between Age and Age at Index:", round(average_difference, 2), "years")
+
+
+```
+
+
+## Tumor Grade
+Our download of the clinical data using `TCGAbiolinks` for each project includes a "tumor_grade" column which is entirely filled with "Not Reported" annotations (or NA values). I suspect tumor grade may be reported elsewhere or something is flawed with the way `TCGAbiolinks` is retrieving this information.
+
+A 2018 paper (https://doi.org/10.1016/j.cell.2018.02.052) created their own harmonized version of the TCGA clinical data, including tumor grade. I am unsure how they retrieved this information, likely from another source of the clinical information. 
+
+Here, we load in this harmonized data set and add the tumor grade information to our harmonized meta data. We set "Not Available" and "Discrepancy" annotations to NA.
+
+Notes from the paper on grade:
+In BLCA, G1 was for “low grade” and G3 for “high grade” in this table; UCEC had 11 high grade, which was converted to G3 (the highest for this disease) in this table. All original values were retained in Table S1, tab TCGA-CDR. GBM is grade IV by definition. In the original TCGA dataset, the grades for GBM cases were not provided. We realized that OV should not have a grade IV disease but reported the data as in the original TCGA dataset.
+
+```{r}
+unique(final_metadata_clean$tumor_grade)
+```
+
+```{r}
+clinical_2018 <- read.csv(file.path(TCGA, "metadata/resources/2018_TCGA-IntegratedClinical.csv"))
+
+# Assuming 'bcr_patient_barcode' and 'histological_grade' are the correct column names:
+grade_info <- clinical_2018[c("bcr_patient_barcode", "histological_grade")]
+
+paste0("Number of duplicate samples : " , anyDuplicated(grade_info$bcr_patient_barcode))
+
+# Check the unique values of histological_grade if needed
+unique(grade_info$histological_grade)
+
+# Replace "[Not Available]", "[Unknown]", and "[Discrepancy]" with NA
+grade_info <- grade_info %>%
+  dplyr::mutate(histological_grade = dplyr::case_when(
+    histological_grade %in% c("[Not Available]", "[Unknown]", "[Discrepancy]") ~ NA_character_,
+    TRUE ~ histological_grade
+  ))
+
+
+metadata_final <- merge(metadata_final, grade_info, by.x = "submitter_id", by.y = "bcr_patient_barcode", all.x = TRUE)
+
+# remove empty grade column to avoid confusion
+metadata_final$tumor_grade <- NULL
+```
+
+```{r}
+# Generate a summarized table
+grade_summary <- metadata_final %>%
+  dplyr::group_by(project, histological_grade) %>%
+  dplyr::summarise(count = dplyr::n(), .groups = 'drop')
+
+wide_grade_summary <- grade_summary %>%
+  tidyr::pivot_wider(names_from = histological_grade, values_from = count, values_fill = list(count = 0))
+
+# View the wide format table
+reactable::reactable(wide_grade_summary, resizable = TRUE, searchable = TRUE)
+```
+
+
+## Proportion of Columns Complete
+Here we calculate the proportion of each meta-data column that are not NA. We also create a table showing, for each cancer type, the proportion of samples that have information for each meta-data type. 
+
+NOTE: Some columns may have an alternative way to represent a NA value. For example, some columns may report "Not reported" or "not available" instead of NA, which is not captured here. In short, some columns may show high or complete availability of information across sample but in reality lack information. 
+```{r check proportion of columns complete}
+# Calculate the proportion of non-NA/non-NULL values in each column
+proportions <- metadata_final %>%
+  dplyr::summarize_all(~ mean(!is.na(.) & !is.null(.)))
+
+# Convert the proportions to a long format
+proportions_long <- tidyr::pivot_longer(proportions, cols = everything(), names_to = "Column", values_to = "Proportion")
+
+# View the proportions in a reactable table
+reactable::reactable(proportions_long,searchable = TRUE,resizable = TRUE)
+
+# Optionally, plot the proportions using ggplot2
+ggplot2::ggplot(proportions_long, ggplot2::aes(x = reorder(Column, -Proportion), y = Proportion)) +
+  ggplot2::geom_bar(stat = "identity") +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  ggplot2::labs(x = "Column", y = "Proportion of Non-NA Values", title = "Proportion of Non-NA/Non-NULL Values by Column")
+```
+
+```{r}
+# Identify the columns to analyze (excluding 'submitter_id' and 'project')
+cols_to_analyze <- setdiff(names(metadata_final), c("submitter_id", "project"))
+
+# Generate the summary table
+summary_table <- metadata_final %>%
+  group_by(project) %>%
+  dplyr::summarise(
+    total_samples = n(),
+    across(
+      .cols = all_of(cols_to_analyze),
+      .fns = ~ mean(!is.na(.)),
+      .names = "prop_non_na_{.col}"
+    )
+  )
+
+# View the summary table
+reactable::reactable(summary_table, searchable = TRUE, resizable = TRUE)
+```
+
+## Save Meta-Data as RDS file
+
+```{r save meta data as RDS}
+harmonized_RDS_output <- file.path(TCGA, "metadata/data/harmonized_metadata.rds")
+
+cat("Number of Rows (samples) and Columns (metadata): ", dim(metadata_final))
+cat("Saving RDS file to ", harmonized_RDS_output)
+
+rownames(metadata_final) <- metadata_final$submitter_id
+
+reactable::reactable(metadata_final, searchable = TRUE, resizable = TRUE)
+
+saveRDS(metadata_final, harmonized_RDS_output)
+```
+
+## Session Info
+```{r session_info}
+sessionInfo()
+```
+
+
+
+
+
+
+
+
+
+
+

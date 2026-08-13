@@ -1,0 +1,546 @@
+---
+title: "01 — Import official part-1 results"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+## Overview
+
+This script loads the finalized legacy pan-cancer age-analysis outputs needed for part 1 and standardizes them for the manuscript workflow.
+
+It prepares:
+
+- Fig. 1A input tables,
+- a simple layer manifest for downstream extension,
+- file manifests for RNA-seq GSEA and multi-omic clustering, and
+- organ-system annotations used in figure panels.
+
+The goal is to save one clean imported-results object that downstream part-1 Rmds can reuse.
+
+## Libraries
+
+```{r}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(stringr)
+  library(tibble)
+  library(here)
+})
+```
+
+## Paths
+
+```{r}
+legacy_root <- Sys.getenv(
+  "PCANAGE",
+  "/restricted/projectnb/agedisease/projects/pancancer_aging_pbock"
+)
+
+colleague_root <- Sys.getenv(
+  "PCANAGE_COLLEAGUE",
+  "/restricted/projectnb/agedisease/projects/pancancer_aging"
+)
+
+derived_dir <- here::here("results", "derived", "part1", "01_import_official_results")
+tables_dir  <- here::here("results", "tables", "part1")
+
+
+dir.create(derived_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(tables_dir,  recursive = TRUE, showWarnings = FALSE)
+```
+
+## Organ-system annotations
+
+```{r}
+organ_system_dict <- c(
+  "TCGA-BLCA" = "Genitourinary",
+  "TCGA-KIRC" = "Genitourinary",
+  "TCGA-KIRP" = "Genitourinary",
+  "TCGA-KICH" = "Genitourinary",
+  "TCGA-PRAD" = "Genitourinary",
+  "TCGA-TGCT" = "Genitourinary",
+  "TCGA-CESC" = "Gynecologic",
+  "TCGA-OV"   = "Gynecologic",
+  "TCGA-UCEC" = "Gynecologic",
+  "TCGA-UCS"  = "Gynecologic",
+  "TCGA-BRCA" = "Breast",
+  "TCGA-ESCA" = "Gastrointestinal",
+  "TCGA-STAD" = "Gastrointestinal",
+  "TCGA-COAD" = "Gastrointestinal",
+  "TCGA-READ" = "Gastrointestinal",
+  "TCGA-LIHC" = "Gastrointestinal",
+  "TCGA-PAAD" = "Gastrointestinal",
+  "TCGA-CHOL" = "Gastrointestinal",
+  "TCGA-HNSC" = "Head and Neck",
+  "TCGA-LUAD" = "Thoracic",
+  "TCGA-LUSC" = "Thoracic",
+  "TCGA-MESO" = "Thoracic",
+  "TCGA-THYM" = "Thoracic",
+  "TCGA-GBM"  = "Central Nervous System",
+  "TCGA-LGG"  = "Central Nervous System",
+  "TCGA-ACC"  = "Endocrine",
+  "TCGA-THCA" = "Endocrine",
+  "TCGA-PCPG" = "Endocrine",
+  "TCGA-SKCM" = "Skin",
+  "TCGA-UVM"  = "Ocular",
+  "TCGA-SARC" = "Soft Tissue",
+  "TCGA-DLBC" = "Hematologic and Lymphatic",
+  "TCGA-LAML" = "Hematologic and Lymphatic"
+)
+
+organ_annotations <- tibble(
+  Project = names(organ_system_dict),
+  Organ_System = unname(organ_system_dict)
+)
+
+base_colors <- c(
+  "#1f78b4", "#33a02c", "#e31a1c", "#ff7f00", "#6a3d9a",
+  "#b15928", "#a6cee3", "#b2df8a", "#fb9a99", "#fdbf6f",
+  "#cab2d6", "#4D4D4D", "#8dd3c7", "#bebada", "#fb8072",
+  "#80b1d3", "#fdb462", "#b3de69", "#fccde5", "#d9d9d9"
+)
+
+organ_palette <- setNames(
+  base_colors[seq_along(sort(unique(organ_annotations$Organ_System)))],
+  sort(unique(organ_annotations$Organ_System))
+)
+```
+
+## Layer manifest
+
+```{r}
+layer_manifest <- tibble(
+  layer_id = c("Methylation", "RNAseq", "miRNA", "RPPA", "Mutation", "SCNA"),
+  figure_label = c("Methylation", "RNA-seq", "miRNA", "RPPA", "Mutation", "SCNA"),
+  include_in_fig1a = c(TRUE, TRUE, TRUE, TRUE, TRUE, TRUE),
+  include_in_fig1b = c(TRUE, TRUE, TRUE, FALSE, TRUE, TRUE),
+  required_for_baseline = c(TRUE, TRUE, FALSE, FALSE, FALSE, FALSE),
+  summary_source = c("summary_rds", "filtered_deseq", "filtered_deseq", "summary_rds", "list_rds", "list_rds"),
+  positive_col = c(
+    "Hypermethylation",
+    "IncreasedExp_with_Age",
+    "IncreasedExp_with_Age",
+    "IncreasedExp_with_Age",
+    "Positive_Association",
+    "Positive_Association"
+  ),
+  negative_col = c(
+    "Hypomethylation",
+    "DecreasedExp_with_Age",
+    "DecreasedExp_with_Age",
+    "DecreasedExp_with_Age",
+    "Negative_Association",
+    "Negative_Association"
+  ),
+  results_dir = c(
+    file.path(legacy_root, "results", "methylation", "DMP_analysis"),
+    file.path(legacy_root, "results", "RNAseq", "DGE_analysis"),
+    file.path(legacy_root, "results", "mirna", "DE_analysis"),
+    file.path(legacy_root, "results", "RPPA", "DPE_analysis"),
+    file.path(colleague_root, "results", "mutation"),
+    file.path(colleague_root, "results", "scna_pn")
+  ),
+  filtered_pattern = c(
+    NA_character_,
+    "_filtered_DESeq2_results\\.rds$",
+    "_filtered_DESeq2_results\\.rds$",
+    NA_character_,
+    NA_character_,
+    NA_character_
+  ),
+  filtered_suffix = c(
+    NA_character_,
+    "_filtered_DESeq2_results.rds",
+    "_filtered_DESeq2_results.rds",
+    NA_character_,
+    NA_character_,
+    NA_character_
+  ),
+  clustering_pattern = c(
+    "_CpG-Sites_hg19_limma\\.rds$",
+    "_unfiltered_DESeq2_results\\.rds$",
+    "_unfiltered_DESeq2_results\\.rds$",
+    "_RPPA_Proteins_limma\\.rds$",
+    "lm_with_covariates_results_list\\.rds$",
+    "lm_test_with_covariates_results_gene_level\\.rds$"
+  ),
+  clustering_suffix = c(
+    "_CpG-Sites_hg19_limma.rds",
+    "_unfiltered_DESeq2_results.rds",
+    "_unfiltered_DESeq2_results.rds",
+    "_RPPA_Proteins_limma.rds",
+    "lm_with_covariates_results_list.rds",
+    "lm_test_with_covariates_results_gene_level.rds"
+  ),
+  feature_identifier = c("Name", NA, NA, NA, "gene_name", "feature_name"),
+  feature_in_rownames = c(FALSE, TRUE, TRUE, TRUE, FALSE, FALSE),
+  stat_col = c("t", "stat", "stat", "t", "stat", "stat"),
+  pval_col = c("adj.P.Val", "padj", "padj", "adj.P.Val", "adj_p_val", "adj_p_val"),
+  pval_threshold = c(0.01, 0.05, 0.05, 0.05, 0.05, 0.05),
+  top_n = c(100000, NA, NA, NA, NA, NA),
+  gsea_input = c(FALSE, TRUE, FALSE, FALSE, FALSE, FALSE)
+)
+```
+
+## RNA-seq summary input
+
+```{r}
+rnaseq_dir <- layer_manifest$results_dir[layer_manifest$layer_id == "RNAseq"]
+rnaseq_filtered_files <- sort(list.files(
+  path = rnaseq_dir,
+  pattern = layer_manifest$filtered_pattern[layer_manifest$layer_id == "RNAseq"],
+  full.names = TRUE
+))
+
+if (length(rnaseq_filtered_files) == 0) {
+  stop("No RNA-seq filtered DESeq2 result files were found in: ", rnaseq_dir)
+}
+
+RNAseq_summary <- purrr::map_dfr(
+  rnaseq_filtered_files,
+  function(file_path) {
+    x <- readRDS(file_path) %>%
+      as.data.frame()
+
+    x$Project <- stringr::str_extract(basename(file_path), "TCGA-[^_]+")
+    x$direction <- ifelse(x$log2FoldChange > 0, "Up", "Down")
+
+    x %>%
+      dplyr::summarise(
+        Project = dplyr::first(Project),
+        Total_Features = dplyr::n(),
+        Q_Value_0.05 = sum(padj <= 0.05, na.rm = TRUE),
+        Q_Value_0.025 = sum(padj <= 0.025, na.rm = TRUE),
+        Q_Value_0.01 = sum(padj <= 0.01, na.rm = TRUE),
+        IncreasedExp_with_Age = sum(padj <= 0.05 & direction == "Up", na.rm = TRUE),
+        DecreasedExp_with_Age = sum(padj <= 0.05 & direction == "Down", na.rm = TRUE)
+      )
+  }
+)
+```
+
+## miRNA summary input
+
+```{r}
+mirna_dir <- layer_manifest$results_dir[layer_manifest$layer_id == "miRNA"]
+mirna_filtered_files <- sort(list.files(
+  path = mirna_dir,
+  pattern = layer_manifest$filtered_pattern[layer_manifest$layer_id == "miRNA"],
+  full.names = TRUE
+))
+
+if (length(mirna_filtered_files) == 0) {
+  stop("No miRNA filtered DESeq2 result files were found in: ", mirna_dir)
+}
+
+miRNA_summary <- purrr::map_dfr(
+  mirna_filtered_files,
+  function(file_path) {
+    x <- readRDS(file_path) %>%
+      as.data.frame()
+
+    x$Project <- stringr::str_extract(basename(file_path), "TCGA-[^_]+")
+    x$direction <- ifelse(x$log2FoldChange > 0, "Up", "Down")
+
+    x %>%
+      dplyr::summarise(
+        Project = dplyr::first(Project),
+        Total_Features = dplyr::n(),
+        Q_Value_0.05 = sum(padj <= 0.05, na.rm = TRUE),
+        Q_Value_0.025 = sum(padj <= 0.025, na.rm = TRUE),
+        Q_Value_0.01 = sum(padj <= 0.01, na.rm = TRUE),
+        IncreasedExp_with_Age = sum(padj <= 0.05 & direction == "Up", na.rm = TRUE),
+        DecreasedExp_with_Age = sum(padj <= 0.05 & direction == "Down", na.rm = TRUE)
+      )
+  }
+)
+```
+
+## Mutation summary input
+
+```{r}
+mutation_dir <- layer_manifest$results_dir[layer_manifest$layer_id == "Mutation"]
+mutation_results_files <- sort(list.files(
+  path = mutation_dir,
+  pattern = layer_manifest$clustering_pattern[layer_manifest$layer_id == "Mutation"],
+  full.names = TRUE,
+  recursive = TRUE
+))
+
+if (length(mutation_results_files) == 0) {
+  stop("No mutation result files were found in: ", mutation_dir)
+}
+
+Mutation_summary <- purrr::map_dfr(
+  mutation_results_files,
+  function(file_path) {
+    x <- readRDS(file_path)
+
+    if (!"all" %in% names(x)) {
+      stop("Mutation result file does not contain an 'all' entry: ", file_path)
+    }
+
+    x_all <- x[["all"]] %>%
+      as.data.frame()
+
+    dplyr::summarise(
+      x_all,
+      Project = basename(dirname(file_path)),
+      Total_Features = dplyr::n(),
+      Q_Value_0.05 = sum(adj_p_val <= 0.05, na.rm = TRUE),
+      Q_Value_0.025 = sum(adj_p_val <= 0.025, na.rm = TRUE),
+      Q_Value_0.01 = sum(adj_p_val <= 0.01, na.rm = TRUE),
+      Positive_Association = sum(adj_p_val <= 0.05 & beta > 0, na.rm = TRUE),
+      Negative_Association = sum(adj_p_val <= 0.05 & beta < 0, na.rm = TRUE)
+    )
+  }
+)
+```
+
+## SCNA summary input
+
+```{r}
+scna_dir <- layer_manifest$results_dir[layer_manifest$layer_id == "SCNA"]
+scna_results_files <- sort(list.files(
+  path = scna_dir,
+  pattern = layer_manifest$clustering_pattern[layer_manifest$layer_id == "SCNA"],
+  full.names = TRUE,
+  recursive = TRUE
+))
+
+if (length(scna_results_files) == 0) {
+  stop("No SCNA result files were found in: ", scna_dir)
+}
+
+SCNA_summary <- purrr::map_dfr(
+  scna_results_files,
+  function(file_path) {
+    x <- readRDS(file_path)
+
+    if (!all(c("amplified_two_levels", "deleted_two_levels") %in% names(x))) {
+      stop("SCNA result file is missing amplified/deleted gene-level tables: ", file_path)
+    }
+
+    amp_df <- x[["amplified_two_levels"]] %>%
+      as.data.frame()
+
+    del_df <- x[["deleted_two_levels"]] %>%
+      as.data.frame()
+
+    dplyr::tibble(
+      Project = basename(dirname(file_path)),
+      Total_Features = nrow(amp_df) + nrow(del_df),
+      Q_Value_0.05 = sum(amp_df$adj_p_val <= 0.05, na.rm = TRUE) + sum(del_df$adj_p_val <= 0.05, na.rm = TRUE),
+      Q_Value_0.025 = sum(amp_df$adj_p_val <= 0.025, na.rm = TRUE) + sum(del_df$adj_p_val <= 0.025, na.rm = TRUE),
+      Q_Value_0.01 = sum(amp_df$adj_p_val <= 0.01, na.rm = TRUE) + sum(del_df$adj_p_val <= 0.01, na.rm = TRUE),
+      Positive_Association = sum(amp_df$adj_p_val <= 0.05 & amp_df$beta > 0, na.rm = TRUE) +
+        sum(del_df$adj_p_val <= 0.05 & del_df$beta > 0, na.rm = TRUE),
+      Negative_Association = sum(amp_df$adj_p_val <= 0.05 & amp_df$beta < 0, na.rm = TRUE) +
+        sum(del_df$adj_p_val <= 0.05 & del_df$beta < 0, na.rm = TRUE)
+    )
+  }
+)
+```
+
+## Legacy summary objects already prepared upstream
+
+```{r}
+DMR_summary_path  <- file.path(legacy_root, "results", "methylation", "summary_results", "PanCancer_DMR_summary.rds")
+RPPA_summary_path <- file.path(legacy_root, "results", "RPPA", "summary_results", "PanCancer_RPPA_summary.rds")
+
+if (!file.exists(DMR_summary_path)) {
+  stop("Missing methylation summary file: ", DMR_summary_path)
+}
+
+if (!file.exists(RPPA_summary_path)) {
+  stop("Missing RPPA summary file: ", RPPA_summary_path)
+}
+
+DMR_summary  <- readRDS(DMR_summary_path)
+RPPA_summary <- readRDS(RPPA_summary_path)
+```
+
+## Raw-result file manifest
+
+```{r}
+rnaseq_unfiltered_files <- sort(list.files(
+  path = rnaseq_dir,
+  pattern = layer_manifest$clustering_pattern[layer_manifest$layer_id == "RNAseq"],
+  full.names = TRUE
+))
+
+mirna_unfiltered_files <- sort(list.files(
+  path = mirna_dir,
+  pattern = layer_manifest$clustering_pattern[layer_manifest$layer_id == "miRNA"],
+  full.names = TRUE
+))
+
+methylation_files <- sort(list.files(
+  path = layer_manifest$results_dir[layer_manifest$layer_id == "Methylation"],
+  pattern = layer_manifest$clustering_pattern[layer_manifest$layer_id == "Methylation"],
+  full.names = TRUE
+))
+
+rppa_files <- sort(list.files(
+  path = layer_manifest$results_dir[layer_manifest$layer_id == "RPPA"],
+  pattern = layer_manifest$clustering_pattern[layer_manifest$layer_id == "RPPA"],
+  full.names = TRUE
+))
+
+result_file_manifest <- bind_rows(
+  tibble(
+    layer_id = "RNAseq",
+    result_use = "filtered_deseq",
+    Project = stringr::str_extract(basename(rnaseq_filtered_files), "TCGA-[^_]+"),
+    file_path = rnaseq_filtered_files
+  ),
+  tibble(
+    layer_id = "RNAseq",
+    result_use = "unfiltered_deseq",
+    Project = stringr::str_remove(basename(rnaseq_unfiltered_files), fixed(layer_manifest$clustering_suffix[layer_manifest$layer_id == "RNAseq"])),
+    file_path = rnaseq_unfiltered_files
+  ),
+  tibble(
+    layer_id = "miRNA",
+    result_use = "filtered_deseq",
+    Project = stringr::str_extract(basename(mirna_filtered_files), "TCGA-[^_]+"),
+    file_path = mirna_filtered_files
+  ),
+  tibble(
+    layer_id = "miRNA",
+    result_use = "unfiltered_deseq",
+    Project = stringr::str_remove(basename(mirna_unfiltered_files), fixed(layer_manifest$clustering_suffix[layer_manifest$layer_id == "miRNA"])),
+    file_path = mirna_unfiltered_files
+  ),
+  tibble(
+    layer_id = "Methylation",
+    result_use = "limma",
+    Project = stringr::str_remove(basename(methylation_files), fixed(layer_manifest$clustering_suffix[layer_manifest$layer_id == "Methylation"])),
+    file_path = methylation_files
+  ),
+  tibble(
+    layer_id = "RPPA",
+    result_use = "limma",
+    Project = stringr::str_remove(basename(rppa_files), fixed(layer_manifest$clustering_suffix[layer_manifest$layer_id == "RPPA"])),
+    file_path = rppa_files
+  ),
+  tibble(
+    layer_id = "Mutation",
+    result_use = "with_covariates_all",
+    Project = basename(dirname(mutation_results_files)),
+    file_path = mutation_results_files
+  ),
+  tibble(
+    layer_id = "SCNA",
+    result_use = "with_covariates_gene_level",
+    Project = basename(dirname(scna_results_files)),
+    file_path = scna_results_files
+  )
+)
+```
+
+## Standardize Fig. 1A counts
+
+```{r}
+all_projects <- sort(Reduce(
+  union,
+  list(
+    DMR_summary$Project,
+    RPPA_summary$Project,
+    RNAseq_summary$Project,
+    miRNA_summary$Project,
+    Mutation_summary$Project,
+    SCNA_summary$Project
+  )
+))
+
+standardize_counts <- function(df, positive_col, negative_col, layer_label, project_levels) {
+  df %>%
+    dplyr::transmute(
+      Project = as.character(Project),
+      Positive = .data[[positive_col]],
+      Negative = .data[[negative_col]]
+    ) %>%
+    tidyr::complete(Project = project_levels, fill = list(Positive = 0, Negative = 0)) %>%
+    dplyr::mutate(Layer = layer_label)
+}
+
+fig1a_counts_wide <- bind_rows(
+  standardize_counts(DMR_summary, "Hypermethylation", "Hypomethylation", "Methylation", all_projects),
+  standardize_counts(RNAseq_summary, "IncreasedExp_with_Age", "DecreasedExp_with_Age", "RNA-seq", all_projects),
+  standardize_counts(miRNA_summary, "IncreasedExp_with_Age", "DecreasedExp_with_Age", "miRNA", all_projects),
+  standardize_counts(RPPA_summary, "IncreasedExp_with_Age", "DecreasedExp_with_Age", "RPPA", all_projects),
+  standardize_counts(Mutation_summary, "Positive_Association", "Negative_Association", "Mutation", all_projects),
+  standardize_counts(SCNA_summary, "Positive_Association", "Negative_Association", "SCNA", all_projects)
+)
+
+fig1a_long <- fig1a_counts_wide %>%
+  tidyr::pivot_longer(
+    cols = c(Positive, Negative),
+    names_to = "Regulation",
+    values_to = "Count"
+  ) %>%
+  dplyr::mutate(
+    Count = ifelse(Regulation == "Negative", -Count, Count),
+    Cancer = stringr::str_remove(Project, "^TCGA-"),
+    Layer = factor(Layer, levels = layer_manifest$figure_label[layer_manifest$include_in_fig1a]),
+    Regulation = factor(Regulation, levels = c("Positive", "Negative")),
+    Cancer = factor(Cancer, levels = rev(sort(unique(Cancer))))
+  )
+```
+
+## Save official imported-results object
+
+```{r}
+part1_imported_results <- list(
+  legacy_root = legacy_root,
+  colleague_root = colleague_root,
+  organ_annotations = organ_annotations,
+  organ_palette = organ_palette,
+  layer_manifest = layer_manifest,
+  result_file_manifest = result_file_manifest,
+  layer_summaries = list(
+    Methylation = DMR_summary,
+    RNAseq = RNAseq_summary,
+    miRNA = miRNA_summary,
+    RPPA = RPPA_summary,
+    Mutation = Mutation_summary,
+    SCNA = SCNA_summary
+  ),
+  fig1a_long = fig1a_long
+)
+
+saveRDS(
+  part1_imported_results,
+  file.path(derived_dir, "part1_imported_results.rds")
+)
+
+utils::write.csv(
+  fig1a_long,
+  file = file.path(tables_dir, "fig1a_feature_counts_long.csv"),
+  row.names = FALSE
+)
+
+utils::write.csv(
+  result_file_manifest,
+  file = file.path(tables_dir, "part1_result_file_manifest.csv"),
+  row.names = FALSE
+)
+```
+
+## Quick checks
+
+```{r}
+dplyr::count(fig1a_long, Layer)
+
+dplyr::count(result_file_manifest, layer_id, result_use)
+```

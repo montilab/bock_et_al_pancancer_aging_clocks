@@ -1,0 +1,1101 @@
+---
+title: "07 — Stability & QC: cohort shift + ClockSHAP robustness"
+author: "Pan-cancer aging pipeline"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: united
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  # One reader-facing report per TCGA–GTEx tissue pair
+  tcga_project: "BRCA"
+  gtex_project: "BREAST"
+
+  # Feature set label used by upstream steps when writing RDS outputs
+  feature_set: "PC"
+
+  # Root directory containing step outputs: <out_root>/<TCGA>__<GTEx>/
+  out_root: "results/derived/GTEx"
+
+  # Minimum NAT samples required to treat the adjacent-normal cohort as present
+  min_nat: 10
+---
+
+<!--
+Stability & QC report (single TCGA–GTEx pair).
+
+Design intent
+- Produce a single, reader-facing HTML report per cancer–tissue combination.
+- Favor completeness and interpretability over runtime.
+- Keep parameters minimal. Sections are skipped automatically when inputs or packages are missing.
+
+Upstream assumptions
+- Step 01 produced ssGSEA matrices + sample_metadata.
+- Step 02 produced clock_and_RAA_objects (<analysis_id>/clock_and_RAA_objects-<feature_set>.rds).
+- Step 04 (optional) produced clockshap_objects (<analysis_id>/clockshap_objects-<feature_set>.rds).
+- Step 06 (optional) produced coupling_objects (<analysis_id>/coupling_objects-<feature_set>.rds).
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE
+)
+
+suppressPackageStartupMessages({
+  library(here)
+  library(dplyr)
+  library(tibble)
+  library(tidyr)
+  library(ggplot2)
+})
+
+# ---- Report-wide constants (intentionally NOT parameters) ----
+SEED <- 2026
+
+# PCA/QC defaults
+PCA_SCALE <- TRUE
+PCA_N_PCS <- 10L
+TOP_N_SHIFT_PATHS <- 25L
+
+# Stability defaults
+TOP_K_CONTRIB <- 15L
+MAX_PT_FOR_HYPER <- 500L
+MAX_HYPER_MODELS <- 9L
+
+# Unified iteration budget (used for permutation + PT bootstrap + GTEx bootstrap refits)
+N_ITER <- 1000L
+
+# Hyperparameter neighborhood around tuned (alpha, lambda)
+ALPHA_OFFSETS <- c(-0.25, 0, 0.25)
+LAMBDA_MULTIPLIERS <- c(0.5, 1, 2)
+
+set.seed(SEED)
+
+# ---- Small helpers ----
+reactable_pretty <- function(df, digits = 3) {
+  if (!requireNamespace("reactable", quietly = TRUE)) return(df)
+  df2 <- df %>% mutate(across(where(is.numeric), ~ signif(., digits)))
+  reactable::reactable(
+    df2,
+    searchable = TRUE,
+    resizable = TRUE,
+    striped = TRUE,
+    highlight = TRUE,
+    defaultPageSize = 10
+  )
+}
+
+safe_min <- function(x) if (length(x) && any(is.finite(x))) min(x, na.rm = TRUE) else NA_real_
+safe_med <- function(x) if (length(x) && any(is.finite(x))) stats::median(x, na.rm = TRUE) else NA_real_
+safe_max <- function(x) if (length(x) && any(is.finite(x))) max(x, na.rm = TRUE) else NA_real_
+
+safe_cor <- function(x, y, method = "pearson") {
+  ok <- complete.cases(x, y)
+  if (sum(ok) < 3) return(NA_real_)
+  suppressWarnings(cor(x[ok], y[ok], method = method))
+}
+
+fit_slope <- function(y, age) {
+  ok <- complete.cases(y, age)
+  y <- as.numeric(y[ok])
+  age <- as.numeric(age[ok])
+  if (length(y) < 3) {
+    return(tibble(n = length(y), intercept = NA_real_, slope = NA_real_, r2 = NA_real_))
+  }
+  fit <- lm(y ~ age)
+  tibble(
+    n = length(y),
+    intercept = unname(coef(fit)[1]),
+    slope     = unname(coef(fit)[2]),
+    r2        = summary(fit)$r.squared
+  )
+}
+
+cohens_d <- function(x1, x2) {
+  x1 <- x1[is.finite(x1)]; x2 <- x2[is.finite(x2)]
+  if (length(x1) < 2 || length(x2) < 2) return(NA_real_)
+  m1 <- mean(x1); m2 <- mean(x2)
+  s1 <- stats::var(x1); s2 <- stats::var(x2)
+  sp <- sqrt(((length(x1)-1)*s1 + (length(x2)-1)*s2) / (length(x1)+length(x2)-2))
+  if (!is.finite(sp) || sp == 0) return(NA_real_)
+  (m2 - m1) / sp
+}
+
+topk <- function(x, k) {
+  # x: named numeric
+  x <- x[is.finite(x)]
+  if (!length(x)) return(character())
+  names(sort(abs(x), decreasing = TRUE))[seq_len(min(k, length(x)))]
+}
+
+jaccard <- function(a, b) {
+  a <- unique(a); b <- unique(b)
+  if (!length(a) && !length(b)) return(NA_real_)
+  length(intersect(a, b)) / length(union(a, b))
+}
+```
+
+```{r load_inputs, include=FALSE}
+# Goal: load the step outputs for this TCGA–GTEx pair and harmonize cohorts
+analysis_id <- paste0(params$tcga_project, "__", params$gtex_project)
+proc_dir    <- file.path(here::here(params$out_root), analysis_id)
+proc_dir_rel <- file.path(params$out_root, analysis_id)  # reader-facing (avoid absolute paths)
+suffix      <- paste0("-", params$feature_set)
+
+# --- Step 01: ssGSEA scores + metadata ---
+scores_gtex <- readRDS(file.path(proc_dir, paste0("ssgsea_scores_gtex", suffix, ".rds")))
+scores_nt   <- readRDS(file.path(proc_dir, paste0("ssgsea_scores_nt",   suffix, ".rds")))
+scores_pt   <- readRDS(file.path(proc_dir, paste0("ssgsea_scores_pt",   suffix, ".rds")))
+metadata    <- readRDS(file.path(proc_dir, "sample_metadata.rds"))
+
+# --- Step 02: clock outputs ---
+clock_results <- readRDS(file.path(proc_dir, paste0("clock_and_RAA_objects", suffix, ".rds")))
+
+stopifnot(!anyDuplicated(rownames(metadata)))
+stopifnot(all(colnames(scores_gtex) %in% rownames(metadata)))
+stopifnot(all(colnames(scores_pt)   %in% rownames(metadata)))
+stopifnot(all(colnames(scores_nt)   %in% rownames(metadata)))
+
+feat <- clock_results$feature_names
+stopifnot(all(feat %in% rownames(scores_gtex)))
+
+# features matrices: samples × features (raw ssGSEA)
+X_gtex <- t(scores_gtex[feat, , drop = FALSE])
+X_nt   <- if (ncol(scores_nt) > 0) t(scores_nt[feat, , drop = FALSE]) else matrix(nrow = 0, ncol = length(feat), dimnames = list(NULL, feat))
+X_pt   <- t(scores_pt  [feat, , drop = FALSE])
+
+if (!identical(colnames(X_gtex), feat)) colnames(X_gtex) <- feat
+if (!identical(colnames(X_pt),   feat)) colnames(X_pt)   <- feat
+if (!identical(colnames(X_nt),   feat)) colnames(X_nt)   <- feat
+
+# ages aligned to rownames
+age_gtex <- metadata[rownames(X_gtex), "age_years"]
+age_nt   <- if (nrow(X_nt) > 0) metadata[rownames(X_nt), "age_years"] else numeric()
+age_pt   <- metadata[rownames(X_pt), "age_years"]
+
+# Filter to samples with finite age (report should only use well-defined ages)
+keep_g <- is.finite(age_gtex)
+X_gtex <- X_gtex[keep_g, , drop = FALSE]
+age_gtex <- as.numeric(age_gtex[keep_g])
+names(age_gtex) <- rownames(X_gtex)
+
+keep_pt <- is.finite(age_pt)
+X_pt <- X_pt[keep_pt, , drop = FALSE]
+age_pt <- as.numeric(age_pt[keep_pt])
+names(age_pt) <- rownames(X_pt)
+
+keep_nt <- if (length(age_nt)) is.finite(age_nt) else logical(0)
+if (nrow(X_nt) > 0) {
+  X_nt <- X_nt[keep_nt, , drop = FALSE]
+  age_nt <- as.numeric(age_nt[keep_nt])
+  names(age_nt) <- rownames(X_nt)
+}
+
+has_nat <- nrow(X_nt) >= as.integer(params$min_nat)
+
+# ---- Compute GTEx expectation lines E[x_k | age] (linear) ----
+# Goal: define a consistent "age-expected" baseline in GTEx for deviation calculations.
+g0 <- g1 <- setNames(numeric(length(feat)), feat)
+for (k in feat) {
+  fit <- lm(X_gtex[, k] ~ age_gtex)
+  g0[k] <- coef(fit)[1]
+  g1[k] <- coef(fit)[2]
+}
+
+# ---- Baseline contribution matrix for tumors (phi) + deviation (preferred: ClockSHAP; fallback: linear age-adjusted) ----
+# Goal: produce a stable baseline "contribution per pathway" matrix for PT, used by all stability checks.
+clockshap_path <- file.path(proc_dir, paste0("clockshap_objects", suffix, ".rds"))
+has_clockshap_file <- file.exists(clockshap_path)
+
+baseline_phi_source_used <- NA_character_
+baseline_phi_mat <- NULL
+baseline_dev <- NULL
+
+# Record counts before any alignment (for transparency)
+n_pt_before_phi_align <- nrow(X_pt)
+
+if (has_clockshap_file && requireNamespace("ClockSHAP", quietly = TRUE)) {
+  cs_obj <- readRDS(clockshap_path)
+  if (!is.null(cs_obj$pt$phi) && !is.null(cs_obj$pt$deviation)) {
+    baseline_phi_source_used <- "clockshap_objects"
+    baseline_phi_mat <- cs_obj$pt$phi
+    baseline_dev <- cs_obj$pt$deviation
+  }
+}
+
+if (is.null(baseline_phi_mat) || is.null(baseline_dev)) {
+  baseline_phi_source_used <- "linear_age_adjusted"
+
+  cs <- clock_results$clock_cs
+  beta_cs <- cs$beta[feat]
+  mu <- cs$mu[feat]
+  sigma <- cs$sigma[feat]
+
+  Exp_pt <- outer(as.numeric(age_pt), g1) + matrix(g0, nrow = nrow(X_pt), ncol = length(feat), byrow = TRUE)
+  colnames(Exp_pt) <- feat
+
+  Zadj <- (X_pt - Exp_pt)
+  Zadj <- sweep(Zadj, 2, sigma, "/")
+  baseline_phi_mat <- sweep(Zadj, 2, beta_cs, "*")
+
+  # expected prediction under E[x|Age]
+  Exp_z <- sweep(Exp_pt, 2, mu, "-")
+  Exp_z <- sweep(Exp_z, 2, sigma, "/")
+  exp_pred <- as.numeric(cs$alpha + Exp_z %*% beta_cs)
+
+  # align to available tumor predictions
+  pred_pt <- clock_results$pred$Tumour
+  pred_pt <- pred_pt[intersect(rownames(X_pt), names(pred_pt))]
+  pred_pt <- as.numeric(pred_pt[rownames(X_pt)])
+  baseline_dev <- pred_pt - exp_pred
+}
+
+# Harmonize tumor sample IDs between X_pt and baseline_phi_mat if needed
+common_pt <- intersect(rownames(X_pt), rownames(baseline_phi_mat))
+if (length(common_pt) < 3) stop("Tumor samples do not overlap between X_pt and baseline contributions; check upstream outputs.")
+if (!identical(rownames(X_pt), rownames(baseline_phi_mat))) {
+  X_pt <- X_pt[common_pt, , drop = FALSE]
+  age_pt <- age_pt[common_pt]
+  baseline_phi_mat <- baseline_phi_mat[common_pt, , drop = FALSE]
+  baseline_dev <- baseline_dev[common_pt]
+}
+
+colnames(baseline_phi_mat) <- feat
+baseline_dev <- as.numeric(baseline_dev)
+names(baseline_dev) <- rownames(baseline_phi_mat)
+
+baseline_invariant_max_abs_err <- max(abs(rowSums(baseline_phi_mat) - baseline_dev), na.rm = TRUE)
+n_pt_after_phi_align <- nrow(X_pt)
+
+# Baseline summary used throughout the report
+baseline_phi_summary <- tibble(
+  feature = colnames(baseline_phi_mat),
+  mean_phi = colMeans(baseline_phi_mat, na.rm = TRUE),
+  mean_abs_phi = colMeans(abs(baseline_phi_mat), na.rm = TRUE),
+  sd_phi = apply(baseline_phi_mat, 2, sd, na.rm = TRUE)
+) %>%
+  arrange(desc(mean_abs_phi))
+```
+
+## Context
+
+This report summarizes **QC, cohort shift, and stability** checks for a single pair:
+
+- **TCGA tumor cohort:** `r params$tcga_project`
+- **GTEx tissue cohort:** `r params$gtex_project`
+- **Feature set:** `r params$feature_set`
+- **Output directory:** `r proc_dir_rel`
+
+---
+
+# A) Cohort-shift / QC diagnostics (ssGSEA space)
+
+**Goal:** Identify gross **batch effects / cohort shifts** between GTEx normals, TCGA adjacent normals (if present), and TCGA tumors using ssGSEA pathway space.
+
+## A0) Cohort age summaries
+
+**Goal:** Confirm basic age coverage and sample sizes; large age-range differences can affect calibration and deviation estimates.
+
+```{r age_summary, include=FALSE}
+age_summ <- bind_rows(
+  tibble(cohort = "GTEx",    n = sum(is.finite(age_gtex)), min = safe_min(age_gtex), med = safe_med(age_gtex), max = safe_max(age_gtex)),
+  tibble(cohort = "TCGA-PT", n = sum(is.finite(age_pt)),   min = safe_min(age_pt),   med = safe_med(age_pt),   max = safe_max(age_pt)),
+  tibble(cohort = "TCGA-AN", n = sum(is.finite(age_nt)),   min = safe_min(age_nt),   med = safe_med(age_nt),   max = safe_max(age_nt))
+) %>%
+  mutate(across(c(min, med, max), ~ signif(., 4)))
+```
+
+```{r age_summary_table}
+reactable_pretty(age_summ)
+```
+
+## A1) PCA scatter (GTEx vs NAT vs PT)
+
+**Goal:** Visualize the largest axes of variation to quickly surface issues like tissue mismatch, strong batch effects, or tumors separating along a dominant technical axis.
+
+```{r pca_compute, include=FALSE}
+cohort_tbl <- bind_rows(
+  tibble(sample_id = rownames(X_gtex), cohort = "GTEx"),
+  tibble(sample_id = rownames(X_pt),   cohort = "TCGA-PT"),
+  tibble(sample_id = rownames(X_nt),   cohort = "TCGA-AN")
+) %>%
+  filter(!(cohort == "TCGA-AN" & !has_nat))
+
+X_all <- bind_rows(
+  as_tibble(X_gtex) %>% mutate(sample_id = rownames(X_gtex)),
+  as_tibble(X_pt)   %>% mutate(sample_id = rownames(X_pt)),
+  as_tibble(X_nt)   %>% mutate(sample_id = rownames(X_nt))
+) %>%
+  inner_join(cohort_tbl, by = "sample_id")
+
+X_mat <- X_all %>%
+  select(all_of(feat)) %>%
+  as.matrix()
+
+pca <- prcomp(X_mat, center = TRUE, scale. = PCA_SCALE)
+pcs <- as.data.frame(pca$x[, 1:2, drop = FALSE])
+pcs$sample_id <- X_all$sample_id
+pcs$cohort <- factor(X_all$cohort, levels = c("GTEx", "TCGA-AN", "TCGA-PT"))
+
+p_pca <- ggplot(pcs, aes(PC1, PC2, color = cohort)) +
+  geom_point(alpha = 0.55, size = 1.8) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = paste0("PCA of ssGSEA pathway space: ", analysis_id),
+    subtitle = paste0("Centered", if (PCA_SCALE) " + scaled" else "", "; each point is a sample"),
+    x = paste0("PC1 (", signif(100 * (pca$sdev[1]^2 / sum(pca$sdev^2)), 3), "%)"),
+    y = paste0("PC2 (", signif(100 * (pca$sdev[2]^2 / sum(pca$sdev^2)), 3), "%)")
+  )
+```
+
+```{r pca_plot}
+p_pca
+```
+
+## A2) PC-space centroid distances + within-cohort dispersion
+
+**Goal:** Quantify separation between cohorts (centroid distances) and internal heterogeneity (mean distance to centroid), complementing the PCA scatter.
+
+```{r pca_metrics_compute, include=FALSE}
+pca_metrics <- NULL
+centroid_distances_tbl <- NULL
+
+n_pcs <- max(2L, min(as.integer(PCA_N_PCS), ncol(pca$x)))
+Z <- pca$x[, seq_len(n_pcs), drop = FALSE]
+dfZ <- as.data.frame(Z)
+dfZ$cohort <- X_all$cohort
+
+centroids <- dfZ %>%
+  group_by(cohort) %>%
+  summarise(across(starts_with("PC"), mean), .groups = "drop")
+
+pc_cols <- paste0("PC", seq_len(n_pcs))
+
+# Within-cohort dispersion
+disp <- bind_rows(lapply(unique(dfZ$cohort), function(co) {
+  D <- as.matrix(dfZ[dfZ$cohort == co, pc_cols, drop = FALSE])
+  cen <- unlist(centroids[centroids$cohort == co, pc_cols], use.names = FALSE)
+  tibble(
+    cohort = co,
+    mean_dist_to_centroid = mean(sqrt(rowSums((D - matrix(cen, nrow(D), ncol(D), byrow = TRUE))^2)))
+  )
+}))
+
+# Between-cohort centroid distances
+cen_mat <- as.matrix(centroids %>% select(starts_with("PC")))
+rownames(cen_mat) <- centroids$cohort
+dist_mat <- as.matrix(stats::dist(cen_mat))
+
+pairs <- expand.grid(from = rownames(dist_mat), to = colnames(dist_mat), stringsAsFactors = FALSE) %>%
+  filter(from < to) %>%
+  mutate(dist = dist_mat[cbind(from, to)])
+
+pca_metrics <- pairs %>%
+  left_join(disp, by = c("from" = "cohort")) %>% rename(from_disp = mean_dist_to_centroid) %>%
+  left_join(disp, by = c("to" = "cohort")) %>% rename(to_disp = mean_dist_to_centroid) %>%
+  mutate(dist = signif(dist, 4), from_disp = signif(from_disp, 4), to_disp = signif(to_disp, 4))
+
+# Convenience summary table for the main three distances (when NAT present)
+centroid_distances_tbl <- pca_metrics %>%
+  mutate(pair = paste(from, "vs", to)) %>%
+  select(pair, dist) %>%
+  arrange(desc(dist))
+```
+
+```{r pca_metrics_table}
+reactable_pretty(pca_metrics)
+```
+
+## A3) Pathway-level cohort shifts (effect sizes)
+
+**Goal:** Identify pathways with the largest cohort-level shifts (Cohen’s d), which often explain cohort separation in PCA.
+
+```{r shift_compute, include=FALSE}
+shift_tbl <- tibble(
+  pathway = feat,
+  d_nat_vs_gtex = if (has_nat) vapply(feat, function(p) cohens_d(X_gtex[, p], X_nt[, p]), numeric(1)) else NA_real_,
+  d_pt_vs_gtex  = vapply(feat, function(p) cohens_d(X_gtex[, p], X_pt[, p]), numeric(1)),
+  d_pt_vs_nat   = if (has_nat) vapply(feat, function(p) cohens_d(X_nt[, p], X_pt[, p]), numeric(1)) else NA_real_
+) %>%
+  mutate(
+    abs_d_pt_vs_gtex  = abs(d_pt_vs_gtex),
+    abs_d_nat_vs_gtex = abs(d_nat_vs_gtex)
+  ) %>%
+  arrange(desc(abs_d_pt_vs_gtex))
+```
+
+```{r shift_table}
+reactable_pretty(
+  shift_tbl %>%
+    select(pathway, d_pt_vs_gtex, d_nat_vs_gtex, d_pt_vs_nat) %>%
+    slice_head(n = TOP_N_SHIFT_PATHS)
+)
+```
+
+# B) ClockSHAP contribution stability
+
+**Goal:** Check that the reported top contributing pathways are **not brittle** to (i) tuning choices, and (ii) sampling variation in the tumor cohort.
+
+## B0) Baseline contributions used by this report
+
+**Goal:** Make the “baseline contribution matrix” explicit, including which source was used and whether the $\sum_k \phi_{ik} = deviation_i$ invariant holds.
+
+```{r baseline_source_compute, include=FALSE}
+baseline_source_tbl <- tibble(
+  quantity = c(
+    "baseline phi source",
+    "PT samples (before alignment)",
+    "PT samples (after alignment)",
+    "max |rowSums(phi) - deviation|"
+  ),
+  value = c(
+    baseline_phi_source_used,
+    n_pt_before_phi_align,
+    n_pt_after_phi_align,
+    signif(baseline_invariant_max_abs_err, 6)
+  )
+)
+```
+
+```{r baseline_source_table}
+reactable_pretty(baseline_source_tbl)
+```
+
+### Baseline top contributors (tumors)
+
+**Goal:** Provide an interpretable “headline” ranking of pathways driving tumor deviation (mean |φ| across tumors).
+
+```{r baseline_top_table}
+reactable_pretty(baseline_phi_summary %>% slice_head(n = 25))
+```
+
+## B1) Null check: permuted-age refits
+
+**Goal:** Refit the same clock form on GTEx after *permuting ages* (destroying age signal), then compute the PT deviation under the permuted model.  
+If the observed PT deviation is extreme relative to this null, it supports the deviation reflecting a real aging signal rather than purely model structure or cohort shift.
+
+```{r permuted_age_compute, include=FALSE}
+perm_tbl <- NULL
+perm_summary <- NULL
+p_perm <- NULL
+
+if (requireNamespace("glmnet", quietly = TRUE)) {
+  # Delta matrices (feature deviation from age-expected profile)
+  Exp_pt <- outer(as.numeric(age_pt), g1) + matrix(g0, nrow = nrow(X_pt), ncol = length(feat), byrow = TRUE)
+  colnames(Exp_pt) <- feat
+  Delta_pt <- X_pt - Exp_pt
+
+  Delta_nt <- NULL
+  if (has_nat) {
+    Exp_nt <- outer(as.numeric(age_nt), g1) + matrix(g0, nrow = nrow(X_nt), ncol = length(feat), byrow = TRUE)
+    colnames(Exp_nt) <- feat
+    Delta_nt <- X_nt - Exp_nt
+  }
+
+  obs_mean_pt <- mean(baseline_dev, na.rm = TRUE)
+  obs_med_pt  <- median(baseline_dev, na.rm = TRUE)
+
+  cs <- clock_results$clock_cs
+  b_ref <- (cs$beta[feat] / cs$sigma[feat])
+  dev_nt_ref <- if (!is.null(Delta_nt)) as.numeric(Delta_nt %*% b_ref) else NULL
+  obs_mean_delta_pt_minus_nt <- if (!is.null(dev_nt_ref)) obs_mean_pt - mean(dev_nt_ref, na.rm = TRUE) else NA_real_
+
+  n_perm_target <- as.integer(N_ITER)
+
+  best_alpha  <- as.numeric(clock_results$tuning$best_alpha)
+  best_lambda <- as.numeric(clock_results$tuning$best_lambda)
+
+  set.seed(SEED + 310)
+  out <- vector("list", n_perm_target)
+
+  for (b in seq_len(n_perm_target)) {
+    y_perm <- sample(age_gtex)
+
+    fit <- glmnet::glmnet(
+      x = X_gtex, y = y_perm,
+      alpha = best_alpha,
+      lambda = best_lambda,
+      standardize = TRUE,
+      intercept = TRUE
+    )
+
+    cm <- as.matrix(stats::coef(fit, s = best_lambda))
+    b_orig <- setNames(as.numeric(cm[-1, 1]), rownames(cm)[-1])[feat]
+    b_orig[is.na(b_orig)] <- 0
+
+    dev_pt_perm <- as.numeric(Delta_pt %*% b_orig)
+    mean_pt_perm <- mean(dev_pt_perm, na.rm = TRUE)
+    med_pt_perm  <- median(dev_pt_perm, na.rm = TRUE)
+
+    mean_delta_perm <- NA_real_
+    if (!is.null(Delta_nt)) {
+      dev_nt_perm <- as.numeric(Delta_nt %*% b_orig)
+      mean_delta_perm <- mean_pt_perm - mean(dev_nt_perm, na.rm = TRUE)
+    }
+
+    out[[b]] <- tibble(
+      iter = b,
+      mean_dev_pt = mean_pt_perm,
+      med_dev_pt  = med_pt_perm,
+      mean_delta_pt_minus_nt = mean_delta_perm
+    )
+  }
+
+  perm_tbl <- bind_rows(out)
+
+  # Empirical p-values (two-sided)
+  p_mean_pt <- (1 + sum(abs(perm_tbl$mean_dev_pt) >= abs(obs_mean_pt), na.rm = TRUE)) / (nrow(perm_tbl) + 1)
+  p_med_pt  <- (1 + sum(abs(perm_tbl$med_dev_pt)  >= abs(obs_med_pt),  na.rm = TRUE)) / (nrow(perm_tbl) + 1)
+
+  perm_summary <- tibble(
+    metric = c("PT mean deviation", "PT median deviation", if (has_nat) "PT–AN mean deviation (delta)" else NULL),
+    observed = c(obs_mean_pt, obs_med_pt, if (has_nat) obs_mean_delta_pt_minus_nt else NULL),
+    null_mean = c(
+      mean(perm_tbl$mean_dev_pt, na.rm = TRUE),
+      mean(perm_tbl$med_dev_pt,  na.rm = TRUE),
+      if (has_nat) mean(perm_tbl$mean_delta_pt_minus_nt, na.rm = TRUE) else NULL
+    ),
+    null_sd   = c(
+      sd(perm_tbl$mean_dev_pt, na.rm = TRUE),
+      sd(perm_tbl$med_dev_pt,  na.rm = TRUE),
+      if (has_nat) sd(perm_tbl$mean_delta_pt_minus_nt, na.rm = TRUE) else NULL
+    ),
+    empirical_p = c(
+      p_mean_pt,
+      p_med_pt,
+      if (has_nat) (1 + sum(abs(perm_tbl$mean_delta_pt_minus_nt) >= abs(obs_mean_delta_pt_minus_nt), na.rm = TRUE)) / (nrow(perm_tbl) + 1) else NULL
+    )
+  ) %>%
+    mutate(across(where(is.numeric), ~ signif(., 5)))
+
+  p_perm <- ggplot(perm_tbl, aes(x = mean_dev_pt)) +
+    geom_histogram(bins = 35) +
+    geom_vline(xintercept = obs_mean_pt, linetype = "dashed", linewidth = 1) +
+    theme_minimal(base_size = 12) +
+    labs(
+      title = paste0("Permuted-age null: PT mean deviation (", analysis_id, ")"),
+      subtitle = paste0("Refit glmnet at tuned alpha/lambda with permuted GTEx ages; ran ", nrow(perm_tbl), " permutations. Dashed = observed."),
+      x = "Mean PT deviation (years)",
+      y = "Count"
+    )
+} else {
+  perm_summary <- tibble(note = "glmnet is not available; permuted-age null check skipped.")
+}
+```
+
+```{r permuted_age_summary_table}
+reactable_pretty(perm_summary)
+```
+
+```{r permuted_age_plot, eval = !is.null(p_perm)}
+p_perm
+```
+
+## B2) Hyperparameter stability (local neighborhood)
+
+**Goal:** Refit clocks in a small neighborhood around the tuned $(\\alpha, \\lambda)$ and test whether the **rank and sign** of top contributors are stable.
+
+```{r hyperparam_compute, include=FALSE}
+hyper_overall_tbl <- NULL
+hyper_feature_stability_tbl <- NULL
+p_hyper_heatmap <- NULL
+
+if (requireNamespace("glmnet", quietly = TRUE)) {
+  mu_train <- clock_results$clock_cs$mu[feat]
+  sigma_train <- clock_results$clock_cs$sigma[feat]
+
+  # PT subsample keeps runtime bounded without changing the qualitative question
+  set.seed(SEED + 10)
+  pt_ids <- rownames(X_pt)
+  if (length(pt_ids) > MAX_PT_FOR_HYPER) {
+    pt_ids <- sample(pt_ids, size = MAX_PT_FOR_HYPER)
+  }
+  X_pt_sub <- X_pt[pt_ids, , drop = FALSE]
+  age_pt_sub <- age_pt[pt_ids]
+
+  Exp_sub <- outer(as.numeric(age_pt_sub), g1) + matrix(g0, nrow = nrow(X_pt_sub), ncol = length(feat), byrow = TRUE)
+  colnames(Exp_sub) <- feat
+  Zadj_sub <- sweep(X_pt_sub - Exp_sub, 2, sigma_train, "/")
+
+  compute_meanphi <- function(beta_cs) {
+    phi <- sweep(Zadj_sub, 2, beta_cs, "*")
+    colMeans(phi, na.rm = TRUE)
+  }
+
+  best_alpha <- as.numeric(clock_results$tuning$best_alpha)
+  best_lambda <- as.numeric(clock_results$tuning$best_lambda)
+
+  alpha_vals <- unique(signif(pmin(1, pmax(0, best_alpha + ALPHA_OFFSETS)), 4))
+  lam_vals   <- unique(signif(best_lambda * LAMBDA_MULTIPLIERS, 6))
+
+  grid <- expand.grid(alpha = alpha_vals, lambda = lam_vals, stringsAsFactors = FALSE)
+  if (nrow(grid) > MAX_HYPER_MODELS) {
+    set.seed(SEED + 11)
+    grid <- grid[sample(seq_len(nrow(grid)), size = MAX_HYPER_MODELS), , drop = FALSE]
+  }
+
+  meanphi_list <- list()
+
+  for (i in seq_len(nrow(grid))) {
+    a <- grid$alpha[i]
+    lam <- grid$lambda[i]
+
+    fit <- glmnet::glmnet(
+      x = X_gtex, y = age_gtex,
+      alpha = a,
+      lambda = lam,
+      standardize = TRUE,
+      intercept = TRUE
+    )
+
+    coef_mat <- as.matrix(stats::coef(fit, s = lam))
+    a_orig <- as.numeric(coef_mat[1, 1])
+    b_orig <- setNames(as.numeric(coef_mat[-1, 1]), rownames(coef_mat)[-1])[feat]
+    b_orig[is.na(b_orig)] <- 0
+
+    beta_cs <- b_orig * sigma_train
+    alpha_cs <- a_orig + sum(b_orig * mu_train, na.rm = TRUE)
+
+    model_id <- sprintf("a=%.2f | lam=%.4g", a, lam)
+    meanphi_list[[model_id]] <- compute_meanphi(beta_cs)
+  }
+
+  if (length(meanphi_list) >= 2) {
+    meanphi_mat <- do.call(cbind, meanphi_list)
+    colnames(meanphi_mat) <- names(meanphi_list)
+    rownames(meanphi_mat) <- feat
+
+    meanabs_mat <- abs(meanphi_mat)
+
+    cor_mat <- suppressWarnings(cor(meanphi_mat, method = "spearman", use = "pairwise.complete.obs"))
+    cor_vals <- cor_mat[upper.tri(cor_mat)]
+
+    base_top <- topk(setNames(baseline_phi_summary$mean_phi, baseline_phi_summary$feature), TOP_K_CONTRIB)
+
+    # Per-feature stability
+    ranks <- apply(meanabs_mat, 2, function(x) rank(-x, ties.method = "average"))
+    med_rank <- apply(ranks, 1, median, na.rm = TRUE)
+    iqr_rank <- apply(ranks, 1, IQR, na.rm = TRUE)
+
+    med_meanphi <- apply(meanphi_mat, 1, median, na.rm = TRUE)
+    maj_sign <- ifelse(med_meanphi >= 0, 1, -1)
+    sign_stab <- vapply(seq_along(feat), function(i) {
+      x <- meanphi_mat[i, ]
+      ok <- is.finite(x)
+      if (sum(ok) == 0) return(NA_real_)
+      mean(sign(x[ok]) == maj_sign[i])
+    }, numeric(1))
+
+    in_topk <- apply(ranks, 2, function(r) r <= TOP_K_CONTRIB)
+    topk_freq <- rowMeans(in_topk, na.rm = TRUE)
+
+    base_top_tbl <- tibble(
+      feature = base_top,
+      sign_stability = sign_stab[match(base_top, feat)],
+      topk_freq = topk_freq[match(base_top, feat)]
+    )
+
+    hyper_overall_tbl <- tibble(
+      n_models = ncol(meanphi_mat),
+      clockshap_spearman_med = median(cor_vals, na.rm = TRUE),
+      top_path_sign_stability_med = median(base_top_tbl$sign_stability, na.rm = TRUE),
+      top_path_retention_freq_med = median(base_top_tbl$topk_freq, na.rm = TRUE),
+      pt_subsample_n = nrow(X_pt_sub)
+    ) %>%
+      mutate(across(where(is.numeric), ~ signif(., 4)))
+
+    hyper_feature_stability_tbl <- tibble(
+      feature = feat,
+      baseline_mean_abs_phi = baseline_phi_summary$mean_abs_phi[match(feat, baseline_phi_summary$feature)],
+      median_rank = med_rank,
+      iqr_rank = iqr_rank,
+      sign_stability = sign_stab,
+      topk_freq = topk_freq,
+      median_mean_phi = med_meanphi
+    ) %>%
+      arrange(median_rank) %>%
+      mutate(across(where(is.numeric), ~ signif(., 4)))
+
+    # Heatmap across models for top baseline contributors
+    top_paths <- baseline_phi_summary$feature[seq_len(min(TOP_K_CONTRIB, nrow(baseline_phi_summary)))]
+    hm <- as.data.frame(meanphi_mat[top_paths, , drop = FALSE])
+    hm$feature <- rownames(hm)
+    hm_long <- tidyr::pivot_longer(hm, cols = -feature, names_to = "model", values_to = "mean_phi")
+
+    p_hyper_heatmap <- ggplot(hm_long, aes(x = model, y = feature, fill = mean_phi)) +
+      geom_tile() +
+      theme_minimal(base_size = 11) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+      scale_fill_gradient2() +
+      labs(
+        title = paste0("Hyperparameter neighborhood stability (mean signed contribution): ", analysis_id),
+        subtitle = paste0("Top ", length(top_paths), " pathways by baseline mean |φ|; PT subsample n=", nrow(X_pt_sub)),
+        x = NULL, y = NULL, fill = "Mean φ"
+      )
+  } else {
+    hyper_overall_tbl <- tibble(note = "Insufficient hyperparameter models to summarize (need >=2).")
+  }
+} else {
+  hyper_overall_tbl <- tibble(note = "glmnet is not available; hyperparameter stability skipped.")
+}
+```
+
+```{r hyperparam_overall_table}
+reactable_pretty(hyper_overall_tbl)
+```
+
+```{r hyperparam_feature_table, eval = !is.null(hyper_feature_stability_tbl)}
+reactable_pretty(hyper_feature_stability_tbl %>% slice_head(n = 25))
+```
+
+```{r hyperparam_heatmap, eval = !is.null(p_hyper_heatmap)}
+p_hyper_heatmap
+```
+
+## B3) Bootstrap stability (PT-only resampling)
+
+**Goal:** Resample tumor samples with replacement and recompute mean contributions. This tests whether the top contributors are stable to sampling variation in the tumor cohort.
+
+```{r pt_boot_compute, include=FALSE}
+boot_summary_tbl <- NULL
+boot_feature_stability_tbl <- NULL
+p_boot_freq <- NULL
+
+phi <- baseline_phi_mat
+nB <- as.integer(N_ITER)
+
+feats <- colnames(phi)
+meanphi_draws <- matrix(
+  NA_real_,
+  nrow = length(feats),
+  ncol = nB,
+  dimnames = list(feats, paste0("boot", seq_len(nB)))
+)
+
+set.seed(SEED + 200)
+
+for (jj in seq_len(nB)) {
+  ix <- sample(seq_len(nrow(phi)), replace = TRUE)
+  meanphi_draws[, jj] <- colMeans(phi[ix, , drop = FALSE], na.rm = TRUE)
+}
+
+B <- nB
+cor_mat <- suppressWarnings(cor(meanphi_draws, method = "spearman", use = "pairwise.complete.obs"))
+cor_vals <- cor_mat[upper.tri(cor_mat)]
+
+base_top <- topk(setNames(baseline_phi_summary$mean_phi, baseline_phi_summary$feature), TOP_K_CONTRIB)
+
+# Per-feature stability
+med_meanphi <- apply(meanphi_draws, 1, median, na.rm = TRUE)
+maj_sign <- ifelse(med_meanphi >= 0, 1, -1)
+sign_stab <- vapply(seq_along(feats), function(i) {
+  x <- meanphi_draws[i, ]
+  ok <- is.finite(x)
+  if (sum(ok) == 0) return(NA_real_)
+  mean(sign(x[ok]) == maj_sign[i])
+}, numeric(1))
+
+ranks <- apply(abs(meanphi_draws), 2, function(x) rank(-x, ties.method = "average"))
+in_topk <- apply(ranks, 2, function(r) r <= TOP_K_CONTRIB)
+topk_freq <- rowMeans(in_topk, na.rm = TRUE)
+
+base_top_tbl <- tibble(
+  feature = base_top,
+  sign_stability = sign_stab[match(base_top, feats)],
+  topk_freq = topk_freq[match(base_top, feats)]
+)
+
+boot_summary_tbl <- tibble(
+  ran_n_boot = B,
+  clockshap_spearman_med = median(cor_vals, na.rm = TRUE),
+  top_path_sign_stability_med = median(base_top_tbl$sign_stability, na.rm = TRUE),
+  top_path_retention_freq_med = median(base_top_tbl$topk_freq, na.rm = TRUE)
+) %>%
+  mutate(across(where(is.numeric), ~ signif(., 4)))
+
+boot_feature_stability_tbl <- tibble(
+  feature = feats,
+  baseline_mean_abs_phi = baseline_phi_summary$mean_abs_phi[match(feats, baseline_phi_summary$feature)],
+  sign_stability = sign_stab,
+  topk_freq = topk_freq,
+  median_mean_phi = med_meanphi
+) %>%
+  arrange(desc(baseline_mean_abs_phi)) %>%
+  mutate(across(where(is.numeric), ~ signif(., 4)))
+
+plot_df <- boot_feature_stability_tbl %>%
+  slice_head(n = min(25, nrow(.))) %>%
+  mutate(feature = factor(feature, levels = rev(feature)))
+
+p_boot_freq <- ggplot(plot_df, aes(x = topk_freq, y = feature)) +
+  geom_col() +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = paste0("Bootstrap stability (PT-only): top-k selection frequency (", analysis_id, ")"),
+    subtitle = paste0("k=", TOP_K_CONTRIB, "; ran ", B, " bootstraps."),
+    x = "Fraction of bootstraps in top-k",
+    y = NULL
+  )
+```
+
+```{r pt_boot_summary_table}
+reactable_pretty(boot_summary_tbl)
+```
+
+```{r pt_boot_feature_table}
+reactable_pretty(boot_feature_stability_tbl %>% slice_head(n = 25))
+```
+
+```{r pt_boot_plot}
+p_boot_freq
+```
+
+## B4) Reference aging profile stability (GTEx bootstrap refits)
+
+**Goal:** Resample GTEx samples (with replacement), refit the clock at tuned hyperparameters, and check whether the **same pathways** and **directions** are consistently recovered.
+
+```{r gtex_refboot_compute, include=FALSE}
+refboot_summary_tbl <- NULL
+refboot_feature_tbl <- NULL
+p_refboot <- NULL
+
+if (requireNamespace("glmnet", quietly = TRUE)) {
+  best_alpha  <- as.numeric(clock_results$tuning$best_alpha)
+  best_lambda <- as.numeric(clock_results$tuning$best_lambda)
+
+  cs <- clock_results$clock_cs
+  b_ref <- (cs$beta[feat] / cs$sigma[feat])
+  b_ref[is.na(b_ref)] <- 0
+
+  k <- max(10L, TOP_K_CONTRIB)
+  top_feat <- names(sort(abs(b_ref), decreasing = TRUE))[seq_len(min(k, length(b_ref)))]
+
+  n_boot_target <- as.integer(N_ITER)
+  coef_draws <- matrix(NA_real_, nrow = length(feat), ncol = n_boot_target, dimnames = list(feat, paste0("boot", seq_len(n_boot_target))))
+
+  set.seed(SEED + 410)
+
+  for (b in seq_len(n_boot_target)) {
+    ix <- sample(seq_len(nrow(X_gtex)), replace = TRUE)
+
+    fit <- glmnet::glmnet(
+      x = X_gtex[ix, , drop = FALSE],
+      y = age_gtex[ix],
+      alpha = best_alpha,
+      lambda = best_lambda,
+      standardize = TRUE,
+      intercept = TRUE
+    )
+
+    cm <- as.matrix(stats::coef(fit, s = best_lambda))
+    b_orig <- setNames(as.numeric(cm[-1, 1]), rownames(cm)[-1])[feat]
+    b_orig[is.na(b_orig)] <- 0
+
+    coef_draws[, b] <- b_orig
+  }
+
+  cor_mat <- suppressWarnings(cor(coef_draws[top_feat, , drop = FALSE], method = "spearman", use = "pairwise.complete.obs"))
+  cor_vals <- cor_mat[upper.tri(cor_mat)]
+
+  base_top <- names(sort(abs(b_ref), decreasing = TRUE))[seq_len(min(k, length(b_ref)))]
+
+  eps <- 1e-12
+  sel_freq <- rowMeans(abs(coef_draws) > eps, na.rm = TRUE)
+
+  sign_ref <- sign(b_ref)
+  sign_ref[sign_ref == 0] <- NA_integer_
+
+  sign_stab_selected <- vapply(seq_along(feat), function(i) {
+    x <- coef_draws[i, ]
+    sel <- abs(x) > eps & is.finite(x)
+    if (!any(sel) || is.na(sign_ref[i])) return(NA_real_)
+    mean(sign(x[sel]) == sign_ref[i])
+  }, numeric(1))
+
+  base_retained <- feat[abs(b_ref[feat]) > eps]
+  retained_tbl <- tibble(
+    feature = base_retained,
+    selection_freq = sel_freq[match(base_retained, feat)],
+    sign_stability_if_selected = sign_stab_selected[match(base_retained, feat)]
+  )
+
+  refboot_summary_tbl <- tibble(
+    ran_n_boot = ncol(coef_draws),
+    reference_spearman_med = median(cor_vals, na.rm = TRUE),
+    retained_path_selection_freq_med = median(retained_tbl$selection_freq, na.rm = TRUE),
+    retained_path_sign_stability_med = median(retained_tbl$sign_stability_if_selected, na.rm = TRUE)
+  ) %>%
+    mutate(across(where(is.numeric), ~ signif(., 4)))
+
+  refboot_feature_tbl <- tibble(
+    feature = feat,
+    baseline_coef = b_ref[feat],
+    baseline_sign = sign_ref[feat],
+    selection_freq = sel_freq,
+    sign_stability_if_selected = sign_stab_selected,
+    median_coef = apply(coef_draws, 1, median, na.rm = TRUE),
+    iqr_coef = apply(coef_draws, 1, IQR, na.rm = TRUE)
+  ) %>%
+    arrange(desc(abs(baseline_coef))) %>%
+    mutate(across(where(is.numeric), ~ signif(., 4)))
+
+  # Boxplot of coefficient variability across bootstraps, highlighting pathways in the official clock.
+  coef_df <- as.data.frame(coef_draws)
+  coef_df$Pathway <- rownames(coef_draws)
+
+  coef_long <- tidyr::pivot_longer(
+    coef_df,
+    cols = -Pathway,
+    names_to = "Bootstrap",
+    values_to = "Beta"
+  )
+
+  meds <- coef_long %>%
+    dplyr::group_by(Pathway) %>%
+    dplyr::summarise(median_beta = stats::median(Beta, na.rm = TRUE), .groups = "drop") %>%
+    dplyr::arrange(median_beta)
+
+  coef_long$Pathway <- factor(coef_long$Pathway, levels = meds$Pathway)
+
+  official_paths <- names(b_ref)[abs(b_ref) > eps]
+  coef_long <- coef_long %>%
+    dplyr::mutate(in_official_clock = as.character(Pathway) %in% official_paths)
+  
+  p_refboot <- ggplot(
+    coef_long,
+    aes(x = Pathway, y = Beta, color = in_official_clock)
+  ) +
+    geom_boxplot(outlier.size = 0.6) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+    coord_flip() +
+    scale_color_manual(
+      values = c(`TRUE` = "red3", `FALSE` = "grey50"),
+      breaks = c(TRUE, FALSE),
+      labels = c("Retained in clock", "Not retained"),
+      name = NULL
+    ) +
+    theme_minimal(base_size = 9) +
+    theme(legend.position = "top") +
+    labs(
+      title = paste0("GTEx refit bootstrap: coefficient stability — ", analysis_id),
+      subtitle = paste0("Refit at tuned (alpha, lambda); ", ncol(coef_draws), " bootstraps"),
+      y = "\u03b2 coefficient",
+      x = NULL
+    )
+} else {
+  refboot_summary_tbl <- tibble(note = "glmnet is not available; GTEx bootstrap refits skipped.")
+}
+```
+
+```{r gtex_refboot_summary_table}
+reactable_pretty(refboot_summary_tbl)
+```
+
+```{r gtex_refboot_feature_table, eval = !is.null(refboot_feature_tbl)}
+reactable_pretty(refboot_feature_tbl %>% slice_head(n = 25))
+```
+
+```{r gtex_refboot_plot, eval = !is.null(p_refboot)}
+p_refboot
+```
+
+# C) Coupling stability (import summaries from Step 06)
+
+**Goal:** If Step 06 produced coupling bootstrap descriptors, import them here for a single “stability dashboard” view (no recomputation in this report).
+
+```{r coupling_import, include=FALSE}
+coupling_bootstrap_tbl <- NULL
+coupling_bootstrap_ci <- NULL
+coupling_derived <- NULL
+coupling_bootstrap_msg <- NULL
+
+coupling_path <- file.path(proc_dir, paste0("coupling_objects", suffix, ".rds"))
+if (file.exists(coupling_path)) {
+  coup <- readRDS(coupling_path)
+  coupling_derived <- coup$derived
+  if (!is.null(coup$bootstrap) && !is.null(coup$bootstrap$descriptors)) {
+    coupling_bootstrap_tbl <- coup$bootstrap$descriptors
+    coupling_bootstrap_ci  <- coup$bootstrap$ci
+    coupling_bootstrap_msg <- "Imported coupling bootstrap summaries from Step 06 outputs."
+  } else {
+    coupling_bootstrap_msg <- "Coupling objects found, but no bootstrap summaries present (run step 06 with do_bootstrap=TRUE if needed)."
+  }
+} else {
+  coupling_bootstrap_msg <- "No coupling bootstrap outputs found; skipping import."
+}
+```
+
+`r coupling_bootstrap_msg`
+
+```{r coupling_table, eval = !is.null(coupling_bootstrap_tbl)}
+reactable_pretty(coupling_bootstrap_tbl)
+```
+
+# D) Save stability objects
+
+**Goal:** Save a compact RDS bundle capturing the computed diagnostics so downstream steps can reuse them without re-parsing the HTML.
+
+```{r save_objects, include=FALSE}
+out <- list(
+  analysis_id = analysis_id,
+  params = params,
+  constants = list(
+    SEED = SEED,
+    PCA_SCALE = PCA_SCALE,
+    PCA_N_PCS = PCA_N_PCS,
+    TOP_N_SHIFT_PATHS = TOP_N_SHIFT_PATHS,
+    TOP_K_CONTRIB = TOP_K_CONTRIB,
+    MAX_PT_FOR_HYPER = MAX_PT_FOR_HYPER,
+    MAX_HYPER_MODELS = MAX_HYPER_MODELS,
+    N_ITER = N_ITER,
+    ALPHA_OFFSETS = ALPHA_OFFSETS,
+    LAMBDA_MULTIPLIERS = LAMBDA_MULTIPLIERS
+  ),
+  cohorts = list(
+    has_nat = has_nat,
+    age_summary = age_summ
+  ),
+  cohort_shift = list(
+    pca_centroid_metrics = pca_metrics,
+    pathway_shift_effect_sizes = shift_tbl
+  ),
+  clockshap = list(
+    baseline_phi_source = baseline_phi_source_used,
+    baseline_invariant_max_abs_err = baseline_invariant_max_abs_err,
+    baseline_phi_summary = baseline_phi_summary,
+    permuted_age_null = list(
+      summary = perm_summary,
+      draws = perm_tbl
+    ),
+    hyperparam_neighborhood = list(
+      summary = hyper_overall_tbl,
+      feature_stability = hyper_feature_stability_tbl
+    ),
+    pt_bootstrap = list(
+      summary = boot_summary_tbl,
+      feature_stability = boot_feature_stability_tbl
+    ),
+    gtex_bootstrap_refits = list(
+      summary = refboot_summary_tbl,
+      feature_stability = refboot_feature_tbl
+    )
+  ),
+  coupling = list(
+    imported_bootstrap_descriptors = coupling_bootstrap_tbl,
+    imported_bootstrap_ci = coupling_bootstrap_ci,
+    imported_derived = coupling_derived
+  )
+)
+
+saveRDS(out, file = file.path(proc_dir, paste0("stability_objects", suffix, ".rds")))
+```
+
+## Session info
+
+```{r session_info}
+sessionInfo()
+```

@@ -1,0 +1,324 @@
+---
+title: "Downloading TCGA RPPA Data"
+subtitle: "TCGA PanCancer Aging"
+author: "Payton Bock - Monti Lab"
+date:   "`r format(Sys.Date(), '%B %d, %Y')`"
+params: 
+  dummy: "dummy"
+output:
+  html_document:
+    theme: united
+    code_folding: hide
+    css: style.css
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+```{r, include = FALSE}
+#Load TCGA biolinks library
+.libPaths("/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/r-library/")
+
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(dplyr)
+library(tidyr)
+
+```
+
+## Script Summary 
+- Downloads raw RPPA data using TCGAbiolinks queries
+- 32 total cancer types
+- Creates SummarizedExperiment objects for each cancer type
+
+
+## Set up
+TCGA-LAML DOES NOT HAVE RPPA DATA. We download RPPA data for the remaining 32 cancer types. 
+
+```{r projects to download}
+projects <- c(
+  "TCGA-BRCA", "TCGA-OV","TCGA-GBM", "TCGA-LUAD", "TCGA-UCEC", 
+  "TCGA-KIRC", "TCGA-HNSC", "TCGA-LGG", "TCGA-THCA", "TCGA-LUSC", 
+  "TCGA-PRAD", "TCGA-SKCM", "TCGA-COAD", "TCGA-STAD", "TCGA-BLCA", 
+  "TCGA-LIHC", "TCGA-CESC", "TCGA-KIRP", "TCGA-SARC", 
+  "TCGA-ESCA", "TCGA-PAAD", "TCGA-PCPG", "TCGA-READ", "TCGA-TGCT", 
+  "TCGA-THYM", "TCGA-KICH", "TCGA-ACC", "TCGA-MESO", "TCGA-UVM", 
+  "TCGA-DLBC", "TCGA-UCS", "TCGA-CHOL"
+)
+
+#Sets the CBMDATA directory path
+Sys.setenv(CBMDATA = "/restricted/projectnb/agedisease/CBMrepositoryData")
+
+#Combines CBMDATA path with sub-directories for data output
+PATH <- file.path(Sys.getenv("CBMDATA"), "TCGA-GDC", "RPPA", "raw_data")
+PATH_rawdl <- file.path(PATH,"project_downloads")
+PATH_se <- file.path(PATH,"raw_SE")
+```
+
+
+## Downloading Raw Data - Function
+```{r Download project data}
+## download of the TCGA project dataset for RPPA
+RPPA_download <- function(project) {
+#Query
+project_RPPA.hg38 <- GDCquery(
+  project = project,
+  data.category = "Proteome Profiling",
+  experimental.strategy = "Reverse Phase Protein Array",
+  data.type = "Protein Expression Quantification",
+  sample.type = "Primary Tumor"
+)
+
+#Here we remove duplicate sample which causes the GDCprepare() func to fail
+project_RPPA.hg38.2=project_RPPA.hg38
+tmp=project_RPPA.hg38.2$results[[1]]
+tmp=tmp[which(!duplicated(tmp$cases)),]
+project_RPPA.hg38.2$results[[1]]=tmp
+
+#Download query
+GDCdownload(project_RPPA.hg38.2,directory = PATH_rawdl)
+
+#Assigns query to global variable (so we can use it for summarized experiment object creation)
+assign(paste0(project, "_queryRPPA.hg38"), project_RPPA.hg38.2, envir = .GlobalEnv)
+
+}
+## This will create and download data to "GDCdata" folder in PATH_rawdl directory
+for (project in projects) {
+  cat("Downloading data for", project, "\n") # Print message to keep track
+  RPPA_download(project)
+  Sys.sleep(5) # Optional: Adds a delay of 5 seconds between downloads to avoid overwhelming the server
+}
+
+```
+
+## Create Summarized Experiment object for all projects
+Here we create SummarizedExperiment objects from the downloaded TCGA Data. 
+To note, my goal is to set the peptide targets as the rownames of the object.
+
+However, some TCGA projects have duplicate RPPA result for the same peptide target
+  - TCGA-GBM creates an error when not accounting for duplicates
+
+From my investigation, it appears that projects like TCGA-GBM had samples split into
+different analysis sets. This suggests samples were analyzed using different "set_id" for the same peptide target. Example:
+
+   AGID lab_id catalog_number set_id peptide_target TCGA-06-5410-01A TCGA-06-A5U1-01A TCGA-06-A6S0-01A TCGA-06-1086-01A
+11  AGID00408   2372           3658 Set165         AceCS1       0.03113372               NA               NA               NA
+488 AGID00408   2372           3658 Set164         AceCS1               NA       -0.5925601       -0.5002053               NA
+728 AGID00408   2372           3658 Set166         AceCS1               NA               NA               NA               NA
+968 AGID00408   2372           3658 Set163         AceCS1               NA               NA               NA               NA
+
+
+This suggests samples were analyzed using different "set_id" for the same peptide target. 
+
+For simplicity, and overall difficulty when trying to track "set_ids" for each sample-protein combination, we simply combine all values of the same protein into a single row. This seems to be ok based on the replicate-based normalization performed on the data. Description from MD Anderson: "RBN involves normalizing by taking identical (technically replicated) control samples in the given set with an invariant control sample set and applying the adjustment (differences in means × inverse of standard deviation ratio) to each corresponding data point to produce Level 4 data.  Level 4 data enables comparison of results across different RPPA Core sets..."
+
+Link to more info: https://www.mdanderson.org/research/research-resources/core-facilities/functional-proteomics-rppa-core/faq.html
+
+
+### Number of Duplicate Values per Sample
+Due to this complexity, lets see if any samples have multiple values for the same peptide. This would complicate matters, since we would have to resolve these duplicates. Our goal is to have one RPPA valuer per peptide for each sample. 
+```{r}
+# Initialize a list to store the duplicate summary for each project
+duplicates_summary_list <- list()
+
+for (project in projects){
+  message("Analyzing duplicate measurements for ", project)
+  
+  # Load the query object
+  data_name <- paste0(project, "_queryRPPA.hg38")
+  query_obj <- get(data_name)
+  
+  # Prepare the data
+  data.hg38 <- as.data.frame(GDCprepare(query_obj, directory = PATH_rawdl, summarizedExperiment = FALSE))
+  
+  # Reshape data to long format
+  data_long <- data.hg38 %>%
+    pivot_longer(
+      cols = -c(AGID, lab_id, catalog_number, set_id, peptide_target),
+      names_to = "sample_id",
+      values_to = "expression"
+    )
+  
+  # Filter out NA values
+  data_long_filtered <- data_long %>%
+    filter(!is.na(expression))
+  
+  # Count the number of measurements per sample-peptide pair
+  duplicate_counts <- data_long_filtered %>%
+    group_by(sample_id, peptide_target) %>%
+    summarise(measurement_count = n(), .groups = 'drop')
+  
+  # Identify sample-peptide pairs with more than one measurement
+  duplicates <- duplicate_counts %>%
+    filter(measurement_count > 1)
+  
+  # Summarize the number of duplicates
+  total_sample_peptide_pairs <- nrow(duplicate_counts)
+  total_duplicates <- nrow(duplicates)
+  percentage_duplicates <- (total_duplicates / total_sample_peptide_pairs) * 100
+  
+  # Create a summary table for the project
+  duplicate_summary <- data.frame(
+    Project = project,
+    Total_Sample_Peptide_Pairs = total_sample_peptide_pairs,
+    Sample_Peptide_Pairs_With_Duplicates = total_duplicates,
+    Percentage_Duplicates = round(percentage_duplicates, 2)
+  )
+  
+  # Store the summary in the list
+  duplicates_summary_list[[project]] <- list(
+    duplicate_counts = duplicate_counts,
+    duplicates = duplicates,
+    summary = duplicate_summary
+  )
+  
+  # Print the summary for the project
+  #print(duplicate_summary)
+}
+
+# Combine all project summaries into one data frame
+all_projects_summary <- do.call(rbind, lapply(duplicates_summary_list, function(x) x$summary))
+
+# View the combined summary
+reactable::reactable(all_projects_summary, searchable = TRUE)
+```
+
+
+### Process Data
+Having confirmed that there are no duplicate measurements for the same sample-peptide combinations, we proceed to process the RPPA data for each TCGA project and create corresponding SummarizedExperiment objects. The absence of duplicates simplifies our workflow, allowing us to match each sample with its unique peptide measurements directly.
+
+Here are the major steps involved in the data processing:
+
+1. Loading the RPPA Data:
+
+For each TCGA project, we use the GDCprepare function from the TCGAbiolinks package to download and prepare the RPPA data.
+The data is loaded into a data frame (data.hg38), which includes peptide expression values along with associated metadata.
+
+2. Grouping by Identifier Columns:
+
+We group the data by the first three identifier columns: AGID, lab_id, and catalog_number.
+Grouping ensures that each peptide target is uniquely identified, even though there are no duplicates at the sample-peptide level.
+We use dplyr::group_by() and dplyr::summarise() to perform this operation, selecting the first non-NA value for each grouped entry (since there should only be 1)
+
+3. Setting Peptide Targets as Row Names:
+
+We attempt to set the peptide_target column as the row names of the data frame.
+This step is crucial for aligning peptide measurements as features in the SummarizedExperiment object.
+
+4. Verifying Unique Peptide Targets:
+
+We check if the row names have been successfully set to peptide_target.
+If there are any issues (e.g., duplicate peptide targets), we skip processing that project.
+In our case, since there are no duplicates, this check passes without issues.
+
+5. Standardizing Sample Names:
+
+We clean the sample identifiers by removing the portion after the last hyphen.
+For example, TCGA-OR-A5JV-01A becomes TCGA-OR-A5JV (to match our meta data)
+This standardization ensures consistency when matching samples with clinical data.
+
+6. Extracting Row Metadata:
+
+We separate the peptide-related metadata (AGID, lab_id, catalog_number, set_id) and store it in row_metadata.
+This metadata will be included in the rowData of the SummarizedExperiment object.
+
+7. Retrieving and aligning Clinical Data:
+
+We query the clinical data for the project using GDCquery_clinic.
+We filter the clinical data to include only the samples that have corresponding RPPA data.
+Sample IDs are set as row names for proper alignment.We match the clinical data to the expression data by reordering the clinical data to align with the columns of the expression matrix.
+
+8. Create and Save SummarizedExperiment Object per cancer type
+
+We check that the sample IDs in both the expression data and clinical data match perfectly.
+Using the SummarizedExperiment constructor, we create an object that combines the expression data (assays), peptide metadata (rowData), and clinical data (colData).
+We then save these objects! 
+
+```{r Create summarized experiments}
+for (project in projects){
+  message("Creating SummarizedExperiment Object for RPPA data for ", project)
+  data_name<- paste0(project, "_queryRPPA.hg38")
+  query_obj <- get(data_name)
+  data.hg38 <- as.data.frame(GDCprepare(query_obj,directory = PATH_rawdl, summarizedExperiment = TRUE))
+  
+  #duplicated_peptides <- data.hg38[duplicated(data.hg38$peptide_target) | duplicated(data.hg38$peptide_target, fromLast = TRUE), ]
+
+  
+  #Some data has multiple rows for the same protein (used different sets?)
+  #Need to combine these rows so we can use the peptide name as the feature
+  #This code groups rows using AGID, labID, and catalog_number, and then combines
+  # the first NON-NA value associated with each sample so we get a single row per 
+  # peptide target. eventually we need to figure out a way to add set_id information
+  num_id_cols <- 3
+  data.hg38 <- data.hg38 %>%
+   dplyr::group_by(dplyr::across(1:num_id_cols)) %>%
+   dplyr::summarise(dplyr::across(everything(), ~first(.[!is.na(.)], default = NA)), .groups = 'drop') %>%
+   dplyr::arrange("AGID") %>%
+   as.data.frame()
+  
+  #Set protein names as features
+    # Attempt to set protein names as features
+  try({
+    rownames(data.hg38) <- data.hg38$peptide_target
+  }, silent = TRUE) # silent = TRUE suppresses error messages
+  
+  # Check if rownames were successfully set
+  if (!identical(rownames(data.hg38), data.hg38$peptide_target)) {
+    message("Skipping project ", project, " due to duplicate peptide targets")
+    next # Skip to the next iteration of the loop
+  }
+  data.hg38$peptide_target <- NULL
+  
+  #Removes the final portion of the sample ID (TCGA-OR-A5JV-01A -> TCGA-OR-A5JV )
+  names(data.hg38) <- sub("-[^-]*$", "", names(data.hg38))
+  
+  #Retrieves meta-data for protein (rowData in se)
+  row_metadata <- data.hg38[, c("AGID","lab_id","catalog_number","set_id")]  # Assuming first 4 columns are metadata
+  
+  # Removes this meta data from feature and sample matrix
+  data.hg38 <- data.hg38 %>%
+    dplyr::select(-AGID, -lab_id, -catalog_number, -set_id)
+  
+  #query clinical data
+  clinical_query = GDCquery_clinic(project = project, type = "Clinical") 
+  
+  #Only keep info for samples we have RPPA data for
+  clinical_query_f <- clinical_query[clinical_query$submitter_id %in% colnames(data.hg38), ]
+  
+  #Set sample id as rownames
+  rownames(clinical_query_f) = clinical_query_f$submitter_id
+  
+  #Remove sample id, redundant
+  clinical_query_f = clinical_query_f[,-2]
+  
+  #Match samples to rows
+  clinical_query_f <- clinical_query_f[match(colnames(data.hg38), rownames(clinical_query_f)), ]
+  
+  ## remove those columns that have all NA
+  #clinical_query_f <- clinical_query_f[, !apply(is.na(clinical_query_f), 2, all)]
+  
+  if(all(rownames(clinical_query_f) == colnames(data.hg38))){
+    se <- SummarizedExperiment(assays = list(counts = data.hg38),
+                               rowData = row_metadata,
+                               colData = clinical_query_f)
+    
+    SE_output_filename <- paste0(project, "_RPPA.rds")
+    
+    message("Saving SE as ", SE_output_filename)
+    
+    saveRDS(se, file = file.path(PATH_se, SE_output_filename))
+  } else {
+    warning("Mismatch between clinical and RPPA data for project ", project)
+  }
+}
+```
+
+## Session Info
+```{r sys info}
+sessionInfo()
+```
+
+

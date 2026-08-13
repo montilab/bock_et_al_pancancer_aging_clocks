@@ -1,0 +1,618 @@
+---
+title: "01 — Processing: GTEx + TCGA → logCPM + Hallmark ssGSEA"
+author: "Pan-can aging pipeline"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: united
+    code_folding: hide
+    toc: true
+    toc_float: true
+params:
+  # Core identifiers
+  tcga_project: "BRCA"        # recount3 TCGA project (e.g., BRCA, LUAD, COAD)
+  gtex_project: "BREAST"      # recount3 GTEx tissue project (e.g., BREAST, LUNG)
+  feature_set: "PC"           # "PC" = protein-coding
+
+  # IO
+  out_root: "results/derived/GTEx"
+
+  # Protected GTEx age metadata (optional but recommended)
+  gtex_age_tsv: "/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/data/GTEx/GTEx_Analysis_2022-06-06_v10_Annotations_SubjectPhenotypesDS.txt"
+
+
+  # Optional: subtype annotation table (BRCA: PAM50)
+  harmonized_metadata_rds: "/restricted/projectnb/agedisease/CBMrepositoryData/TCGA-GDC/metadata/data/harmonized_metadata.rds"
+  subtype_field: "subtype_selected"   # column in harmonized_metadata (if present)
+  subtype_label: "Subtype_Selected"              # name used in this pipeline; NA if unavailable
+
+  # Optional: TP53 mutation status (cBioPortal table; Sample.ID column expected)
+  tp53_cbioportal_tsv: "/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/manuscript_analyses/data/metadata/cBioPortal_TP53-BRCA_table.tsv"
+
+  # TCGA sample-type handling
+  tcga_tumor_types:
+    - "Primary Tumor"
+  tcga_normal_types:
+    - "Solid Tissue Normal"
+  min_nat: 10                 # if < min_nat normals, downstream scripts will skip NAT plots/models
+
+  # GTEx sex filter (optional): set to [2] for female-only, [1] for male-only, or null for no filter
+  gtex_sex_keep: null
+
+  # Reproducibility
+  seed: 2026
+  verbose: true
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+## Overview
+
+This step:
+
+1. pulls GTEx tissue + TCGA project from **recount3**
+2. normalizes to **logCPM**
+3. collapses to **gene symbols** (protein-coding only; mean across duplicate symbols)
+4. runs **Hallmark ssGSEA** once on the combined matrix (GTEx + NAT + PT), then splits back
+5. saves clean objects for downstream scripts (clock training + delta-age analyses)
+
+
+## Libraries
+
+```{r}
+suppressPackageStartupMessages({
+  library(recount3)
+  library(edgeR)
+  library(SummarizedExperiment)
+  library(dplyr)
+  library(stringr)
+  library(tibble)
+  library(purrr)
+  library(GSVA)
+  library(msigdbr)
+  library(ggplot2)
+  library(here)
+})
+```
+
+## Helper functions
+
+```{r}
+reactable_pretty <- function(df) {
+  if (!requireNamespace("reactable", quietly = TRUE)) return(df)
+  reactable::reactable(df, searchable = TRUE, resizable = TRUE)
+}
+
+# Collapse recount3 RSE rows → SYMBOL-level matrix (mean across duplicates)
+sym_from_rse <- function(rse, protein_coding_only = TRUE, drop_par_y = TRUE, verbose = TRUE) {
+  stopifnot("logCPM" %in% assayNames(rse))
+  rd  <- as.data.frame(rowData(rse))
+  mat <- assay(rse, "logCPM")
+
+  keep <- !is.na(rd$gene_name) & rd$gene_name != ""
+
+  if (protein_coding_only) {
+    if (!"gene_type" %in% names(rd)) stop("rowData(rse)$gene_type missing; cannot filter to protein_coding.")
+    keep <- keep & rd$gene_type == "protein_coding"
+  }
+
+  if (drop_par_y && "gene_id" %in% names(rd)) {
+    keep <- keep & !grepl("_PAR_Y$", rd$gene_id)
+  }
+
+  mat_keep <- mat[keep, , drop = FALSE]
+  syms     <- rd$gene_name[keep]
+
+  mat_sum   <- rowsum(mat_keep, syms)
+  dup_count <- table(syms)[rownames(mat_sum)]
+  out       <- mat_sum / as.numeric(dup_count)
+
+  if (isTRUE(verbose)) {
+    message("sym_from_rse: kept rows=", sum(keep),
+            " | unique SYMBOLs=", nrow(out),
+            " | protein_coding_only=", protein_coding_only,
+            " | drop_par_y=", drop_par_y)
+  }
+
+  out
+}
+
+# Hallmark gene sets with readable names (50 pathways)
+get_hallmark_sets <- function() {
+  hall_raw <- msigdbr(species = "Homo sapiens", category = "H")
+
+  nice <- function(x) {
+    x %>%
+      str_remove("^HALLMARK_") %>%
+      str_replace_all("_", " ") %>%
+      str_to_title()
+  }
+
+  split(hall_raw$gene_symbol, nice(hall_raw$gs_name))
+}
+
+# ssGSEA wrapper (GSVA >= 1.50 uses Param objects)
+run_ssgsea <- function(expr_mat, gene_sets) {
+  param <- ssgseaParam(
+    exprData  = expr_mat,   # genes × samples
+    geneSets  = gene_sets,
+    minSize   = 1,
+    maxSize   = Inf,
+    alpha     = 0.25,
+    normalize = FALSE       # avoid dataset-dependent scaling
+  )
+  gsva(param, verbose = FALSE)
+}
+```
+
+## Load GTEx tissue + TCGA project from recount3
+```{r}
+analysis_id <- paste0(params$tcga_project, "__", params$gtex_project)
+
+out_root_abs <- here::here(params$out_root)
+proc_dir     <- file.path(out_root_abs, analysis_id)
+
+dir.create(proc_dir, recursive = TRUE, showWarnings = FALSE)
+
+msg <- function(...) if (isTRUE(params$verbose)) message(...)
+suffix <- paste0("-", params$feature_set)
+
+msg("out_root (abs) = ", out_root_abs)
+msg("proc_dir      = ", proc_dir)
+```
+
+```{r}
+set.seed(params$seed)
+
+human_projects <- available_projects()
+
+# GTEx tissue
+gtex_info <- human_projects %>%
+  dplyr::filter(project_type == "data_sources", project == params$gtex_project)
+
+if (nrow(gtex_info) == 0) {
+  stop("Could not find GTEx project '", params$gtex_project, "' in recount3::available_projects().")
+}
+
+# TCGA cancer
+tcga_info <- human_projects %>%
+  dplyr::filter(project_type == "data_sources", project == params$tcga_project)
+
+if (nrow(tcga_info) == 0) {
+  stop("Could not find TCGA project '", params$tcga_project, "' in recount3::available_projects().")
+}
+
+msg("Creating RSEs (this may download data on first run)...")
+rse_gene_gtex <- create_rse(gtex_info)
+rse_gene_tcga <- create_rse(tcga_info)
+```
+
+
+### Drop HPV+ samples (HNSC only)
+```{r}
+# ---- HNSC only: drop HPV+ using harmonized_metadata.rds ----
+if (identical(params$tcga_project, "HNSC")) {
+
+  if (is.null(params$harmonized_metadata_rds) || !file.exists(params$harmonized_metadata_rds)) {
+    stop("HNSC HPV filtering requested but harmonized_metadata_rds not found: ", params$harmonized_metadata_rds)
+  }
+
+  cd <- as.data.frame(colData(rse_gene_tcga))
+  if (!"tcga.tcga_barcode" %in% colnames(cd)) {
+    stop("tcga.tcga_barcode missing from recount3 colData; cannot apply HPV filter for HNSC.")
+  }
+
+  meta_full <- readRDS(params$harmonized_metadata_rds)
+  req <- c("project", "submitter_id", "HPV.status")
+  if (!all(req %in% colnames(meta_full))) {
+    stop("harmonized_metadata.rds missing required columns: ", paste(setdiff(req, colnames(meta_full)), collapse = ", "))
+  }
+
+  meta_hnsc <- meta_full %>%
+    dplyr::filter(project == "TCGA-HNSC") %>%
+    dplyr::mutate(patient12 = substr(submitter_id, 1, 12)) %>%
+    dplyr::select(patient12, HPV.status)
+
+  hpv_map <- setNames(as.character(meta_hnsc$HPV.status), meta_hnsc$patient12)
+
+  patient12 <- substr(cd$tcga.tcga_barcode, 1, 12)
+  hpv <- toupper(trimws(as.character(hpv_map[patient12])))
+
+  # keep everything except HPV+ (unknown/NA are kept)
+  keep <- !(hpv %in% c("POSITIVE", "HPV+", "HPV POSITIVE"))
+
+  cat("HNSC HPV filter: dropping ", sum(!keep, na.rm = TRUE),
+      " HPV+ samples; keeping ", sum(keep, na.rm = TRUE), "/", length(keep))
+
+  rse_gene_tcga <- rse_gene_tcga[, keep]
+}
+```
+
+## Normalize counts → logCPM
+
+```{r}
+assay(rse_gene_gtex, "counts") <- transform_counts(rse_gene_gtex)
+assay(rse_gene_tcga, "counts") <- transform_counts(rse_gene_tcga)
+
+dge_gtex <- edgeR::DGEList(counts = assay(rse_gene_gtex, "counts"))
+dge_gtex <- edgeR::calcNormFactors(dge_gtex, method = "TMM")
+assay(rse_gene_gtex, "logCPM") <-
+  edgeR::cpm(dge_gtex, log = TRUE, prior.count = 1)
+
+dge_tcga <- edgeR::DGEList(counts = assay(rse_gene_tcga, "counts"))
+dge_tcga <- edgeR::calcNormFactors(dge_tcga, method = "TMM")
+assay(rse_gene_tcga, "logCPM") <-
+  edgeR::cpm(dge_tcga, log = TRUE, prior.count = 1)
+
+```
+
+## Add ages
+
+### GTEx ages (protected file)
+
+```{r}
+# ---- GTEx ages (protected, numeric; v10) ----
+if (!is.null(params$gtex_age_tsv) && file.exists(params$gtex_age_tsv)) {
+
+  age_specific <- read.delim(
+    params$gtex_age_tsv,
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
+
+  if (!all(c("SUBJID", "AGE") %in% colnames(age_specific))) {
+    stop("GTEx age file must contain SUBJID and AGE columns.")
+  }
+
+  age_years <- age_specific$AGE[
+    match(colData(rse_gene_gtex)$gtex.subjid, age_specific$SUBJID)
+  ]
+
+  colData(rse_gene_gtex)$age_years <- as.numeric(age_years)
+
+  msg(
+    "Attached GTEx ages: non-missing = ",
+    sum(!is.na(colData(rse_gene_gtex)$age_years)),
+    "/",
+    ncol(rse_gene_gtex)
+  )
+
+} else {
+  stop("GTEx age file not found; cannot train GTEx clock.")
+}
+
+```
+
+### TCGA ages (from recount3 colData)
+
+```{r}
+cd_tcga <- as.data.frame(colData(rse_gene_tcga))
+if ("tcga.cgc_case_age_at_diagnosis" %in% colnames(cd_tcga)) {
+  colData(rse_gene_tcga)$age_years <- suppressWarnings(as.numeric(cd_tcga$tcga.cgc_case_age_at_diagnosis))
+  msg("Attached TCGA ages: non-missing = ", sum(!is.na(colData(rse_gene_tcga)$age_years)),
+      "/", ncol(rse_gene_tcga))
+} else {
+  warning("tcga.cgc_case_age_at_diagnosis not found; TCGA ages will be NA.")
+  colData(rse_gene_tcga)$age_years <- NA_real_
+}
+```
+
+## Optional GTEx sex filter
+
+```{r}
+if (!is.null(params$gtex_sex_keep)) {
+  sex_keep <- unlist(params$gtex_sex_keep)
+  cd <- as.data.frame(colData(rse_gene_gtex))
+  if (!"gtex.sex" %in% colnames(cd)) {
+    warning("gtex.sex not found; cannot apply sex filter.")
+  } else {
+    keep <- cd$gtex.sex %in% sex_keep
+    msg("Applying GTEx sex filter: keeping ", sum(keep), "/", length(keep), " samples.")
+    rse_gene_gtex <- rse_gene_gtex[, keep]
+  }
+}
+```
+
+## Split TCGA into NAT and primary tumor
+
+```{r}
+cd_tcga <- as.data.frame(colData(rse_gene_tcga))
+
+# recount3 TCGA sample type column (known-good)
+if (!"tcga.cgc_sample_sample_type" %in% colnames(cd_tcga)) {
+  stop("tcga.cgc_sample_sample_type missing from TCGA colData; cannot split PT vs NAT.")
+}
+
+samptype <- cd_tcga$tcga.cgc_sample_sample_type
+
+tum_types <- unlist(params$tcga_tumor_types)
+nat_types <- unlist(params$tcga_normal_types)
+
+tum_keep <- samptype %in% tum_types
+nat_keep <- samptype %in% nat_types
+
+rse_pt_tcga <- rse_gene_gtex[, FALSE]  # placeholder to keep structure
+rse_nt_tcga <- rse_gene_gtex[, FALSE]
+
+rse_pt_tcga <- rse_gene_tcga[, tum_keep]
+rse_nt_tcga <- rse_gene_tcga[, nat_keep]
+
+msg("TCGA split: PT n=", ncol(rse_pt_tcga), " | NAT n=", ncol(rse_nt_tcga))
+msg("NAT sufficient? (min_nat=", params$min_nat, ") -> ", ncol(rse_nt_tcga) >= params$min_nat)
+
+```
+
+## Optional annotations
+
+### Subtype (e.g., BRCA PAM50) from harmonized_metadata.rds
+
+```{r}
+# Default: fill with NA (only if there are samples)
+if (ncol(rse_pt_tcga) > 0) {
+  colData(rse_pt_tcga)[[params$subtype_label]] <- rep(NA_character_, ncol(rse_pt_tcga))
+}
+if (ncol(rse_nt_tcga) > 0) {
+  colData(rse_nt_tcga)[[params$subtype_label]] <- rep(NA_character_, ncol(rse_nt_tcga))
+}
+
+if (!is.null(params$harmonized_metadata_rds) &&
+    file.exists(params$harmonized_metadata_rds) &&
+    !is.null(params$subtype_field)) {
+
+  meta_full <- readRDS(params$harmonized_metadata_rds)
+  tcga_proj_full <- paste0("TCGA-", params$tcga_project)
+
+  if ("project" %in% colnames(meta_full) && "submitter_id" %in% colnames(meta_full) &&
+      params$subtype_field %in% colnames(meta_full)) {
+
+    meta_tcga <- meta_full %>%
+      dplyr::filter(project == tcga_proj_full) %>%
+      dplyr::mutate(patient12 = substr(submitter_id, 1, 12))
+
+    # map by patient barcode (12 chars) from recount3 colData
+    map_subtype <- setNames(meta_tcga[[params$subtype_field]], meta_tcga$patient12)
+
+    # clean labels like "BRCA.LumA" → "LumA" (generic: drop leading "XXXX.")
+    clean_subtype <- function(x) {
+      x <- as.character(x)
+      x <- sub(paste0("^", params$tcga_project, "\\."), "", x)
+      x <- sub("^.+\\.", "", x)
+      x
+    }
+
+    get_patient12 <- function(rse) {
+      cd <- as.data.frame(colData(rse))
+      if ("tcga.tcga_barcode" %in% colnames(cd)) substr(cd$tcga.tcga_barcode, 1, 12) else NA_character_
+    }
+
+    pt_pat <- get_patient12(rse_pt_tcga)
+    nt_pat <- get_patient12(rse_nt_tcga)
+
+    colData(rse_pt_tcga)[[params$subtype_label]] <- clean_subtype(map_subtype[pt_pat])
+    colData(rse_nt_tcga)[[params$subtype_label]] <- clean_subtype(map_subtype[nt_pat])
+
+    msg("Subtype attach: PT non-NA=", sum(!is.na(colData(rse_pt_tcga)[[params$subtype_label]])),
+        " | NAT non-NA=", sum(!is.na(colData(rse_nt_tcga)[[params$subtype_label]])))
+  } else {
+    warning("harmonized_metadata.rds missing required columns; skipping subtype attach.")
+  }
+} else {
+  msg("Subtype attach skipped (file not found or params unset).")
+}
+```
+
+### TP53 mutation (optional)
+
+```{r}
+# Default: NA
+if (ncol(rse_pt_tcga) > 0) colData(rse_pt_tcga)$TP53 <- rep(NA_character_, ncol(rse_pt_tcga))
+if (ncol(rse_nt_tcga) > 0) colData(rse_nt_tcga)$TP53 <- rep(NA_character_, ncol(rse_nt_tcga))
+
+if (!is.null(params$tp53_cbioportal_tsv) && file.exists(params$tp53_cbioportal_tsv)) {
+  tp53_tab <- read.delim(params$tp53_cbioportal_tsv)
+
+  req_cols <- c("Sample.ID", "Mutation.Type")
+  if (!all(req_cols %in% colnames(tp53_tab))) {
+    warning("TP53 cBioPortal TSV missing required columns (need: Sample.ID, Mutation.Type); skipping TP53 status attach.")
+  } else {
+
+    # Define "Mut" consistently (as in the known-good version)
+    keep_mt <- tp53_tab$Mutation.Type %in% c(
+      "Missense_Mutation", "Nonsense_Mutation",
+      "Frame_Shift_Del", "Frame_Shift_Ins",
+      "Splice_Site", "Splice_Region",
+      "In_Frame_Del", "In_Frame_Ins"
+    )
+
+    mut_bar <- substr(tp53_tab$Sample.ID[keep_mt], 1, 12)
+    mut_bar <- unique(mut_bar[!is.na(mut_bar)])
+
+    # Map TCGA UUID colnames -> barcode12 (from colData), then invert to barcode12 -> UUID
+    cd_pt <- as.data.frame(colData(rse_pt_tcga))
+    if (!"tcga.tcga_barcode" %in% colnames(cd_pt)) {
+      warning("tcga.tcga_barcode missing from rse_pt_tcga colData; cannot map TP53 calls; skipping.")
+    } else {
+      uuid2bar <- setNames(substr(cd_pt$tcga.tcga_barcode, 1, 12), colnames(rse_pt_tcga))
+      uuid2bar <- uuid2bar[!is.na(uuid2bar) & uuid2bar != ""]
+
+      bar2uuid <- setNames(names(uuid2bar), uuid2bar)
+
+      uuid_mut <- bar2uuid[mut_bar]
+      uuid_mut <- unique(uuid_mut[!is.na(uuid_mut)])
+
+      tp53_status <- function(uids, mut_uids) {
+        v <- rep("WT", length(uids)); names(v) <- uids
+        v[uids %in% mut_uids] <- "Mut"
+        v
+      }
+
+      # Attach to PT and NAT by UUID (NAT typically WT, but this keeps the behavior consistent)
+      colData(rse_pt_tcga)$TP53 <- tp53_status(colnames(rse_pt_tcga), uuid_mut)
+      colData(rse_nt_tcga)$TP53 <- tp53_status(colnames(rse_nt_tcga), uuid_mut)
+
+      msg("TP53 attach: PT Mut=", sum(colData(rse_pt_tcga)$TP53 == "Mut", na.rm = TRUE),
+          " | NAT Mut=", sum(colData(rse_nt_tcga)$TP53 == "Mut", na.rm = TRUE))
+    }
+  }
+} else {
+  msg("TP53 attach skipped (file not found).")
+}
+
+```
+
+## Build symbol-level logCPM matrices (protein-coding) and harmonize gene universe
+
+```{r}
+logcpm_gtex_sym <- sym_from_rse(rse_gene_gtex, protein_coding_only = TRUE, drop_par_y = TRUE, verbose = params$verbose)
+logcpm_pt_sym   <- sym_from_rse(rse_pt_tcga,   protein_coding_only = TRUE, drop_par_y = TRUE, verbose = params$verbose)
+logcpm_nt_sym   <- sym_from_rse(rse_nt_tcga,   protein_coding_only = TRUE, drop_par_y = TRUE, verbose = params$verbose)
+
+universe_pc <- Reduce(intersect, list(
+  rownames(logcpm_gtex_sym),
+  rownames(logcpm_pt_sym),
+  rownames(logcpm_nt_sym)
+))
+if (length(universe_pc) == 0) stop("No shared gene universe across GTEx/PT/NAT.")
+
+logcpm_gtex_sym <- logcpm_gtex_sym[universe_pc, , drop = FALSE]
+logcpm_pt_sym   <- logcpm_pt_sym  [universe_pc, , drop = FALSE]
+logcpm_nt_sym   <- logcpm_nt_sym  [universe_pc, , drop = FALSE]
+
+stopifnot(identical(rownames(logcpm_gtex_sym), rownames(logcpm_pt_sym)))
+stopifnot(identical(rownames(logcpm_gtex_sym), rownames(logcpm_nt_sym)))
+
+msg("Gene universe (protein-coding SYMBOLs): ", length(universe_pc))
+```
+
+## Hallmark ssGSEA (run once on combined matrix)
+
+```{r}
+hall_sets <- get_hallmark_sets()
+
+expr_all <- cbind(logcpm_gtex_sym, logcpm_nt_sym, logcpm_pt_sym)
+
+scores_all <- run_ssgsea(expr_all, hall_sets)
+
+n_gtex <- ncol(logcpm_gtex_sym)
+n_nt   <- ncol(logcpm_nt_sym)
+
+# GTEx always exists
+scores_gtex <- scores_all[, seq_len(n_gtex), drop = FALSE]
+
+# NAT: only if present
+if (n_nt > 0) {
+  scores_nt <- scores_all[, seq.int(n_gtex + 1, n_gtex + n_nt), drop = FALSE]
+} else {
+  scores_nt <- scores_all[, 0, drop = FALSE]
+  colnames(scores_nt) <- colnames(logcpm_nt_sym)
+}
+
+# PT: whatever remains
+scores_pt <- scores_all[, -(seq_len(n_gtex + n_nt)), drop = FALSE]
+
+
+stopifnot(identical(colnames(scores_gtex), colnames(logcpm_gtex_sym)))
+stopifnot(identical(colnames(scores_nt),   colnames(logcpm_nt_sym)))
+stopifnot(identical(colnames(scores_pt),   colnames(logcpm_pt_sym)))
+
+msg("ssGSEA dims: all=", paste(dim(scores_all), collapse="×"),
+    " | gtex=", paste(dim(scores_gtex), collapse="×"),
+    " | nat=", paste(dim(scores_nt), collapse="×"),
+    " | pt=", paste(dim(scores_pt), collapse="×"))
+```
+
+## Minimal QC summary
+
+```{r}
+qc_tbl <- tibble(
+  cohort = c("GTEx", "TCGA-AN", "TCGA-PT"),
+  n      = c(ncol(scores_gtex), ncol(scores_nt), ncol(scores_pt)),
+  age_nonmissing = c(
+    sum(!is.na(colData(rse_gene_gtex)$age_years)),
+    sum(!is.na(colData(rse_nt_tcga)$age_years)),
+    sum(!is.na(colData(rse_pt_tcga)$age_years))
+  )
+)
+reactable_pretty(qc_tbl)
+
+# Optional: age distribution quick plot (skips cohorts with all-NA ages)
+age_df <- bind_rows(
+  tibble(cohort = "GTEx",   age = colData(rse_gene_gtex)$age_years),
+  tibble(cohort = "TCGA-AN",age = colData(rse_nt_tcga)$age_years),
+  tibble(cohort = "TCGA-PT",age = colData(rse_pt_tcga)$age_years)
+) %>% filter(!is.na(age))
+
+if (nrow(age_df) > 0) {
+  ggplot(age_df, aes(x = age, fill = cohort)) +
+    geom_histogram(bins = 30, alpha = 0.6, position = "identity") +
+    facet_wrap(~ cohort, nrow = 1, scales = "free_y") +
+    theme_minimal(base_size = 12) +
+    labs(title = paste0("Age distributions: ", analysis_id),
+         x = "Chronological age (years)", y = "Count")
+}
+```
+
+## Build and save metadata
+
+```{r}
+meta_gtex <- as.data.frame(colData(rse_gene_gtex)) %>%
+  tibble::rownames_to_column("sample_id") %>%
+  mutate(cohort = "GTEx")
+
+meta_nt <- as.data.frame(colData(rse_nt_tcga)) %>%
+  tibble::rownames_to_column("sample_id") %>%
+  mutate(cohort = "TCGA-AN")
+
+meta_pt <- as.data.frame(colData(rse_pt_tcga)) %>%
+  tibble::rownames_to_column("sample_id") %>%
+  mutate(cohort = "TCGA-PT")
+
+metadata <- bind_rows(meta_gtex, meta_nt, meta_pt) %>%
+  as.data.frame()
+
+rownames(metadata) <- metadata$sample_id
+
+# sanity: metadata rows align to score cols
+stopifnot(all(colnames(scores_gtex) %in% rownames(metadata)))
+stopifnot(all(colnames(scores_pt)   %in% rownames(metadata)))
+stopifnot(all(colnames(scores_nt)   %in% rownames(metadata)))
+
+# GTEx scalers for optional downstream z-scoring (uses GTEx only)
+gtex_scalers <- data.frame(
+  pathway = colnames(t(scores_gtex)),
+  mu  = colMeans(t(scores_gtex), na.rm = TRUE),
+  sd  = apply(t(scores_gtex), 2, sd, na.rm = TRUE),
+  row.names = NULL
+)
+```
+
+## Save results
+
+```{r}
+saveRDS(logcpm_gtex_sym, file = file.path(proc_dir, paste0("logcpm_gtex_sym", suffix, ".rds")))
+saveRDS(logcpm_nt_sym,   file = file.path(proc_dir, paste0("logcpm_nt_sym",   suffix, ".rds")))
+saveRDS(logcpm_pt_sym,   file = file.path(proc_dir, paste0("logcpm_pt_sym",   suffix, ".rds")))
+
+saveRDS(scores_all,  file = file.path(proc_dir, paste0("ssgsea_scores_all",  suffix, ".rds")))
+saveRDS(scores_gtex, file = file.path(proc_dir, paste0("ssgsea_scores_gtex", suffix, ".rds")))
+saveRDS(scores_nt,   file = file.path(proc_dir, paste0("ssgsea_scores_nt",   suffix, ".rds")))
+saveRDS(scores_pt,   file = file.path(proc_dir, paste0("ssgsea_scores_pt",   suffix, ".rds")))
+
+saveRDS(metadata,     file = file.path(proc_dir, "sample_metadata.rds"))
+saveRDS(gtex_scalers, file = file.path(proc_dir, paste0("gtex_scalers", suffix, ".rds")))
+
+msg("Saved outputs to: ", proc_dir)
+```
+
+## Session info
+
+```{r}
+sessionInfo()
+```

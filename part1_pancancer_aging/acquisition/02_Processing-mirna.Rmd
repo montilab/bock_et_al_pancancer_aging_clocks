@@ -1,0 +1,228 @@
+---
+title: "Processing miRNA SummarizedExperiment Objects"
+subtitle: "TCGA PanCancer Aging"
+author: "Payton Bock - Monti Lab"
+date:   "`r format(Sys.Date(), '%B %d, %Y')`"
+params: 
+  dummy: "dummy"
+output:
+  html_document:
+    theme: united
+    code_folding: hide
+    css: style.css
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+
+```{r, include = FALSE}
+.libPaths("/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/r-library/")
+
+library(dplyr)
+library(SummarizedExperiment)
+library(ggplot2)
+library(reactable)
+library(S4Vectors)
+library(edgeR)      # For filtering functions
+
+#get environmental variables
+PATH <- file.path( Sys.getenv("PCANAGE","/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/")) 
+TCGA <- file.path( Sys.getenv("CBMDATA","/restricted/projectnb/agedisease/CBMrepositoryData/TCGA-GDC"), "TCGA-GDC")
+```
+
+## Script Summary 
+- Loads harmonized meta data RDS file
+
+- Adds meta data to all SummarizedExperiment objects for the miRNA omics layer
+
+- Remove lowly expressed miRNA, and save both the filtered and unfiltered miRNA SE objects
+
+
+## Path Setting
+Load in metadata RDS object and define directory with SummarizedExperiment objects
+```{r data loading}
+#Where the meta data RDS file is
+metadata <- readRDS(file.path(TCGA,"metadata/data/harmonized_metadata.rds"))
+
+#Path where the summarized experiment objects you are updating are located
+se_directory <- file.path(TCGA,"miR/raw_data/raw_SE/")
+
+#Path to directory you want to output to
+output_directory_all <- file.path(TCGA,"miR/processed_data/all/") 
+output_directory_filtered <- file.path(TCGA,"miR/processed_data/filtered/") 
+```
+
+
+## Filtering Lowly Expressed miRNA
+Here we filter out miRNA with low expression using the `filterByExpr()` function. 
+
+From: https://rdrr.io/bioc/edgeR/man/filterByExpr.html on `filterByExpr()`    
+This function implements the filtering strategy that was intuitively described by Chen et al (2016). Roughly speaking, the strategy keeps genes that have at least min.count reads in a worthwhile number samples. More precisely, the filtering keeps genes that have count-per-million (CPM) above k in n samples, where k is determined by min.count and by the sample library sizes and n is determined by the design matrix.
+
+n is essentially the smallest group sample size or, more generally, the minimum inverse leverage of any fitted value. If all the group sizes are larger than large.n, then this is relaxed slightly, but with n always greater than min.prop of the smallest group size (70% by default).
+
+In addition, each kept gene is required to have at least min.total.count reads across all the samples.
+
+Defaults:  min.count = 10, min.total.count = 15, large.n = 10, min.prop = 0.7
+Used Values:  min.prop = 0.2, min.count = 5
+```{r}
+# Function to filter lowly expressed miRNAs using edgeR's filterByExpr()
+filter_lowly_expressed <- function(se, min_count = 5, min_prop = 0.2) {
+  # Extract raw counts
+  raw_counts <- assay(se, "raw_counts")
+  
+  # Create a DGEList object
+  dge <- DGEList(counts = raw_counts)
+  
+  # Define the filtering parameters
+  # min.count: Minimum count threshold
+  # min.prop: Minimum proportion of samples expressing the miRNA
+  keep <- filterByExpr(dge, min.count = min_count, min.prop = min_prop)
+  
+  # Filter the SummarizedExperiment object
+  se_filtered <- se[keep, ]
+  
+  # Return the filtered SummarizedExperiment object
+  return(se_filtered)
+}
+
+```
+
+## Process all Summarized Experiment Objects in folder
+
+Here we loop through all SummarizedExperiment RDS files and add the harmonized meta data to the SummarizedObject (which is then saved). 
+
+Unlike other layers, `TCGAbiolinks` does not provide ANY meta data for the miRNA layer. In the data download script, we extracted and set the names of the samples to the 12 symbol sample ID - matching the format of other layers. 
+
+```{r Add Meta Data to Folder of Summarized Experiments}
+# List all .rds files in the SummarizedExperiment directory
+file_list <- list.files(path = se_directory, pattern = "*.rds$", full.names = TRUE)
+
+# Initialize a list to store filtering summary
+filter_summary <- list()
+
+# Loop through each file
+for(file in file_list) {
+  
+  cat("Processing file:", basename(file), "\n")
+  
+  # Read the SummarizedExperiment object
+  se <- readRDS(file)
+  
+  # Determine samples present in both the SE object and metadata
+  samples_to_keep <- intersect(colnames(se), rownames(metadata))
+  
+  if(length(samples_to_keep) == 0){
+    warning(paste("No overlapping samples found for file:", basename(file)))
+    next
+  }
+  
+  # Subset the SummarizedExperiment to keep only overlapping samples
+  se_subset <- se[, samples_to_keep]
+  
+  # Extract project-specific metadata
+  project_specific_metadata <- metadata[samples_to_keep, ]
+  
+  # Ensure metadata is a DataFrame object
+  project_specific_metadata <- DataFrame(project_specific_metadata)
+  
+  # Check if the order of samples matches between SE and metadata
+  if(!all(colnames(se_subset) == rownames(project_specific_metadata))){
+    stop(paste("Mismatch between sample names and metadata for file:", basename(file)))
+  }
+  
+  # Add metadata as colData
+  colData(se_subset) <- project_specific_metadata
+  
+  # ===========================
+  # Save Unfiltered SummarizedExperiment
+  # ===========================
+  
+  # Define output path for unfiltered data
+  output_all <- file.path(output_directory_all, basename(file))
+  
+  # Save the unfiltered SE object with metadata
+  saveRDS(se_subset, file = output_all)
+  
+  cat("Saved unfiltered data to:", output_all, "\n")
+  
+  # =============================
+  # Filter Lowly Expressed miRNAs
+  # =============================
+  
+  # Apply the filtering function
+  se_filtered <- filter_lowly_expressed(se_subset, min_count = 5, min_prop = 0.2)
+  
+  # Report the number of miRNAs filtered out
+  num_filtered_out <- nrow(se_subset) - nrow(se_filtered)
+  cat("Filtered out", num_filtered_out, "lowly expressed miRNAs. Remaining:", nrow(se_filtered), "\n")
+  
+  # =============================
+  # Save Filtered SummarizedExperiment
+  # =============================
+  
+  # Define output path for filtered data
+  output_filtered <- file.path(output_directory_filtered, basename(file))
+  
+  # Save the filtered SE object with metadata
+  saveRDS(se_filtered, file = output_filtered)
+  
+  cat("Saved filtered data to:", output_filtered, "\n\n")
+  
+  # =============================
+  # Track Filtering Summary
+  # =============================
+  
+  # Extract cancer type from filename
+  # Assumption: Filename format is "TCGA-XXXX_miRNA.rds" where XXXX is the cancer type
+  # Modify the regex pattern if your filenames have a different structure
+  cancer_type <- sub("_miRNA\\.rds$", "", basename(file))
+  
+  # Append the summary to the filter_summary list
+  filter_summary[[length(filter_summary) + 1]] <- list(
+    Cancer_Type = cancer_type,
+    miRNAs_Filtered_Out = num_filtered_out,
+    miRNAs_Retained = nrow(se_filtered)
+  )
+}
+
+# ===========================
+# Create and Display Reactable Summary
+# ===========================
+
+# Convert the filter_summary list to a data frame
+filter_summary_df <- bind_rows(filter_summary)
+
+# Calculate additional metrics (optional)
+filter_summary_df <- filter_summary_df %>%
+  mutate(
+    Total_miRNAs = miRNAs_Filtered_Out + miRNAs_Retained,
+    Percentage_Filtered_Out = round((miRNAs_Filtered_Out / Total_miRNAs) * 100, 2)
+  )
+
+# Display the summary table using reactable
+reactable(
+  filter_summary_df,
+  columns = list(
+    Cancer_Type = colDef(name = "Cancer Type"),
+    miRNAs_Filtered_Out = colDef(name = "miRNAs Filtered Out"),
+    miRNAs_Retained = colDef(name = "miRNAs Retained"),
+    Total_miRNAs = colDef(name = "Total miRNAs"),
+    Percentage_Filtered_Out = colDef(name = "Percentage Filtered Out (%)")
+  ),
+  searchable = TRUE,
+  resizable  = TRUE
+)
+
+```
+
+
+## Session Info
+```{r}
+sessionInfo()
+```
+

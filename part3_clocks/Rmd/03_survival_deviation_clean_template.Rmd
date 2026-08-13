@@ -1,0 +1,338 @@
+---
+title: "03 — Tumor Deviation downstream: survival (OS + PFI)"
+author: "Pan-can aging pipeline"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: united
+    code_folding: hide
+    toc: true
+    toc_float: true
+params:
+  # Must match upstream pipeline (Steps 01–04)
+  tcga_project: "BRCA"
+  gtex_project: "BREAST"
+  feature_set: "PC"
+
+  # IO
+  out_root: "results/derived/GTEx"
+
+  # Integrated clinical file (TCGA-CDR style)
+  clinical_csv: "/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/manuscript_analyses/data/survival/2018_TCGA-IntegratedClinical.csv"
+
+  # Minimum requirements
+  min_events: 10
+  verbose: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+## Purpose
+
+Per-cancer Cox survival analysis of age-matched **Deviation**
+(GTEx-anchored, in years) against OS and PFI endpoints from the
+TCGA integrated clinical file (CDR-like). Deviation is loaded
+directly from the saved ClockSHAP object (Step 04 output), not
+recomputed.
+
+Outputs a single per-cancer RDS at:
+
+  `<proc_dir>/survival_deviation_results-<feature_set>.rds`
+
+containing both endpoints' Cox results in a tidy table format
+suitable for downstream cross-cancer aggregation.
+
+## Load inputs
+
+```{r}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(purrr)
+  library(ggplot2)
+  library(stringr)
+  library(survival)
+  library(broom)
+  library(scales)
+})
+```
+
+```{r}
+reactable_pretty <- function(df, digits = 3) {
+  if (!requireNamespace("reactable", quietly = TRUE)) return(df)
+  df2 <- df %>% mutate(across(where(is.numeric), ~ signif(., digits)))
+  reactable::reactable(
+    df2,
+    searchable = TRUE,
+    resizable  = TRUE,
+    striped    = TRUE,
+    highlight  = TRUE,
+    defaultPageSize = 10
+  )
+}
+```
+
+```{r}
+analysis_id <- paste0(params$tcga_project, "__", params$gtex_project)
+proc_dir <- file.path(here::here(params$out_root), analysis_id)
+suffix   <- paste0("-", params$feature_set)
+
+msg <- function(...) if (isTRUE(params$verbose)) message(...)
+msg("proc_dir = ", proc_dir)
+```
+
+## Load Deviation from saved ClockSHAP object
+
+```{r}
+clockshap_path <- file.path(proc_dir, paste0("clockshap_objects", suffix, ".rds"))
+metadata_path  <- file.path(proc_dir, "sample_metadata.rds")
+
+stopifnot(file.exists(clockshap_path))
+stopifnot(file.exists(metadata_path))
+
+cs       <- readRDS(clockshap_path)
+metadata <- readRDS(metadata_path)
+
+stopifnot(!is.null(cs$pt))
+stopifnot(!is.null(cs$pt$deviation))
+stopifnot(!is.null(cs$pt$age))
+
+# Sanity check: ClockSHAP invariant phi-row-sums == deviation
+phi_row_sums <- rowSums(cs$pt$phi)
+max_abs_err  <- max(abs(phi_row_sums - cs$pt$deviation), na.rm = TRUE)
+msg("ClockSHAP invariant max |sum(phi) - deviation|: ", signif(max_abs_err, 3))
+
+# Build the per-tumor deviation table
+dev_df <- tibble::tibble(
+  sample_id = rownames(cs$pt$phi),
+  age_years = as.numeric(cs$pt$age),
+  Deviation = as.numeric(cs$pt$deviation)
+) %>%
+  filter(is.finite(age_years), is.finite(Deviation))
+
+msg("Tumor samples with deviation: ", nrow(dev_df))
+```
+
+## Helpers
+
+```{r}
+`%||%` <- function(x, y) if (is.null(x)) y else x
+
+# 12-char patient barcode lookup from metadata
+get_patient12 <- function(sample_ids, metadata) {
+  if ("tcga.tcga_barcode" %in% colnames(metadata)) {
+    out <- substr(as.character(metadata[sample_ids, "tcga.tcga_barcode"]), 1, 12)
+    out[out == "" | is.na(out)] <- NA_character_
+    return(out)
+  }
+  if ("tcga.cgc_case_id" %in% colnames(metadata)) {
+    x <- as.character(metadata[sample_ids, "tcga.cgc_case_id"])
+    out <- substr(x, 1, 12)
+    out[out == "" | is.na(out)] <- NA_character_
+    return(out)
+  }
+  # Fall back to sample_id if it looks like a TCGA barcode
+  out <- ifelse(grepl("^TCGA-", sample_ids), substr(sample_ids, 1, 12), NA_character_)
+  out[out == "" | is.na(out)] <- NA_character_
+  out
+}
+
+# Endpoint column discovery for TCGA IntegratedClinical.csv (CDR-like)
+pick_surv_cols <- function(cdr, endpoint = c("OS", "PFI")) {
+  endpoint <- match.arg(endpoint)
+  if (endpoint == "OS") {
+    time_candidates  <- c("OS.time", "OS_time", "OS.time.days", "OS_days", "OS_time_days")
+    event_candidates <- c("OS", "OS_event", "OS.status", "OS_status")
+  } else {
+    time_candidates  <- c("PFI.time", "PFI_time", "PFI.time.days", "PFI_days", "PFI_time_days")
+    event_candidates <- c("PFI", "PFI_event", "PFI.status", "PFI_status")
+  }
+  list(
+    time_col  = intersect(time_candidates,  colnames(cdr))[1],
+    event_col = intersect(event_candidates, colnames(cdr))[1]
+  )
+}
+```
+
+## Merge clinical + run Cox per endpoint
+
+`Surv(time, event) ~ age_years + Deviation` per endpoint. No per-cancer
+extra covariates — keeping the model simple and identical across
+cancers maximizes cross-cancer comparability for downstream aggregation.
+
+```{r}
+surv_os_res  <- NULL
+surv_pfi_res <- NULL
+
+if (is.null(params$clinical_csv) || !file.exists(params$clinical_csv)) {
+  warning("clinical_csv not found: ", params$clinical_csv, " (skipping survival analysis)")
+} else {
+
+  cdr <- read.csv(
+    params$clinical_csv,
+    na.strings = c("NA", "", "#N/A"),
+    stringsAsFactors = FALSE,
+    check.names = TRUE
+  )
+
+  if (!"bcr_patient_barcode" %in% colnames(cdr)) {
+    warning("Integrated clinical file missing bcr_patient_barcode column; cannot merge (skipping survival analysis).")
+  } else {
+
+    # Build patient barcode for tumors
+    dev_df2 <- dev_df %>%
+      mutate(patient12 = get_patient12(sample_id, metadata)) %>%
+      filter(!is.na(patient12))
+    msg("Tumor samples with patient12: ", nrow(dev_df2), "/", nrow(dev_df))
+
+    # One row per patient in clinical file
+    cdr2 <- cdr %>%
+      mutate(patient12 = substr(as.character(bcr_patient_barcode), 1, 12)) %>%
+      distinct(patient12, .keep_all = TRUE)
+
+    # Merge
+    surv_base <- dev_df2 %>%
+      left_join(cdr2, by = "patient12") %>%
+      filter(is.finite(Deviation), is.finite(age_years))
+
+    run_one_survival <- function(endpoint = c("OS", "PFI")) {
+      endpoint <- match.arg(endpoint)
+      cols <- pick_surv_cols(surv_base, endpoint)
+
+      if (is.na(cols$time_col) || is.na(cols$event_col)) {
+        warning("Could not find required columns for ", endpoint, " in clinical file (skipping).")
+        return(NULL)
+      }
+
+      df <- surv_base %>%
+        mutate(
+          time  = suppressWarnings(as.numeric(.data[[cols$time_col]])),
+          event = suppressWarnings(as.numeric(.data[[cols$event_col]]))
+        ) %>%
+        mutate(event = event == 1) %>%
+        filter(is.finite(time), !is.na(event))
+
+      msg(endpoint, " rows n=", nrow(df), " | events=", sum(df$event))
+
+      if (sum(df$event) < params$min_events) {
+        warning("Not enough ", endpoint, " events (", sum(df$event), " < min_events=", params$min_events, "); skipping Cox model.")
+        return(NULL)
+      }
+
+      fml <- as.formula("Surv(time, event) ~ age_years + Deviation")
+      cox_fit <- coxph(fml, data = df)
+      s <- summary(cox_fit)
+
+      rr <- s$coefficients["Deviation", "coef"]
+      se <- s$coefficients["Deviation", "se(coef)"]
+      p  <- s$coefficients["Deviation", "Pr(>|z|)"]
+
+      hr <- exp(rr)
+      ci <- exp(rr + c(-1, 1) * 1.96 * se)
+
+      # Proportional hazards diagnostic (per-coefficient + global)
+      zph <- tryCatch(cox.zph(cox_fit), error = function(e) NULL)
+      zph_dev_p    <- if (!is.null(zph) && "Deviation" %in% rownames(zph$table)) zph$table["Deviation", "p"] else NA_real_
+      zph_global_p <- if (!is.null(zph)) zph$table["GLOBAL", "p"] else NA_real_
+
+      tibble(
+        analysis_id    = analysis_id,
+        endpoint       = endpoint,
+        n              = nrow(df),
+        events         = sum(df$event),
+        model          = deparse(fml),
+        HR_per1yr_dev  = hr,
+        CI_low         = ci[1],
+        CI_high        = ci[2],
+        p_value        = p,
+        zph_dev_p      = zph_dev_p,
+        zph_global_p   = zph_global_p
+      )
+    }
+
+    surv_os_res  <- run_one_survival("OS")
+    surv_pfi_res <- run_one_survival("PFI")
+  }
+}
+```
+
+## Save per-cancer results
+
+```{r}
+out_rds <- list(
+  analysis_id  = analysis_id,
+  surv_res_os  = surv_os_res,
+  surv_res_pfi = surv_pfi_res
+)
+
+out_path <- file.path(proc_dir, paste0("survival_deviation_results", suffix, ".rds"))
+saveRDS(out_rds, file = out_path)
+msg("Saved: ", out_path)
+```
+
+## Summary table + forest plot (OS + PFI)
+
+```{r}
+tbl_surv <- bind_rows(surv_os_res, surv_pfi_res)
+
+if (nrow(tbl_surv) == 0) {
+  msg("No survival results available to summarize (OS and PFI both NULL).")
+} else {
+
+  tbl_print <- tbl_surv %>%
+    mutate(
+      endpoint = factor(endpoint, levels = c("OS", "PFI")),
+      HR       = as.numeric(HR_per1yr_dev),
+      CI       = paste0(sprintf("%.2f", CI_low), "–", sprintf("%.2f", CI_high)),
+      p_value  = as.numeric(p_value)
+    ) %>%
+    select(endpoint, n, events, HR, CI_low, CI_high, p_value, zph_dev_p, zph_global_p)
+
+  reactable_pretty(tbl_print)
+}
+```
+
+```{r}
+if (nrow(tbl_surv) > 0) {
+
+  forest_df <- tbl_surv %>%
+    mutate(
+      HR    = HR_per1yr_dev,
+      label = paste0(endpoint, " (n=", n, ", events=", events, ")"),
+      sig   = ifelse(p_value < 0.05, "p < 0.05", "p ≥ 0.05")
+    ) %>%
+    mutate(label = factor(label, levels = rev(label)))
+
+  forest_plot <- ggplot(forest_df, aes(x = HR, y = label)) +
+    geom_errorbarh(aes(xmin = CI_low, xmax = CI_high), height = 0.2) +
+    geom_point(aes(shape = sig), size = 3) +
+    geom_vline(xintercept = 1, linetype = "dashed") +
+    scale_x_log10(
+      breaks = pretty_breaks(n = 6),
+      labels = label_number(accuracy = 0.01)
+    ) +
+    scale_shape_manual(values = c("p < 0.05" = 19, "p ≥ 0.05" = 1), name = "Significance") +
+    labs(
+      title    = paste0("Effect of tumor Deviation on survival: ", analysis_id),
+      subtitle = "Cox HR per +1 year of GTEx-anchored Deviation (age-adjusted)",
+      x = "Hazard ratio (log scale)",
+      y = NULL
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(panel.grid.major.y = element_blank())
+
+  forest_plot
+}
+```
+
+## Session info
+
+```{r}
+sessionInfo()
+```

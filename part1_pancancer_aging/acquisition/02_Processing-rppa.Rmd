@@ -1,0 +1,185 @@
+---
+title: "Process RPPA SummarizedExperiment Objects"
+subtitle: "TCGA PanCancer Aging"
+author: "Payton Bock - Monti Lab"
+date:   "`r format(Sys.Date(), '%B %d, %Y')`"
+params: 
+  dummy: "dummy"
+output:
+  html_document:
+    theme: united
+    code_folding: hide
+    css: style.css
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+
+```{r, include = FALSE}
+.libPaths("/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/r-library/")
+
+library(dplyr)
+library(SummarizedExperiment)
+library(ggplot2)
+library(reactable)
+library(S4Vectors)
+
+#get environmental variables
+PATH <- file.path( Sys.getenv("PCANAGE","/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/")) 
+TCGA <- file.path( Sys.getenv("CBMDATA","/restricted/projectnb/agedisease/CBMrepositoryData/"), "TCGA-GDC")
+```
+
+## Script Summary 
+- Loads harmonized meta data RDS file
+
+- Adds meta data to all SummarizedExperiment objects for the RPPA omics layer
+
+- Filter and save SummarizedExperiment objects 
+
+
+## Path Setting
+Load in metadata RDS object and define directory with SummarizedExperiment objects
+```{r data loading}
+#Where the meta data RDS file is
+metadata <- readRDS(file.path(TCGA,"metadata/data/harmonized_metadata.rds"))
+
+#Path where the summarized experiment objects you are updating are located
+se_directory <- file.path(TCGA,"RPPA/raw_data/raw_SE/")
+```
+
+
+## Filtering Proteins
+RPPA data quality control guidelines are almost non existent. We will remove proteins with >30% missing values. 
+
+Data is already normalized by TCGA. 
+
+```{r}
+filter_proteins <- function(se_obj, max_missing = 30) {
+  # Calculate the percentage of missing values for each protein (row)
+  row_na_percentage <- rowMeans(is.na(assay(se_obj))) * 100
+  
+  # Identify proteins to keep (<= max_missing% missing values)
+  proteins_to_keep <- row_na_percentage <= max_missing
+  
+  # Filter the SummarizedExperiment object
+  se_obj_filtered <- se_obj[proteins_to_keep, ]
+  
+  # Calculate the number of proteins removed
+  proteins_removed <- sum(!proteins_to_keep)
+  
+  # Print the number of proteins removed
+  message(paste0("Number of Proteins with >", max_missing, "% missing values removed: ", proteins_removed))
+  
+  # Return the filtered object and count of removed proteins
+  list(
+    filtered_data = se_obj_filtered,
+    proteins_removed = proteins_removed
+  )
+}
+
+```
+
+
+
+
+## Process all RPPA Summarized Experiment Objects in folder
+Here we loop through all SummarizedExperiment RDS files, check if the shortened ID is the column names (and sets the barcode as the column if not), and add the harmonzied meta data to the SummarizedObject (which is then saved). 
+
+This assumes the data has only one of each "bcr_patient_barcode", which should be the case given only primary tumors were downloaded.
+
+Note: Other layers set the new column names as the "submitter_id", but this column does not exist for RPPA (GDCprepare does not work for RPPA data, so only a few metadata columns are added). For RPPA, the "bcr_patient_barcode" corresponds to the sample id in the other layers. 
+
+We also apply our filtering function to our SummarizedExperiment objects (removing proteins with >30% missing values)
+
+```{r Add Meta Data to Folder of Summarized Experiments}
+# Define directories for saving all and filtered data
+filtered_directory <- file.path(TCGA, "RPPA/processed_data/filtered")
+all_directory <- file.path(TCGA, "RPPA/processed_data/all")
+
+# Create directories if they don't exist
+#dir.create(filtered_directory, recursive = TRUE, showWarnings = FALSE)
+#dir.create(all_directory, recursive = TRUE, showWarnings = FALSE)
+
+# Create a list of all .rds files in the se_directory
+file_list <- list.files(path = se_directory, pattern = "\\.rds$", full.names = TRUE)
+
+# Initialize removal table
+removal_table <- data.frame(
+  Cancer_Type = character(),
+  Proteins_Removed = integer(),
+  stringsAsFactors = FALSE
+)
+
+# Loop through each file
+for(file in file_list) {
+  
+  cat("Processing file:", file, "\n")
+  
+  # Read in the SummarizedExperiment object
+  se_obj <- readRDS(file)
+  
+  # Ensure 'bcr_patient_barcode' is set as the column names
+  if (!identical(colnames(se_obj), colData(se_obj)$bcr_patient_barcode)) {
+    message("Setting 'bcr_patient_barcode' as column names for ", file)
+    colnames(se_obj) <- colData(se_obj)$bcr_patient_barcode
+  }
+  
+  # Determine samples to keep based on metadata
+  samples_to_keep <- intersect(colnames(se_obj), rownames(metadata))
+  
+  # Extract project-specific metadata
+  project_specific_metadata <- metadata[samples_to_keep, ]
+  
+  # Convert metadata to DataFrame if necessary
+  project_specific_metadata <- S4Vectors::DataFrame(project_specific_metadata)
+  
+  # Sort the SummarizedExperiment columns to match metadata
+  se_obj_sorted <- se_obj[, match(rownames(project_specific_metadata), colnames(se_obj))]
+  
+  # Verify that the samples match
+  if (identical(colnames(se_obj_sorted), rownames(project_specific_metadata))) {
+    
+    # Add metadata to colData
+    colData(se_obj_sorted) <- project_specific_metadata
+    
+    # Save the unfiltered SummarizedExperiment to the "all" directory
+    all_output_path <- file.path(all_directory, basename(file))
+    saveRDS(se_obj_sorted, all_output_path)
+    
+    # Apply the protein filtering function
+    filtered_results <- filter_proteins(se_obj_sorted, max_missing = 30)
+    
+    # Save the filtered SummarizedExperiment to the "filtered" directory
+    filtered_output_path <- file.path(filtered_directory, basename(file))
+    saveRDS(filtered_results$filtered_data, filtered_output_path)
+    
+    # Extract cancer type from the file name (assuming format like TCGA-BRCA_rppa.rds)
+    cancer_type <- tools::file_path_sans_ext(basename(file))
+    
+    # Append the removal counts to the removal_table
+    removal_table <- rbind(removal_table, data.frame(
+      Cancer_Type = cancer_type,
+      Proteins_Removed = filtered_results$proteins_removed,
+      stringsAsFactors = FALSE
+    ))
+    
+  } else {
+    # If there's a mismatch in sample names, throw an error
+    stop(paste("Mismatch between column names and metadata samples in file:", file))
+  }
+}
+
+
+reactable::reactable(removal_table,searchable = TRUE, resizable = TRUE)
+```
+
+
+## Session Info
+```{r}
+sessionInfo()
+```
+

@@ -1,0 +1,60 @@
+library(tidyverse)
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(reactable)
+
+DATA_ROOT <- "/restricted/projectnb/agedisease/projects/pancancer_aging/TCGA-GDC/scna/GISTIC"
+SCRIPT_ROOT <- "/restricted/projectnb/agedisease/projects/pancancer_aging/scripts/scna_pn"
+RESULTS_ROOT <- "/restricted/projectnb/agedisease/projects/pancancer_aging/results/scna_pn"
+
+render_reports <- function(rmd, output_dir, covariate_df, suffix) {
+  required_params <- c(
+    "cancer_type", "include_gender", "include_race", "races_included",
+    "include_subtype", "include_HPV_status", "include_grade",
+    "grades_included", "include_purity"
+  )
+  missing <- setdiff(required_params, names(covariate_df))
+  if (length(missing) > 0) stop("Missing columns in covariate_df: ", paste(missing, collapse = ", "))
+
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+  for (i in seq_len(nrow(covariate_df))) {
+    params_list <- as.list(covariate_df[i, ])
+    output_file <- file.path(output_dir, paste0(params_list$cancer_type, "_", suffix))
+
+    print(paste0("Rendering: ", params_list$cancer_type, " -> ", output_file))
+
+    tryCatch(
+      {
+        rmarkdown::render(
+          input = rmd,
+          output_file = output_file,
+          params = params_list
+        )
+        print("Done!")
+      },
+      error = function(e) {
+        message(paste0("ERROR rendering ", params_list$cancer_type, ": ", e$message))
+      }
+    )
+  }
+}
+
+covariates_SCNA <- readRDS(file.path(
+  "/restricted/projectnb/agedisease/projects/pancancer_aging",
+  "TCGA-GDC", "metadata", "covariates", "SCNA_covariates.rds"
+)) %>%
+  dplyr::select(-omics_type, -num_samples) %>%
+  dplyr::mutate(
+    include_purity = if_else(cancer_type %in% c("TCGA-SKCM"), FALSE, include_purity)
+  ) %>%
+  dplyr::mutate(
+    include_race = if_else(cancer_type %in% c("TCGA-COAD", "TCGA-READ"), FALSE, include_race)
+  )
+
+render_reports(
+  rmd = file.path(SCRIPT_ROOT, "03_EDA_and_filtering-scna.Rmd"),
+  output_dir = file.path(RESULTS_ROOT, "htmls"),
+  covariate_df = covariates_SCNA,
+  suffix = "SCNA_EDA_and_filtering.html"
+)

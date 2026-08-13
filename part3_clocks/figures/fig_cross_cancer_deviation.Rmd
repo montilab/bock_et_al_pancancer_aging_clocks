@@ -1,0 +1,1182 @@
+---
+title: "Figure — Cross-cancer deviation"
+author: "Pan-cancer aging project"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: united
+    toc: true
+    toc_float: true
+    code_folding: hide
+    css: /restricted/projectnb/agedisease/projects/pancancer_aging_pbock/manuscript_analyses/R/style.css
+---
+
+<!--
+This Rmd generates manuscript Figure 4 (cross-cancer deviation) from the
+pre-specified highlight set. The figure focuses on deviation as the
+centerpiece, with coupling components removed.
+
+Panels:
+  - Fig 4A: Cross-cancer mean deviation ordering (most youthful at top)
+  - Fig 4B: Pan-cancer Cox forest for OS (age-adjusted, 6 cancers)
+  - Fig 4C: Per-cancer mean ClockSHAP deviation decomposition (waterfalls, all 6 cancers)
+  - Fig 4D: Recurrent pathway deviation across cancers (heatmap with categories)
+  - Fig 4D-alt: Exploratory heatmap clustered by Pearson on deviation values,
+                no pathway categorization (not saved, for visual exploration)
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(ggplot2)
+  library(grid)
+  library(here)
+  library(tidytext)
+  library(ggtext)
+  library(stringr)
+  library(purrr)
+  library(tidyr)
+  library(scales)
+  library(survival)
+  library(knitr)
+  library(cowplot)
+})
+```
+
+## Highlight set + global options
+
+```{r}
+feature_set <- "PC"
+base_dir    <- "results/derived/GTEx"
+
+highlight_tbl <- tibble(
+  tcga_project = c("BRCA", "LUAD", "LUSC", "GBM", "LGG", "COAD"),
+  gtex_project = c("BREAST", "LUNG", "LUNG", "BRAIN", "BRAIN", "COLON")
+)
+
+# Keep this explicit so the manuscript figure respects the pre-specified emphasis set.
+highlight_order <- highlight_tbl$tcga_project
+```
+
+## Helpers
+
+```{r}
+clean_pathway_label <- function(x) {
+  dplyr::recode(
+    x,
+    "Reactive Oxygen Species Pathway" = "ROS Pathway",
+    "Il2 Stat5 Signaling" = "IL2/STAT5 Signaling",
+    "Il6 Jak Stat3 Signaling" = "IL6/JAK/STAT3",
+    "Tnfa Signaling Via Nfkb" = "TNF\u03b1 \u2192 NF\u03baB",
+    "Pi3k Akt Mtor Signaling" = "PI3K/AKT/MTOR Signaling",
+    "Mitotic Spindle" = "Mitotic Spindle",
+    "Epithelial Mesenchymal Transition" = "EMT",
+    "Wnt Beta Catenin Signaling" = "WNT/\u03b2-Catenin",
+    "Interferon Alpha Response" = "IFN\u03b1 Response",
+    "Xenobiotic Metabolism" = "Xenobiotic Metab.",
+    "Unfolded Protein Response" = "UPR",
+    "Inflammatory Response"     = "Inflammatory Resp.",
+    "Fatty Acid Metabolism" = "Fatty Acid Metab.",
+    .default = x
+  )
+}
+
+load_fig4_objects <- function(tcga_project,
+                              gtex_project,
+                              feature_set = "PC",
+                              base_dir = "results/derived/GTEx") {
+
+  analysis_id <- paste0(tcga_project, "__", gtex_project)
+  analysis_dir <- file.path(here::here(base_dir), analysis_id)
+  suffix <- paste0("-", feature_set)
+
+  surv_path <- file.path(analysis_dir,
+                         paste0("survival_deviation_results", suffix, ".rds"))
+
+  list(
+    analysis_id = analysis_id,
+    tcga_project = tcga_project,
+    gtex_project = gtex_project,
+    shap = readRDS(file.path(analysis_dir, paste0("clockshap_objects", suffix, ".rds"))),
+    survival = if (file.exists(surv_path)) readRDS(surv_path) else NULL
+  )
+}
+```
+
+## Load saved objects
+
+```{r}
+fig4_objs <- purrr::pmap(
+  highlight_tbl,
+  ~ load_fig4_objects(..1, ..2, feature_set = feature_set, base_dir = base_dir)
+)
+
+names(fig4_objs) <- highlight_tbl$tcga_project
+
+stopifnot(all(highlight_order %in% names(fig4_objs)))
+```
+
+## Figure 4A — Cross-cancer mean deviation ordering
+
+```{r}
+fig4_mean_shap_tbl <- purrr::imap_dfr(
+  fig4_objs,
+  function(obj, cancer) {
+    phi <- obj$shap$pt$phi
+    stopifnot(!is.null(phi), is.matrix(phi) || is.data.frame(phi))
+    phi <- as.matrix(phi)
+
+    tibble(
+      cancertype = cancer,
+      pathway = colnames(phi),
+      mean_phi = colMeans(phi, na.rm = TRUE)
+    )
+  }
+) %>%
+  mutate(pathway = clean_pathway_label(pathway))
+
+fig4A_deviation_tbl <- fig4_mean_shap_tbl %>%
+  group_by(cancertype) %>%
+  summarise(
+    mean_deviation = sum(mean_phi, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_deviation)) %>%
+  mutate(
+    cancertype = factor(cancertype, levels = cancertype),
+    direction = if_else(mean_deviation >= 0, "Older", "Younger")
+  )
+
+p_fig4A <- ggplot(
+  fig4A_deviation_tbl,
+  aes(x = mean_deviation, y = cancertype, fill = direction)
+) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey55", linewidth = 0.6) +
+  geom_col(width = 0.7, colour = "grey20", linewidth = 0.3) +
+  geom_text(
+    aes(label = sprintf("%+.1f", mean_deviation),
+        hjust = if_else(mean_deviation >= 0, -0.1, 1.2)),
+    fontface = "bold",
+    size = 4
+  ) +
+  scale_fill_manual(values = c("Older" = "#d73027", "Younger" = "#4575b4"),
+                    guide = "none") +
+  scale_x_continuous(
+  limits = c(-30, NA),
+  expand = expansion(mult = c(0, 0.15)),
+  breaks = scales::pretty_breaks(n = 6)
+  ) +
+  labs(
+    x = "Mean Age-Matched Deviation (years)",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_blank(),
+    axis.text.y = element_text(size = 9, face = "bold"),
+    axis.text.x = element_text(size = 9),
+    axis.title = element_text(size = 10),
+    plot.margin = margin(10, 10, 10, 10)
+  )
+
+p_fig4A
+```
+
+```{r}
+out_dir <- here::here("results", "figures", "figure_crosscancer")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+out_file <- file.path(out_dir, "Fig4A_CrossCancer_Mean_Deviation.pdf")
+
+ggsave(
+  filename = out_file,
+  plot = p_fig4A,
+  width = 3.75,
+  height = 2.5,
+  units = "in"
+)
+
+message("Saved: ", out_file)
+```
+
+## Figure 4B — Pan-cancer Cox forest plot (OS, age-adjusted)
+
+This panel shows the OS Cox hazard ratio per +1 year of GTEx-anchored
+Deviation, age-adjusted, across all 6 emphasis cancers. Loads
+`survival_deviation_results-PC.rds` per cancer. Sorted by HR with the
+smallest HR at the top. Blue points indicate HR < 1 (youthful deviation
+associates with increased risk); red points indicate HR > 1 (less-youthful
+deviation associates with increased risk). Filled circles indicate
+p < 0.05; open circles indicate p >= 0.05.
+
+```{r}
+fig4B_tbl <- purrr::imap_dfr(fig4_objs, function(obj, cancer) {
+  if (is.null(obj$survival) || is.null(obj$survival$surv_res_os)) {
+    warning(sprintf("No surv_res_os for %s", cancer))
+    return(NULL)
+  }
+  obj$survival$surv_res_os %>%
+    mutate(cancertype = cancer)
+}) %>%
+  mutate(
+    HR     = HR_per1yr_dev,
+    sig    = ifelse(p_value < 0.05, "p < 0.05", "p \u2265 0.05"),
+    hr_dir = factor(
+      ifelse(HR < 1,
+             "Youthful deviation, increased risk",
+             "Less-youthful deviation, increased risk"),
+      levels = c("Youthful deviation, increased risk",
+                 "Less-youthful deviation, increased risk")
+    ),
+    label  = cancertype
+  ) %>%
+  arrange(HR) %>%
+  mutate(label = factor(label, levels = rev(label)))  # smallest HR at top
+
+knitr::kable(
+  fig4B_tbl %>%
+    transmute(cancertype, n, events, HR, CI_low, CI_high, p_value, sig),
+  digits = 4,
+  caption = "Panel B - pan-cancer OS Cox HR per +1 year of Deviation, age-adjusted."
+)
+```
+
+```{r}
+hr_pal <- c(
+  "Youthful deviation, increased risk"      = "#2c7bb6",
+  "Less-youthful deviation, increased risk" = "#d7191c"
+)
+
+p_fig4B <- ggplot(fig4B_tbl, aes(x = HR, y = label, colour = hr_dir)) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey55", linewidth = 0.6) +
+  geom_errorbarh(aes(xmin = CI_low, xmax = CI_high),
+                 height = 0.20, linewidth = 0.7) +
+  geom_point(aes(shape = sig), size = 3.6) +
+  scale_x_log10() +
+  scale_shape_manual(values = c("p < 0.05" = 19, "p \u2265 0.05" = 1),
+                     name = NULL) +
+  scale_colour_manual(values = hr_pal, name = NULL) +
+  labs(
+    x = "HR per +1 yr of Deviation (log scale, age-adjusted)",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_blank(),
+    legend.position    = "none",
+    axis.text.y        = element_text(size = 9, face = "bold"),
+    axis.text.x        = element_text(size = 9),
+    axis.title         = element_text(size = 10),
+    plot.margin        = margin(10, 10, 10, 10)
+  )
+
+p_fig4B
+
+
+fig4B_legend <- cowplot::get_legend(
+  p_fig4B +
+    theme(
+      legend.position = "bottom",
+      legend.box = "vertical",
+      legend.margin = margin(0, 0, 0, 0)
+    )
+)
+
+p_fig4B_nolegend <- p_fig4B +
+  theme(legend.position = "none")
+```
+
+```{r}
+ggsave(
+  filename = file.path(out_dir, "Fig4B_PanCancer_Survival_OS.pdf"),
+  plot = p_fig4B_nolegend,
+  width = 3.75,
+  height = 2.5,
+  units = "in"
+)
+
+ggsave(
+  filename = file.path(out_dir, "Fig4B_PanCancer_Survival_OS_legend.pdf"),
+  plot = fig4B_legend,
+  width = 4,
+  height = 0.7,
+  units = "in"
+)
+```
+
+## Figure 4C — Cross-cancer deviation decomposition (waterfalls, all 6 cancers)
+
+This panel summarizes the mean tumor ClockSHAP contributions in each of
+the 6 emphasis cancers. Bars show the top-N pathway-level contributors
+to tumor deviation, with the remainder collapsed into Other. The dashed
+summary row shows the net mean tumor deviation. Cancers are stacked
+vertically and ordered by total mean deviation (most negative at top,
+most positive at bottom).
+
+```{r}
+fig4C_top_k <- 4L
+fig4C_summary_label <- "Mean Age Deviation"
+
+fig4C_rank_tbl <- fig4_mean_shap_tbl %>%
+  group_by(cancertype) %>%
+  arrange(desc(abs(mean_phi)), .by_group = TRUE) %>%
+  mutate(
+    rank = row_number(),
+    pathway_group = if_else(rank <= fig4C_top_k, pathway, "Other")
+  ) %>%
+  group_by(cancertype, pathway_group) %>%
+  summarise(contrib = sum(mean_phi, na.rm = TRUE), .groups = "drop")
+
+fig4C_segment_tbl <- fig4C_rank_tbl %>%
+  group_by(cancertype) %>%
+  arrange(pathway_group == "Other", desc(abs(contrib)), .by_group = TRUE) %>%
+  mutate(
+    ord       = row_number(),
+    start     = cumsum(lag(contrib, default = 0)),
+    end       = start + contrib,
+    direction = if_else(contrib >= 0, "Older", "Younger"),
+    n_path    = sum(pathway_group != "Other"),
+    y_rank    = if_else(pathway_group == "Other", 0, n_path - ord + 1)
+  ) %>%
+  select(-n_path) %>%
+  ungroup()
+
+fig4C_total_tbl <- fig4C_segment_tbl %>%
+  group_by(cancertype) %>%
+  summarise(total_dev = sum(contrib), .groups = "drop") %>%
+  transmute(
+    cancertype,
+    pathway_group = fig4C_summary_label,
+    contrib   = total_dev,
+    start     = 0,
+    end       = total_dev,
+    direction = if_else(total_dev >= 0, "Older", "Younger"),
+    y_rank    = -1
+  )
+
+# Order cancers by total mean deviation: most negative at top of stack, most positive at bottom.
+fig4C_cancer_order <- fig4C_total_tbl %>%
+  arrange(contrib) %>%
+  pull(cancertype)
+
+fig4C_plot_tbl <- bind_rows(fig4C_segment_tbl, fig4C_total_tbl) %>%
+  mutate(cancertype = factor(cancertype, levels = fig4C_cancer_order)) %>%
+  arrange(cancertype, desc(y_rank)) %>%
+  group_by(cancertype) %>%
+  mutate(pathway_within = reorder_within(pathway_group, y_rank, cancertype)) %>%
+  ungroup()
+
+fig4C_x_min <- min(c(fig4C_plot_tbl$start, fig4C_plot_tbl$end), na.rm = TRUE)
+fig4C_x_max <- max(c(fig4C_plot_tbl$start, fig4C_plot_tbl$end), na.rm = TRUE)
+fig4C_pad_left  <- 0.30 * (fig4C_x_max - fig4C_x_min)
+fig4C_pad_right <- 0.06 * (fig4C_x_max - fig4C_x_min)
+```
+
+```{r fig.width=5, fig.height=9}
+fig4C_summary_signs <- fig4C_plot_tbl %>%
+  filter(pathway_group == fig4C_summary_label) %>%
+  arrange(cancertype) %>%
+  pull(contrib)
+
+p_fig4C <- ggplot(fig4C_plot_tbl, aes(y = pathway_within)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey55", linewidth = 0.4) +
+
+  # Pathway segments: coloured fill on top of grey base for separation
+  geom_segment(
+    data = \(d) d %>% filter(pathway_group != fig4C_summary_label),
+    aes(x = start, xend = end, yend = pathway_within),
+    linewidth = 4.2, lineend = "butt", colour = "grey30"
+  ) +
+  geom_segment(
+    data = \(d) d %>% filter(pathway_group != fig4C_summary_label),
+    aes(x = start, xend = end, yend = pathway_within, colour = direction),
+    linewidth = 3.2, lineend = "butt"
+  ) +
+  geom_text(
+    data = \(d) d %>% filter(pathway_group != fig4C_summary_label),
+    aes(x = (start + end) / 2,
+        label = if_else(contrib >= 0, "+", "\u2212")),
+    colour = "white", fontface = "bold", size = 2.7, show.legend = FALSE
+  ) +
+
+  # Summary row: dashed double-arrow plus labelled total
+  geom_segment(
+    data = \(d) d %>% filter(pathway_group == fig4C_summary_label),
+    aes(x = start, xend = end, y = pathway_within, yend = pathway_within),
+    inherit.aes = FALSE, colour = "grey20",
+    linewidth = 0.8, linetype = "dashed",
+    arrow = arrow(ends = "both", type = "closed", length = unit(0.04, "inches"))
+  ) +
+  geom_text(
+    data = \(d) d %>% filter(pathway_group == fig4C_summary_label),
+    aes(x = end, y = pathway_within,
+        label = sprintf("%+.1f yr", contrib)),
+    inherit.aes = FALSE,
+    hjust = ifelse(fig4C_summary_signs >= 0, -0.1, 1.1),
+    vjust = 0.4, size = 3, fontface = "bold", colour = "grey20"
+  ) +
+
+  facet_wrap(~ cancertype, ncol = 1, scales = "free_y") +
+  scale_y_reordered(
+    name = NULL,
+    labels = function(x) {
+      lab <- tidytext::reorder_func(x)
+      ifelse(lab == fig4C_summary_label,
+             paste0("<b>", fig4C_summary_label, "</b>"),
+             as.character(lab))
+    }
+  ) +
+  scale_x_continuous(
+    limits = c(fig4C_x_min - fig4C_pad_left,
+               fig4C_x_max + fig4C_pad_right),
+    breaks = scales::pretty_breaks(n = 5)
+  ) +
+  scale_colour_manual(values = c("Older" = "#d73027", "Younger" = "#4575b4")) +
+  labs(x = "Contribution to Deviation (ClockSHAP, years)", y = NULL, colour = NULL) +
+  theme_minimal(base_size = 10) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank(),
+    strip.background   = element_rect(fill = "grey95", colour = NA),
+    strip.text         = element_text(face = "bold", size = 10),
+    axis.text.y        = element_text(size = 8.5),
+    axis.text.y.left   = ggtext::element_markdown(size = 8.5),
+    axis.text.x        = element_text(size = 9),
+    axis.title.x       = element_text(size = 10),
+    legend.position    = "none",
+    plot.margin        = margin(4, 14, 4, 4)
+  )
+
+p_fig4C
+```
+
+```{r}
+out_file <- file.path(out_dir, "Fig4C_CrossCancer_Deviation_Decomposition.pdf")
+
+ggsave(
+  filename = out_file,
+  plot = p_fig4C,
+  width = 3.25,
+  height = 7.25,
+  units = "in"
+)
+
+message("Saved: ", out_file)
+```
+
+
+## Figure 4D — Stable deviation pathways across cancers
+
+This panel summarizes recurrent pathways that show sufficiently large and stable
+deviation signals across the highlight cancers. Tiles show signed pathway-level
+mean deviation contributions, grouped into biologically interpretable pathway
+categories. Pathways must pass within-cancer bootstrap stability criteria and
+reach the deviation cutoff in at least two cancers to be displayed.
+
+```{r}
+# Manual, exact-match category map for all 50 Hallmark pathways.
+# Includes both raw and cleaned label forms (via clean_pathway_label) so that
+# the map works regardless of which form is passed in.
+hallmark_category_map <- c(
+  # ---- Proliferation ----
+  "E2f Targets" = "Proliferation",
+  "G2m Checkpoint" = "Proliferation",
+  "Mitotic Spindle" = "Proliferation",
+  "Myc Targets V1" = "Proliferation",
+  "Myc Targets V2" = "Proliferation",
+
+  # ---- Immune ----
+  "Allograft Rejection" = "Immune",
+  "Complement" = "Immune",
+  "Coagulation" = "Immune",
+  "IL2/STAT5 Signaling" = "Immune",
+  "Il6 Jak Stat3 Signaling" = "Immune",
+  "IL6/JAK/STAT3" = "Immune",
+  "Inflammatory Resp." = "Immune",
+  "Interferon Alpha Response" = "Immune",
+  "IFN\u03b1 Response" = "Immune",
+  "Interferon Gamma Response" = "Immune",
+  "TNFA Signaling via NFKB" = "Immune",
+  "TNF\u03b1 \u2192 NF\u03baB" = "Immune",
+
+  # ---- Metabolic ----
+  "Adipogenesis" = "Metabolic",
+  "Bile Acid Metabolism" = "Metabolic",
+  "Cholesterol Homeostasis" = "Metabolic",
+  "Fatty Acid Metab." = "Metabolic",
+  "Glycolysis" = "Metabolic",
+  "Heme Metabolism" = "Metabolic",
+  "Oxidative Phosphorylation" = "Metabolic",
+  "Peroxisome" = "Metabolic",
+  "Xenobiotic Metabolism" = "Metabolic",
+  "Xenobiotic Metab." = "Metabolic",
+
+  # ---- Stress / damage response ----
+  "Apoptosis" = "Stress / Damage",
+  "Dna Repair" = "Stress / Damage",
+  "Hypoxia" = "Stress / Damage",
+  "P53 Pathway" = "Stress / Damage",
+  "ROS Pathway" = "Stress / Damage",
+  "UPR" = "Stress / Damage",
+  "Uv Response Dn" = "Stress / Damage",
+  "Uv Response Up" = "Stress / Damage",
+
+  # ---- Signaling ----
+  "Hedgehog Signaling" = "Signaling",
+  "Kras Signaling Dn" = "Signaling",
+  "Kras Signaling Up" = "Signaling",
+  "Mtorc1 Signaling" = "Signaling",
+  "Notch Signaling" = "Signaling",
+  "PI3K/AKT/MTOR Signaling" = "Signaling",
+  "Tgf Beta Signaling" = "Signaling",
+  "Wnt Beta Catenin Signaling" = "Signaling",
+  "WNT/\u03b2-Catenin" = "Signaling",
+  # Androgen Response reassigned from Hormone to Signaling for display purposes:
+  # AR-mediated transcriptional signaling is the operative biology, and grouping
+  # it here avoids creating a singleton Hormone facet.
+  "Androgen Response" = "Signaling",
+
+  # ---- Hormone ----
+  "Estrogen Response Early" = "Hormone",
+  "Estrogen Response Late" = "Hormone",
+
+  # ---- Cell state ----
+  "Angiogenesis" = "Cell State",
+  "Apical Junction" = "Cell State",
+  "Apical Surface" = "Cell State",
+  "Epithelial Mesenchymal Transition" = "Cell State",
+  "EMT" = "Cell State",
+  "Myogenesis" = "Cell State",
+  "Pancreas Beta Cells" = "Cell State",
+  "Protein Secretion" = "Cell State",
+  "Spermatogenesis" = "Cell State"
+)
+
+assign_pathway_category <- function(pathway) {
+  out <- unname(hallmark_category_map[pathway])
+  out[is.na(out)] <- "Other"
+  out
+}
+
+# ---- tuning knobs ----
+# Cancers grouped by tissue of origin, ordered within each tissue by mean
+# deviation (most youthful first). Tissue strip at bottom: Breast, Lung,
+# Brain, Colon.
+fig4D_cancer_order <- c("BRCA", "LUSC", "LUAD", "GBM", "LGG", "COAD")
+
+# Tissue mapping for the x-facet (bottom strip)
+fig4D_tissue_levels <- c("BREAST", "LUNG", "BRAIN", "COLON")
+fig4D_tissue_map    <- setNames(highlight_tbl$gtex_project,
+                                highlight_tbl$tcga_project)
+
+# Inclusion criteria. A pathway is shown if its mean deviation contribution
+# exceeds the magnitude cutoff in at least the recurrence number of cancers.
+# Cross-cancer recurrence is the primary defense against noise; per-cancer
+# bootstrap stability filters were dropped for parsimony.
+fig4D_min_recurrence <- 2L    # number of cancers that must clear the magnitude cutoff
+fig4D_min_abs_dev    <- 1.0   # minimum |mean deviation| in years per cancer
+
+# Color scale cap (years). Values outside +/-fig4D_scale_cap are squished to
+# the cap colour. Mentioned in the figure caption.
+fig4D_scale_cap <- 5
+
+# ---- load clock retention info for each highlight cancer ----
+# A pathway is "retained" if its elastic-net coefficient is non-zero in the
+# tissue-of-origin clock. Non-retained pathways will be marked with a grey X
+# in Panel D to distinguish "not selected by the clock" from "selected but
+# small deviation contribution".
+fig4D_retention_tbl <- purrr::pmap_dfr(
+  highlight_tbl,
+  function(tcga_project, gtex_project) {
+    analysis_id  <- paste0(tcga_project, "__", gtex_project)
+    analysis_dir <- file.path(here::here(base_dir), analysis_id)
+    suffix       <- paste0("-", feature_set)
+
+    clock_obj <- readRDS(file.path(analysis_dir, paste0("clock_and_RAA_objects", suffix, ".rds")))
+    beta <- clock_obj$clock_cs$beta
+    feat <- clock_obj$feature_names
+    if (is.null(names(beta))) names(beta) <- feat
+
+    tibble(
+      cancertype = tcga_project,
+      pathway    = clean_pathway_label(names(beta)),
+      retained   = is.finite(beta) & beta != 0
+    )
+  }
+)
+
+# ---- pathway-level deviation summaries across cancers ----
+fig4D_dev_all_tbl <- fig4_mean_shap_tbl %>%
+  transmute(
+    cancertype,
+    pathway,
+    deviation_value = mean_phi
+  )
+
+# ---- pathway inclusion: |deviation| >= cutoff in at least n cancers ----
+fig4D_keep_tbl <- fig4D_dev_all_tbl %>%
+  filter(
+    is.finite(deviation_value),
+    abs(deviation_value) >= fig4D_min_abs_dev
+  ) %>%
+  group_by(pathway) %>%
+  summarise(
+    n_recurrent = dplyr::n_distinct(cancertype),
+    max_abs_dev = max(abs(deviation_value), na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(n_recurrent >= fig4D_min_recurrence) %>%
+  mutate(Category = assign_pathway_category(pathway))
+
+fig4D_path_keep <- fig4D_keep_tbl$pathway
+
+# ---- dynamic display categories for plotting only ----
+# Keep true Category assignments intact, but merge singleton categories
+# with the next smallest category so facet headers are wide enough to render.
+fig4D_base_category_levels <- c(
+  "Proliferation",
+  "Immune",
+  "Metabolic",
+  "Stress / Damage",
+  "Signaling",
+  "Hormone",
+  "Cell State",
+  "Other"
+)
+
+fig4D_cat_count_tbl <- fig4D_keep_tbl %>%
+  count(Category, name = "n_path_cat") %>%
+  mutate(
+    Category = factor(Category, levels = fig4D_base_category_levels)
+  ) %>%
+  arrange(n_path_cat, Category) %>%
+  mutate(Category = as.character(Category))
+
+fig4D_display_groups <- list()
+i <- 1L
+g <- 1L
+
+while (i <= nrow(fig4D_cat_count_tbl)) {
+  this_cat <- fig4D_cat_count_tbl$Category[i]
+  this_n   <- fig4D_cat_count_tbl$n_path_cat[i]
+
+  if (this_n == 1L && i < nrow(fig4D_cat_count_tbl)) {
+    group_cats <- c(this_cat, fig4D_cat_count_tbl$Category[i + 1L])
+    i <- i + 2L
+  } else {
+    group_cats <- this_cat
+    i <- i + 1L
+  }
+
+  fig4D_display_groups[[g]] <- tibble(
+    Category = group_cats,
+    DisplayCategory = paste(group_cats, collapse = " +\n")
+  )
+  g <- g + 1L
+}
+
+fig4D_display_category_map <- bind_rows(fig4D_display_groups)
+
+fig4D_keep_tbl <- fig4D_keep_tbl %>%
+  left_join(fig4D_display_category_map, by = "Category")
+
+fig4D_display_category_levels <- fig4D_display_category_map %>%
+  mutate(
+    Category = factor(Category, levels = fig4D_base_category_levels),
+    display_priority = dplyr::case_when(
+      Category == "Proliferation" ~ 1L,
+      Category == "Immune" ~ 2L,
+      Category == "Metabolic" ~ 3L,
+      TRUE ~ 100L + as.integer(Category)
+    )
+  ) %>%
+  group_by(DisplayCategory) %>%
+  summarise(
+    display_priority = min(display_priority),
+    .groups = "drop"
+  ) %>%
+  arrange(display_priority, DisplayCategory) %>%
+  pull(DisplayCategory)
+
+
+# ---- build long table for deviation only ----
+fig4D_plot_tbl <- fig4D_dev_all_tbl %>%
+  filter(pathway %in% fig4D_path_keep) %>%
+  transmute(
+    cancertype,
+    pathway,
+    value = deviation_value
+  ) %>%
+  left_join(fig4D_keep_tbl, by = "pathway") %>%
+  mutate(
+    cancertype = factor(cancertype, levels = fig4D_cancer_order)
+  )
+
+# ---- order pathways within category: most-negative-and-recurrent at top ----
+# Within each category, pathways are sorted by (a) direction score = n_pos - n_neg
+# ascending, then (b) recurrence (total non-zero cancers) descending, then
+# (c) mean deviation ascending as a final tie-breaker.
+#
+# Combined with scale_y_discrete(limits = rev) on the plot, this produces
+# top-to-bottom within each category facet:
+#   - Most-negative + most-recurrent (e.g., G2M retained in 6/6, all negative)
+#   - Less-recurrent or less-extremely-negative pathways
+#   - Mixed pathways
+#   - Less-recurrent or less-extremely-positive pathways
+#   - Most-positive + most-recurrent at the bottom
+fig4D_path_order <- fig4D_plot_tbl %>%
+  group_by(Category, pathway) %>%
+  summarise(
+    n_pos = sum(value > 0, na.rm = TRUE),
+    n_neg = sum(value < 0, na.rm = TRUE),
+    direction_score     = n_pos - n_neg,
+    total_retention     = n_pos + n_neg,
+    mean_across_cancers = mean(value, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(Category) %>%
+  arrange(direction_score, desc(total_retention), mean_across_cancers,
+          .by_group = TRUE) %>%
+  ungroup() %>%
+  pull(pathway)
+
+# ---- complete all pathway x cancer combinations so zero tiles are explicit ----
+# Tissue and retained columns are added at the end:
+#   - Tissue feeds the x-facet (bottom strip)
+#   - retained marks non-retained pathways for the grey X overlay
+#
+# IMPORTANT: fig4D_retention_tbl has pathway as character, which would coerce
+# the join result to character and drop our factor levels. We convert it to
+# a matched factor before the join, and additionally re-apply the factor
+# levels at the end of the pipeline as a defensive safeguard.
+fig4D_plot_tbl <- fig4D_plot_tbl %>%
+  select(cancertype, pathway, value) %>%
+  mutate(pathway = factor(pathway, levels = fig4D_path_order)) %>%
+  tidyr::complete(
+    cancertype,
+    pathway,
+    fill = list(value = 0)
+  ) %>%
+  left_join(
+    fig4D_keep_tbl %>%
+      select(pathway, Category, DisplayCategory) %>%
+      distinct() %>%
+      mutate(pathway = factor(pathway, levels = fig4D_path_order)),
+    by = "pathway"
+  ) %>%
+  left_join(
+    fig4D_retention_tbl %>%
+      mutate(
+        cancertype = factor(cancertype, levels = fig4D_cancer_order),
+        pathway    = factor(pathway,    levels = fig4D_path_order)
+      ),
+    by = c("cancertype", "pathway")
+  ) %>%
+  mutate(
+    Category = factor(
+      Category,
+      levels = c(
+        "Proliferation",
+        "Immune",
+        "Metabolic",
+        "Stress / Damage Response",
+        "Signaling",
+        "Hormone",
+        "Cell State",
+        "Other"
+      )
+    ),
+    DisplayCategory = factor(DisplayCategory, levels = fig4D_display_category_levels),
+    Tissue = factor(
+      unname(fig4D_tissue_map[as.character(cancertype)]),
+      levels = fig4D_tissue_levels
+    ),
+    retained = ifelse(is.na(retained), FALSE, retained),
+    # Defensive re-factor: ensures pathway has the intended levels regardless
+    # of any coercion that may have happened in the joins above.
+    pathway = factor(as.character(pathway), levels = fig4D_path_order)
+  )
+
+p_fig4D <- ggplot(
+  fig4D_plot_tbl,
+  aes(x = cancertype, y = pathway, fill = value)
+) +
+  geom_tile(
+    colour = "grey75",
+    linewidth = 0.6,
+    width = 0.95,
+    height = 0.95
+  ) +
+  # Grey X over cells whose pathway is not retained by the elastic-net clock
+  geom_point(
+    data = function(d) d %>% filter(!retained),
+    shape = 4,
+    size = 3.2,
+    colour = "grey45",
+    stroke = 1.1
+  ) +
+  scale_fill_gradient2(
+    low = "#4575b4",
+    mid = "white",
+    high = "#d73027",
+    midpoint = 0,
+    limits = c(-fig4D_scale_cap, fig4D_scale_cap),
+    oob = scales::squish,
+    breaks = c(-fig4D_scale_cap, -fig4D_scale_cap / 2, 0,
+               fig4D_scale_cap / 2, fig4D_scale_cap),
+    labels = c(sprintf("\u2264 %g", -fig4D_scale_cap),
+               sprintf("%g", -fig4D_scale_cap / 2),
+               "0",
+               sprintf("%g", fig4D_scale_cap / 2),
+               sprintf("\u2265 %g", fig4D_scale_cap)),
+    name = "Mean Pathway Deviation (ClockSHAP, years)",
+    guide = guide_colorbar(
+      direction = "horizontal",
+      barwidth = unit(4.2, "cm"),
+      barheight = unit(0.4, "cm"),
+      title.position = "top",
+      title.hjust = 0.5
+    )
+  ) +
+  facet_grid(
+    DisplayCategory ~ Tissue,
+    scales = "free",
+    space = "free",
+    switch = "x"
+  ) +
+  scale_x_discrete(position = "top") +
+  scale_y_discrete(limits = rev) +
+  labs(
+    x = NULL,
+    y = NULL
+  ) +
+  theme_bw(base_size = 10) +
+  theme(
+    strip.background = element_rect(fill = "grey95", colour = NA),
+    strip.placement = "outside",
+    strip.text.y.right = element_text(face = "bold", size = 7.5, lineheight = 0.9),
+    strip.text.x.bottom = element_text(face = "bold", size = 7.5),
+    axis.text.x = element_text(size = 9, face = "bold"),
+    axis.text.y = element_text(size = 8),
+    panel.grid = element_blank(),
+    panel.spacing.x = unit(3, "pt"),
+    panel.spacing.y = unit(2, "pt"),
+    legend.position = "bottom",
+    legend.box.margin = margin(t = 6),
+    legend.text = element_text(size = 9),
+    legend.title = element_text(size = 9)
+  )
+
+p_fig4D
+```
+
+```{r}
+out_file <- file.path(out_dir, "Fig4D_CrossCancer_Stable_Pathway_Overview.pdf")
+
+ggsave(
+  filename = out_file,
+  plot = p_fig4D,
+  width = 4.25,
+  height = 7.5,
+  units = "in"
+)
+
+message("Saved: ", out_file)
+```
+
+## Figure 4D Supplement — Full pathway deviation overview
+
+This supplementary version drops the cross-cancer recurrence requirement
+and shows all pathways whose mean ClockSHAP deviation contribution exceeds
+1 year in magnitude in at least one cancer. Visualization choices match
+Figure 4D (category facets, tissue grouping at bottom, grey X for non-
+retained pathways, ±5 year color cap, within-category ordering by
+direction prevalence and recurrence). Readers can use this panel to
+inspect single-cancer pathway signals that were excluded from the main
+Figure 4D for parsimony.
+
+```{r}
+# ---- supplement-specific tuning knobs ----
+fig4DSupp_min_recurrence <- 1L    # any single cancer clearing the cutoff
+fig4DSupp_min_abs_dev    <- 1.0
+
+# ---- inclusion: |deviation| >= cutoff in at least 1 cancer ----
+fig4DSupp_keep_tbl <- fig4D_dev_all_tbl %>%
+  filter(
+    is.finite(deviation_value),
+    abs(deviation_value) >= fig4DSupp_min_abs_dev
+  ) %>%
+  group_by(pathway) %>%
+  summarise(
+    n_recurrent = dplyr::n_distinct(cancertype),
+    max_abs_dev = max(abs(deviation_value), na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(n_recurrent >= fig4DSupp_min_recurrence) %>%
+  mutate(Category = assign_pathway_category(pathway))
+
+fig4DSupp_path_keep <- fig4DSupp_keep_tbl$pathway
+
+# ---- display category merging: same singleton-merge logic as main panel ----
+fig4DSupp_cat_count_tbl <- fig4DSupp_keep_tbl %>%
+  count(Category, name = "n_path_cat") %>%
+  mutate(
+    Category = factor(Category, levels = fig4D_base_category_levels)
+  ) %>%
+  arrange(n_path_cat, Category) %>%
+  mutate(Category = as.character(Category))
+
+fig4DSupp_display_groups <- list()
+i <- 1L
+g <- 1L
+
+while (i <= nrow(fig4DSupp_cat_count_tbl)) {
+  this_cat <- fig4DSupp_cat_count_tbl$Category[i]
+  this_n   <- fig4DSupp_cat_count_tbl$n_path_cat[i]
+
+  if (this_n == 1L && i < nrow(fig4DSupp_cat_count_tbl)) {
+    group_cats <- c(this_cat, fig4DSupp_cat_count_tbl$Category[i + 1L])
+    i <- i + 2L
+  } else {
+    group_cats <- this_cat
+    i <- i + 1L
+  }
+
+  fig4DSupp_display_groups[[g]] <- tibble(
+    Category = group_cats,
+    DisplayCategory = paste(group_cats, collapse = " +\n")
+  )
+  g <- g + 1L
+}
+
+fig4DSupp_display_category_map <- bind_rows(fig4DSupp_display_groups)
+
+fig4DSupp_keep_tbl <- fig4DSupp_keep_tbl %>%
+  left_join(fig4DSupp_display_category_map, by = "Category")
+
+fig4DSupp_display_category_levels <- fig4DSupp_display_category_map %>%
+  mutate(
+    Category = factor(Category, levels = fig4D_base_category_levels),
+    display_priority = dplyr::case_when(
+      Category == "Proliferation" ~ 1L,
+      Category == "Immune" ~ 2L,
+      Category == "Metabolic" ~ 3L,
+      TRUE ~ 100L + as.integer(Category)
+    )
+  ) %>%
+  group_by(DisplayCategory) %>%
+  summarise(
+    display_priority = min(display_priority),
+    .groups = "drop"
+  ) %>%
+  arrange(display_priority, DisplayCategory) %>%
+  pull(DisplayCategory)
+
+# ---- build long table ----
+fig4DSupp_plot_tbl <- fig4D_dev_all_tbl %>%
+  filter(pathway %in% fig4DSupp_path_keep) %>%
+  transmute(
+    cancertype,
+    pathway,
+    value = deviation_value
+  ) %>%
+  left_join(fig4DSupp_keep_tbl, by = "pathway") %>%
+  mutate(
+    cancertype = factor(cancertype, levels = fig4D_cancer_order)
+  )
+
+# ---- within-category ordering: same logic as main panel ----
+fig4DSupp_path_order <- fig4DSupp_plot_tbl %>%
+  group_by(Category, pathway) %>%
+  summarise(
+    n_pos = sum(value > 0, na.rm = TRUE),
+    n_neg = sum(value < 0, na.rm = TRUE),
+    direction_score     = n_pos - n_neg,
+    total_retention     = n_pos + n_neg,
+    mean_across_cancers = mean(value, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(Category) %>%
+  arrange(direction_score, desc(total_retention), mean_across_cancers,
+          .by_group = TRUE) %>%
+  ungroup() %>%
+  pull(pathway)
+
+# ---- complete + retention join + factor cleanup ----
+fig4DSupp_plot_tbl <- fig4DSupp_plot_tbl %>%
+  select(cancertype, pathway, value) %>%
+  mutate(pathway = factor(pathway, levels = fig4DSupp_path_order)) %>%
+  tidyr::complete(
+    cancertype,
+    pathway,
+    fill = list(value = 0)
+  ) %>%
+  left_join(
+    fig4DSupp_keep_tbl %>%
+      select(pathway, Category, DisplayCategory) %>%
+      distinct() %>%
+      mutate(pathway = factor(pathway, levels = fig4DSupp_path_order)),
+    by = "pathway"
+  ) %>%
+  left_join(
+    fig4D_retention_tbl %>%
+      mutate(
+        cancertype = factor(cancertype, levels = fig4D_cancer_order),
+        pathway    = factor(pathway,    levels = fig4DSupp_path_order)
+      ),
+    by = c("cancertype", "pathway")
+  ) %>%
+  mutate(
+    Category = factor(Category, levels = fig4D_base_category_levels),
+    DisplayCategory = factor(DisplayCategory, levels = fig4DSupp_display_category_levels),
+    Tissue = factor(
+      unname(fig4D_tissue_map[as.character(cancertype)]),
+      levels = fig4D_tissue_levels
+    ),
+    retained = ifelse(is.na(retained), FALSE, retained),
+    pathway = factor(as.character(pathway), levels = fig4DSupp_path_order)
+  )
+
+# ---- split DisplayCategory levels into left/right halves ----
+# First 3 categories on the left, remaining categories on the right.
+fig4DSupp_split <- 3L
+fig4DSupp_left_cats  <- head(fig4DSupp_display_category_levels, fig4DSupp_split)
+fig4DSupp_right_cats <- tail(fig4DSupp_display_category_levels,
+                             length(fig4DSupp_display_category_levels) - fig4DSupp_split)
+
+# Shared plot builder: same styling for both halves, with optional legend.
+build_fig4DSupp_half <- function(plot_tbl, keep_cats, include_legend = FALSE) {
+  p <- ggplot(
+    plot_tbl %>% filter(DisplayCategory %in% keep_cats) %>%
+      mutate(DisplayCategory = droplevels(factor(
+        DisplayCategory,
+        levels = keep_cats
+      ))),
+    aes(x = cancertype, y = pathway, fill = value)
+  ) +
+    geom_tile(
+      colour = "grey75",
+      linewidth = 0.6,
+      width = 0.95,
+      height = 0.95
+    ) +
+    geom_point(
+      data = function(d) d %>% filter(!retained),
+      shape = 4,
+      size = 3.2,
+      colour = "grey45",
+      stroke = 1.1
+    ) +
+    scale_fill_gradient2(
+      low = "#4575b4",
+      mid = "white",
+      high = "#d73027",
+      midpoint = 0,
+      limits = c(-fig4D_scale_cap, fig4D_scale_cap),
+      oob = scales::squish,
+      breaks = c(-fig4D_scale_cap, -fig4D_scale_cap / 2, 0,
+                 fig4D_scale_cap / 2, fig4D_scale_cap),
+      labels = c(sprintf("\u2264 %g", -fig4D_scale_cap),
+                 sprintf("%g", -fig4D_scale_cap / 2),
+                 "0",
+                 sprintf("%g", fig4D_scale_cap / 2),
+                 sprintf("\u2265 %g", fig4D_scale_cap)),
+      name = "Mean Pathway Deviation (ClockSHAP, years)",
+      guide = guide_colorbar(
+        direction = "horizontal",
+        barwidth = unit(4.2, "cm"),
+        barheight = unit(0.4, "cm"),
+        title.position = "top",
+        title.hjust = 0.5
+      )
+    ) +
+    facet_grid(
+      DisplayCategory ~ Tissue,
+      scales = "free",
+      space = "free",
+      switch = "x"
+    ) +
+    scale_x_discrete(position = "top") +
+    scale_y_discrete(limits = rev) +
+    labs(x = NULL, y = NULL) +
+    theme_bw(base_size = 10) +
+    theme(
+      strip.background = element_rect(fill = "grey95", colour = NA),
+      strip.placement = "outside",
+      strip.text.y.right = element_text(face = "bold", size = 7.5, lineheight = 0.9),
+      strip.text.x.bottom = element_text(face = "bold", size = 7.5),
+      axis.text.x = element_text(size = 9, face = "bold"),
+      axis.text.y = element_text(size = 8),
+      panel.grid = element_blank(),
+      panel.spacing.x = unit(3, "pt"),
+      panel.spacing.y = unit(2, "pt"),
+      legend.position = if (include_legend) "bottom" else "none",
+      legend.box.margin = margin(t = 6),
+      legend.text = element_text(size = 9),
+      legend.title = element_text(size = 9)
+    )
+
+  p
+}
+
+p_fig4DSupp_left  <- build_fig4DSupp_half(fig4DSupp_plot_tbl, fig4DSupp_left_cats,
+                                          include_legend = FALSE)
+p_fig4DSupp_right <- build_fig4DSupp_half(fig4DSupp_plot_tbl, fig4DSupp_right_cats,
+                                          include_legend = FALSE)
+
+# ---- shared legend, pulled from a separately-built version with legend on ----
+fig4DSupp_legend <- cowplot::get_legend(
+  build_fig4DSupp_half(fig4DSupp_plot_tbl, fig4DSupp_left_cats,
+                       include_legend = TRUE)
+)
+
+# ---- side-by-side composition with shared legend below ----
+p_fig4DSupp <- cowplot::plot_grid(
+  cowplot::plot_grid(
+    p_fig4DSupp_left,
+    p_fig4DSupp_right,
+    ncol = 2,
+    align = "h",
+    axis = "tb"
+  ),
+  fig4DSupp_legend,
+  ncol = 1,
+  rel_heights = c(1, 0.06)
+)
+
+p_fig4DSupp
+```
+
+```{r}
+out_file <- file.path(out_dir, "FigSupplement-PathwayDeviation-Full.pdf")
+
+# Two-column layout: roughly twice as wide, roughly half as tall as the
+# single-column version.
+ggsave(
+  filename = out_file,
+  plot = p_fig4DSupp,
+  width  = 8.5,
+  height = 6.5,
+  units = "in"
+)
+
+message("Saved: ", out_file)
+```
+
+## Session Info
+```{r}
+sessionInfo()
+```

@@ -1,0 +1,272 @@
+---
+title: "TCGA RNAseq - Data Preprocessing"
+subtitle: "TCGA PanCancer Aging"
+author: "Payton Bock - Monti Lab"
+date:   "`r format(Sys.Date(), '%B %d, %Y')`"
+params: 
+  dummy: "dummy"
+output:
+  html_document:
+    theme: united
+    code_folding: hide
+    css: style.css
+    toc: true
+    toc_float: true
+---
+```{r opts, echo=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+```{r setup, include=FALSE}
+#r library
+.libPaths("/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/r-library/")
+
+#libraries
+library(dplyr)
+library(SummarizedExperiment)
+library(ggplot2)
+library(reshape2)
+library(edgeR)
+library(limma)
+library(reactable)
+
+#get environmental variables
+PATH <- file.path( Sys.getenv("PCANAGE","/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/")) 
+TCGA <- file.path( Sys.getenv("CBMDATA","/restricted/projectnb/agedisease/CBMrepositoryData/"), "TCGA-GDC")
+```
+
+## Script Summary 
+- Removes lowly expressed genes from the  RNAseq data  
+
+- Set rownames to our gene symbols in an informed matter using variation
+
+- Applies filtering to all TCGA projects
+
+- Saves processed SummarizedExperiments
+
+## Data Loading
+Load in SummarizedExperiment RDS objects and define output directory
+```{r data loading}
+#Path where the summarized experiment objects you are updating are located
+se_directory <- file.path(TCGA, "RNAseq/processed_data/all/")
+#Path to directory you want to output to
+output_directory <- file.path(PATH, "data/RNAseq/processed_SummarizedExperiments")
+```
+
+Here we load in a single TCGA project (BRCA) to show the workflow
+```{r Load in BRCA object}
+BRCA <- readRDS(file.path(TCGA,"RNAseq/processed_data/all/TCGA-BRCA_RNAseq.rds"))
+```
+
+## Quality Control
+
+### Filtering Lowly Expressed Genes
+I have gone back and forth on the best approach to filtering lowly expressed genes, such as utilizing edgeR's `filterbyExpr()` function. Given our analysis utilized `DESeq2` for differential analysis, I have decided to apply minimal filtering due to `DESeq2` performing internal filtering when extracting results with the `results()` function. 
+
+Therefore we only remove genes that do not have at least 5 counts across 10 samples. This still removes a large number of genes, but provides a balance between computational efficiency and retaining as much information as possible for downstream analyses. 
+```{r}
+keep <- rowSums(cpm(assay(BRCA,"unstranded")) > 0) >= 10
+BRCA_filtered <- BRCA[keep, ]
+
+# Print the number of removed lowly expressed genes
+cat("Number of removed lowly expressed genes:", sum(!keep), "\n")
+cat("Number of remaining genes:", sum(keep), "\n")
+```
+
+
+
+Visualizes the distribution of gene counts before and after filtering to see the impact of removing lowly expressed genes.
+```{r}
+# Distribution of counts before filtering
+counts_before <- SummarizedExperiment::assay(BRCA)
+row_sums_before <- rowSums(counts_before)
+
+p_before <- ggplot2::ggplot(data.frame(counts = row_sums_before + 1), aes(x = counts)) +
+            ggplot2::geom_histogram(bins = 50, fill = "blue", alpha = 0.7) +
+            ggplot2::scale_x_log10() +
+            ggplot2::ggtitle("Gene Counts Distribution Before Filtering")
+
+# Distribution of counts after filtering
+counts_after <- SummarizedExperiment::assay(BRCA_filtered)
+row_sums_after <- rowSums(counts_after)
+
+p_after <- ggplot2::ggplot(data.frame(counts = row_sums_after + 1), aes(x = counts)) +
+           ggplot2::geom_histogram(bins = 50, fill = "green", alpha = 0.7) +
+           ggplot2::scale_x_log10() +
+           ggplot2::ggtitle("Gene Counts Distribution After Filtering")
+
+gridExtra::grid.arrange(p_before, p_after, ncol = 2)
+```
+
+## Removing Duplicate Gene Names
+One issue we have here is that our rows are set as ENSEMBL ids, where their associated gene names may contain duplicates across our entire data set. This is troublesome for downstream analyses that rely on gene symbols such as gene set enrichment analysis (GSEA). Our approach here is to calculate the variance of each ensembl ID (using log transformed and normalized counts), then retain the duplicate that contains the HIGHEST variance. There are other potential approach to this, but genes with high variance are more likely to contain differential expression across samples (at least thats what I think!). 
+
+```{r}
+# Calculate variance for each gene
+gene_variances <- rowVars(assay(BRCA_filtered,"DESeq2_log"))
+
+# Add variance to rowData
+rowData(BRCA_filtered)$variance <- gene_variances
+
+# Extract gene symbols
+gene_symbols <- rowData(BRCA_filtered)$gene_name
+
+# Identify duplicated gene symbols
+duplicated_symbols <- gene_symbols[duplicated(gene_symbols)]
+
+# Number of duplicated gene symbols
+num_duplicated_genes <- length(unique(duplicated_symbols))
+cat("Number of duplicated gene symbols:", num_duplicated_genes, "\n")
+
+# Create a data frame with gene information
+gene_info <- data.frame(
+  ensembl_id = rownames(BRCA_filtered),
+  gene_symbol = gene_symbols,
+  variance = gene_variances,
+  stringsAsFactors = FALSE
+)
+
+# Subset to duplicated genes
+duplicated_gene_info <- gene_info %>% filter(gene_symbol %in% duplicated_symbols)
+
+reactable::reactable(duplicated_gene_info, searchable = TRUE)
+
+# For each gene symbol, keep the Ensembl ID with the highest variance
+gene_info_retained <- gene_info %>%
+  group_by(gene_symbol) %>%
+  slice_max(order_by = variance, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+# Number of duplicates removed
+duplicates_removed <- nrow(gene_info) - nrow(gene_info_retained)
+cat("Number of duplicates removed:", duplicates_removed, "\n")
+
+# Mark genes as retained or not
+gene_info$Status <- ifelse(gene_info$ensembl_id %in% gene_info_retained$ensembl_id, "Retained", "Filtered Out")
+
+duplicated_gene_info <- gene_info %>% filter(gene_symbol %in% duplicated_symbols)
+duplicated_gene_info_retained <- duplicated_gene_info %>% filter(Status == "Retained")
+
+# Plot variances of duplicated genes, coloring retained genes differently
+ggplot(duplicated_gene_info, aes(x = variance, fill = Status)) +
+  geom_histogram(bins = 50, alpha = 0.7, position = "identity") +
+  ggtitle("Variance Distribution of Duplicated Genes (All)") +
+  xlab("Variance") +
+  ylab("Number of Ensembl IDs") +
+  scale_fill_manual(values = c("Retained" = "lightgreen", "Filtered Out" = "skyblue")) +
+  theme_minimal()
+
+```
+
+
+
+
+```{r}
+# Get Ensembl IDs to keep
+ensembl_ids_to_keep <- gene_info_retained$ensembl_id
+
+# Subset BRCA_filtered
+BRCA_filtered_unique <- BRCA_filtered[ensembl_ids_to_keep, ]
+
+# Update rownames to gene symbols
+rownames(BRCA_filtered_unique) <- rowData(BRCA_filtered_unique)$gene_symbol
+
+# Number of genes before and after duplicate removal
+cat("Number of genes before removing duplicates:", nrow(BRCA_filtered), "\n")
+cat("Number of genes after removing duplicates:", nrow(BRCA_filtered_unique), "\n")
+```
+
+
+
+# Apply Filtering to all TCGA projects
+This section applies the filtering steps to all RNAseq SummarizedExperiment objects 
+```{r filter SEs}
+# Create a list of all files ending in .rds in se_directory
+file_list <- list.files(path = se_directory, pattern = "*.rds", full.names = TRUE)
+
+# Initialize a data frame to store the summary information
+summary_table <- data.frame(Project = character(),
+                            RemovedGenes = numeric(),
+                            RemainingGenes = numeric(),
+                            RemovedDuplicates = numeric(),
+                            stringsAsFactors = FALSE)
+
+# Loop through each file
+for (file_path in file_list) {
+  cat("Filtering and saving ", file_path, "\n")
+  
+  # Read the SummarizedExperiment object
+  se_obj <- readRDS(file_path)
+  
+  # Filter lowly expressed genes (using your existing criteria)
+  keep <- rowSums(cpm(assay(se_obj, "unstranded")) > 0) >= 10
+  se_obj_filtered <- se_obj[keep, ]
+  
+  # Track the number of removed and remaining genes
+  removed_genes <- sum(!keep)
+  remaining_genes <- sum(keep)
+  
+  # Calculate variance for each gene (Ensembl ID)
+  gene_variances <- rowVars(assay(se_obj_filtered, "DESeq2_log"))
+  rowData(se_obj_filtered)$variance <- gene_variances
+  
+  # Extract gene symbols
+  gene_symbols <- rowData(se_obj_filtered)$gene_name
+  
+  # Create a data frame with Ensembl IDs, gene symbols, and variances
+  gene_info <- data.frame(
+    ensembl_id = rownames(se_obj_filtered),
+    gene_symbol = gene_symbols,
+    variance = gene_variances,
+    stringsAsFactors = FALSE
+  )
+  
+  # For genes with duplicates, keep the one with the highest variance
+# For genes with duplicates, keep the one with the highest variance
+  gene_info_retained <- gene_info %>%
+    group_by(gene_symbol) %>%
+    slice_max(order_by = variance, n = 1, with_ties = FALSE) %>%
+    ungroup()
+  
+  # Get the Ensembl IDs to keep
+  ensembl_ids_to_keep <- gene_info_retained$ensembl_id
+  
+  # Calculate the number of duplicates removed
+  removed_duplicates <- nrow(gene_info) - nrow(gene_info_retained)
+  
+  # Subset the SummarizedExperiment object
+  se_obj_filtered <- se_obj_filtered[ensembl_ids_to_keep, ]
+  
+  # Update rownames to gene symbols
+  rownames(se_obj_filtered) <- rowData(se_obj_filtered)$gene_name
+  
+  # Update remaining genes count
+  remaining_genes <- nrow(se_obj_filtered)
+  
+  # Append the information to the summary table
+  project_name <- tools::file_path_sans_ext(basename(file_path))
+  summary_table <- rbind(summary_table, data.frame(Project = project_name,
+                                                   RemovedGenes = removed_genes,
+                                                   RemovedDuplicates = removed_duplicates,
+                                                   RemainingGenes = remaining_genes))
+  
+  # Ensure sample order still matches (should not be an issue)
+  if (identical(colnames(se_obj), colnames(se_obj_filtered)) & !anyDuplicated(rownames(se_obj_filtered))) {
+    # Save output
+    output_path <- file.path(output_directory, basename(file_path))
+    saveRDS(se_obj_filtered, output_path)
+    
+    cat("Saved filtered SummarizedExperiment to", output_path, "\n\n")
+  } else {
+    cat("Cannot create new SummarizedExperiment: Samples/Genes are mismatched\n")
+  }
+}
+
+# Print the summary table
+reactable::reactable(summary_table, searchable = TRUE, resizable = TRUE)
+```
+
+## Session Info
+```{r session info}
+sessionInfo()
+```

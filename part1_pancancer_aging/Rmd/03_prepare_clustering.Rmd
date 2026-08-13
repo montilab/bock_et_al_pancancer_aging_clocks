@@ -1,0 +1,509 @@
+---
+title: "03 — Prepare pan-cancer clustering for Fig. 1B"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+## Overview
+
+Fig. 1B clusters cancers from the cross-cancer similarity of their per-feature
+age-effect profiles. The clustering is hierarchical (Ward.D2) with optimal
+leaf ordering, applied to a distance matrix derived from per-layer Pearson
+similarities averaged across molecular layers.
+
+This script:
+
+1. **Loads** per-cancer age-effect statistics for every layer the upstream
+   pipeline produced (Methylation, RNA-seq, miRNA, RPPA, Mutation, SCNA).
+2. **Filters** each layer to features with evidence of an age effect in at
+   least one cancer.
+3. **Diagnoses** each layer for two criteria that determine whether
+   cross-cancer similarity can be computed reliably: post-filter feature count
+   and pairwise feature overlap between cancers.
+4. **Selects** layers for clustering. The diagnostic informs the decision;
+   the included set itself is specified explicitly so the rationale for each
+   layer's inclusion or exclusion is visible at the point of decision.
+   Excluded layers are not discarded from the manuscript — they remain in
+   Fig. 1A's per-cancer counts; they are excluded only from the cross-cancer
+   similarity step.
+5. **Combines** retained layers via pairwise-available similarity averaging
+   with a per-pair feature-overlap floor.
+6. **Clusters** cancers from the resulting distance.
+
+Each decision is explained inline next to the chunk that implements it.
+
+## Libraries
+
+```{r}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(purrr)
+  library(tibble)
+  library(here)
+})
+```
+
+## Paths
+
+```{r}
+import_file <- here::here(
+  "results", "derived", "part1", "01_import_official_results", "part1_imported_results.rds"
+)
+
+if (!file.exists(import_file)) {
+  stop("Run 01_import_official_results.Rmd first. Missing file: ", import_file)
+}
+
+out_dir    <- here::here("results", "derived", "part1", "03_prepare_clustering")
+tables_dir <- here::here("results", "tables", "part1")
+
+dir.create(out_dir,    recursive = TRUE, showWarnings = FALSE)
+dir.create(tables_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Load imported results
+
+```{r}
+part1_imported_results <- readRDS(import_file)
+
+layer_manifest       <- part1_imported_results$layer_manifest
+result_file_manifest <- part1_imported_results$result_file_manifest
+```
+
+## Per-pair overlap floor
+
+A meaningful Pearson correlation between two cancers needs them to share
+enough features. We apply this as a *per-pair mask* during averaging — a
+pair receives a layer's contribution only when that pair's overlap in that
+layer meets the floor. This protects the combined similarity from noisy
+contributions when a specific pair has very thin shared coverage in one
+layer (relevant primarily for SCNA, where heme cancers have sparse copy-
+number events).
+
+```{r}
+MIN_PAIR_OVERLAP <- 100
+```
+
+## Helper functions
+
+### Optimal leaf ordering
+
+`hcopt` performs Ward.D2 hierarchical clustering and reorders leaves to
+minimize the sum of distances between adjacent tips. This does not change
+which cancers cluster together; it only chooses the most readable left-to-
+right arrangement among the equivalent orderings.
+
+```{r}
+hcopt <- function(d, HC = NULL, method = "ward.D2", members = NULL) {
+  if (!requireNamespace("cba", quietly = TRUE)) {
+    stop("Package 'cba' is required for optimal leaf ordering in Fig. 1B clustering.")
+  }
+
+  if (is.null(HC)) {
+    HC <- stats::hclust(d, method = method, members = members)
+  }
+
+  ORD <- cba::order.optimal(d, merge = HC$merge)
+  HC$merge <- ORD$merge
+  HC$order <- ORD$order
+  HC
+}
+```
+
+### Pairwise feature overlap
+
+For any feature × cancer matrix, the (i, j) entry of the overlap matrix is
+the number of features for which both cancer i and cancer j have a non-NA
+age-effect estimate. This is what `cor(..., use = "pairwise.complete.obs")`
+silently uses; making it explicit lets us inspect and threshold on it.
+
+```{r}
+compute_pair_overlap <- function(mat) {
+  present <- !is.na(mat)
+  t(present) %*% present
+}
+```
+
+### Per-layer matrix construction
+
+For each layer we load the per-cancer regression results, extract the
+single age-effect statistic the upstream pipeline reports (Wald t for
+DESeq2, moderated t for limma, regression statistic for mutation/SCNA),
+and assemble a feature × cancer matrix. Pearson is scale-invariant within a
+layer, so the choice of statistic does not bias the layer's similarity.
+
+We pre-filter to features reaching the layer's adjusted-p threshold in
+**at least one cancer**. Rationale: features that are nowhere age-associated
+do not carry tissue-of-origin information in age-effect space; they only add
+noise to the cross-cancer Pearson. Methylation additionally has a top-
+100,000 cap by significance recurrence — methylation has many more features
+than the next-largest layer, and the cap is a practical compute control with
+negligible impact on similarity (cap-removed features are nearly all
+significant in only one cancer).
+
+```{r}
+process_layer_for_clustering <- function(layer_row, file_manifest) {
+  files_tbl <- file_manifest %>%
+    dplyr::filter(layer_id == layer_row$layer_id)
+
+  if (layer_row$layer_id %in% c("RNAseq", "miRNA")) {
+    files_tbl <- files_tbl %>% dplyr::filter(result_use == "unfiltered_deseq")
+  } else if (layer_row$layer_id == "Mutation") {
+    files_tbl <- files_tbl %>% dplyr::filter(result_use == "with_covariates_all")
+  } else if (layer_row$layer_id == "SCNA") {
+    files_tbl <- files_tbl %>% dplyr::filter(result_use == "with_covariates_gene_level")
+  } else {
+    files_tbl <- files_tbl %>% dplyr::filter(result_use == "limma")
+  }
+
+  if (nrow(files_tbl) == 0) {
+    stop("No clustering input files were found for layer: ", layer_row$layer_id)
+  }
+
+  t_stats_list <- vector("list", nrow(files_tbl))
+  pvals_list   <- vector("list", nrow(files_tbl))
+
+  for (i in seq_len(nrow(files_tbl))) {
+    project   <- files_tbl$Project[[i]]
+    file_path <- files_tbl$file_path[[i]]
+
+    x <- readRDS(file_path)
+
+    # Per-layer feature extraction. Mutation results live under list element
+    # "all"; SCNA splits amplifications and deletions into separate sublists,
+    # so we encode them as AMP|gene and DEL|gene to keep direction
+    # information distinct for clustering.
+    if (layer_row$layer_id == "Mutation") {
+      if (!"all" %in% names(x)) {
+        stop("Mutation result file does not contain an 'all' entry: ", basename(file_path))
+      }
+
+      x <- x[["all"]] %>%
+        as.data.frame() %>%
+        dplyr::rename(Feature = gene_name)
+
+    } else if (layer_row$layer_id == "SCNA") {
+      if (!all(c("amplified_two_levels", "deleted_two_levels") %in% names(x))) {
+        stop(
+          "SCNA result file is missing amplified/deleted gene-level tables: ",
+          basename(file_path)
+        )
+      }
+
+      x <- dplyr::bind_rows(
+        x[["amplified_two_levels"]] %>%
+          as.data.frame() %>%
+          dplyr::mutate(Feature = paste0("AMP|", feature_name)),
+        x[["deleted_two_levels"]] %>%
+          as.data.frame() %>%
+          dplyr::mutate(Feature = paste0("DEL|", feature_name))
+      )
+
+    } else if (isTRUE(layer_row$feature_in_rownames)) {
+      x <- x %>%
+        as.data.frame() %>%
+        tibble::rownames_to_column("Feature")
+
+    } else {
+      x <- x %>%
+        as.data.frame() %>%
+        dplyr::rename(Feature = dplyr::all_of(layer_row$feature_identifier))
+    }
+
+    required_cols <- c("Feature", layer_row$stat_col, layer_row$pval_col)
+    missing_cols  <- setdiff(required_cols, colnames(x))
+
+    if (length(missing_cols) > 0) {
+      stop(
+        "Layer ", layer_row$layer_id,
+        " is missing required columns in ", basename(file_path), ": ",
+        paste(missing_cols, collapse = ", ")
+      )
+    }
+
+    t_stats_list[[i]] <- x %>%
+      dplyr::select(Feature, !!rlang::sym(layer_row$stat_col)) %>%
+      dplyr::rename(!!project := !!rlang::sym(layer_row$stat_col))
+
+    pvals_list[[i]] <- x %>%
+      dplyr::select(Feature, !!rlang::sym(layer_row$pval_col)) %>%
+      dplyr::rename(!!project := !!rlang::sym(layer_row$pval_col))
+  }
+
+  combined_t <- purrr::reduce(t_stats_list, dplyr::full_join, by = "Feature")
+  combined_p <- purrr::reduce(pvals_list,   dplyr::full_join, by = "Feature")
+
+  # Significance pre-filter: keep features reaching threshold in any cancer.
+  significant_features <- combined_p %>%
+    dplyr::filter(dplyr::if_any(-Feature, ~ .x < layer_row$pval_threshold)) %>%
+    dplyr::pull(Feature)
+
+  filtered_t <- combined_t %>% dplyr::filter(Feature %in% significant_features)
+  filtered_p <- combined_p %>% dplyr::filter(Feature %in% significant_features)
+
+  # Optional per-layer cap (methylation only) to control compute.
+  if (!is.na(layer_row$top_n)) {
+    significance_counts <- filtered_p %>%
+      dplyr::mutate(
+        Significant_Count = rowSums(
+          dplyr::across(-Feature, ~ .x < layer_row$pval_threshold),
+          na.rm = TRUE
+        )
+      ) %>%
+      dplyr::arrange(dplyr::desc(Significant_Count))
+
+    n_keep       <- min(layer_row$top_n, nrow(significance_counts))
+    top_features <- significance_counts %>%
+      dplyr::slice(seq_len(n_keep)) %>%
+      dplyr::pull(Feature)
+
+    filtered_t <- filtered_t %>% dplyr::filter(Feature %in% top_features)
+  }
+
+  filtered_t %>%
+    tibble::column_to_rownames("Feature") %>%
+    as.matrix()
+}
+```
+
+## Load every available layer
+
+We load all six layers the upstream pipeline produced. Two will turn out to
+be unsuitable for cross-cancer similarity; we make that decision *after*
+inspecting each layer's diagnostics, not before.
+
+```{r}
+all_layers <- layer_manifest$layer_id
+
+all_layer_matrices <- purrr::map(
+  split(layer_manifest, layer_manifest$layer_id)[all_layers],
+  ~ process_layer_for_clustering(.x, result_file_manifest)
+)
+```
+
+## Per-layer Pearson similarity and pair overlap
+
+For each layer we compute (a) the cancer × cancer Pearson similarity using
+all available pairs, and (b) the cancer × cancer matrix of how many features
+each pair of cancers shares (i.e., have a non-NA age-effect estimate for in
+both). The latter is what makes per-pair masking possible later.
+
+```{r}
+all_similarity_by_layer <- purrr::map(
+  all_layer_matrices,
+  ~ stats::cor(.x, use = "pairwise.complete.obs", method = "pearson")
+)
+
+all_pair_overlap_by_layer <- purrr::map(all_layer_matrices, compute_pair_overlap)
+```
+
+## Layer suitability diagnostics
+
+We summarize each layer with:
+
+- **Total features** (post-filter): how big is the feature universe?
+- **Pairwise overlap** (min, median, max across cancer pairs): how much of
+  that universe does an average pair actually share?
+
+```{r}
+summarize_pair_overlap <- function(overlap_mat) {
+  vals <- as.numeric(overlap_mat[upper.tri(overlap_mat)])
+  vals <- vals[is.finite(vals)]
+  if (length(vals) == 0) {
+    return(c(min = NA_real_, median = NA_real_, max = NA_real_))
+  }
+  c(min = min(vals), median = stats::median(vals), max = max(vals))
+}
+
+layer_diagnostics <- tibble::tibble(layer_id = all_layers) %>%
+  dplyr::mutate(
+    n_cancers      = purrr::map_int(layer_id, ~ ncol(all_layer_matrices[[.x]])),
+    total_features = purrr::map_int(layer_id, ~ nrow(all_layer_matrices[[.x]])),
+    overlap_stats  = purrr::map(layer_id, ~ summarize_pair_overlap(all_pair_overlap_by_layer[[.x]]))
+  ) %>%
+  dplyr::mutate(
+    min_pair_overlap    = purrr::map_dbl(overlap_stats, "min"),
+    median_pair_overlap = purrr::map_dbl(overlap_stats, "median"),
+    max_pair_overlap    = purrr::map_dbl(overlap_stats, "max")
+  ) %>%
+  dplyr::select(-overlap_stats)
+
+layer_diagnostics
+```
+
+## Layer selection
+
+The diagnostic above informs which layers are appropriate for cross-cancer
+similarity. Two layers are excluded:
+
+- **RPPA**: the panel is curated to a few hundred antibodies — too narrow a
+  feature space to anchor cross-cancer similarity, and the dynamic range is
+  much smaller than the genomics layers. This is a structural/measurement
+  decision rather than a data-driven one. RPPA's per-cancer counts still
+  appear in Fig. 1A.
+
+- **Mutation**: the per-cancer mutation regression applies a `min_group_size
+  = 10` filter (a gene is tested only if both ≥ 10 mutated and ≥ 10 wild-
+  type samples exist). This restricts each cancer's testable feature set to
+  its recurrent driver genes, which are largely tissue-specific. The
+  diagnostic above shows median pairwise feature overlap of ~1, far below
+  what is needed for stable Pearson similarity. Mutation's per-cancer
+  counts still appear in Fig. 1A.
+
+The remaining four layers — Methylation, RNA-seq, miRNA, SCNA — are
+retained for clustering. SCNA passes the median-overlap criterion but has a
+long left tail (e.g., heme cancers with sparse copy-number events); the
+per-pair overlap floor will mask SCNA's contribution for those specific
+pairs while leaving its contribution intact where it is well-supported.
+
+```{r}
+selected_layers <- c("Methylation", "RNAseq", "miRNA", "SCNA")
+excluded_layers <- setdiff(all_layers, selected_layers)
+
+stopifnot(all(selected_layers %in% all_layers))
+
+# Restrict downstream objects to retained layers. The full set is preserved
+# under the `all_*` names for diagnostic reproducibility.
+layer_matrices        <- all_layer_matrices[selected_layers]
+similarity_by_layer   <- all_similarity_by_layer[selected_layers]
+pair_overlap_by_layer <- all_pair_overlap_by_layer[selected_layers]
+
+# Cancers must appear in our most comprehensive layers (Methylation and
+# RNA-seq) to enter the clustering. This serves as a quality floor on
+# per-cancer similarity estimation; in practice every cancer in the cohort
+# meets this requirement.
+baseline_layers <- intersect(c("Methylation", "RNAseq"), selected_layers)
+cancers_base    <- Reduce(
+  intersect,
+  purrr::map(similarity_by_layer[baseline_layers], colnames)
+)
+```
+
+## Cross-layer similarity averaging with per-pair overlap floor
+
+For each retained layer, we contribute its per-pair similarity to the
+average — but only where the pair shares at least `MIN_PAIR_OVERLAP`
+features in that layer. The denominator (`S_n`) tracks how many layers
+actually contributed to each pair, so pairs with a layer masked out are
+averaged from the remaining layers, not penalized.
+
+```{r}
+S_sum <- matrix(
+  0,
+  nrow = length(cancers_base),
+  ncol = length(cancers_base),
+  dimnames = list(cancers_base, cancers_base)
+)
+S_n <- S_sum
+
+for (nm in selected_layers) {
+  S <- similarity_by_layer[[nm]]
+  O <- pair_overlap_by_layer[[nm]]
+
+  common <- intersect(cancers_base, colnames(S))
+  if (length(common) < 2) next
+
+  S_sub <- S[common, common, drop = FALSE]
+  O_sub <- O[common, common, drop = FALSE]
+
+  valid <- is.finite(S_sub) & O_sub >= MIN_PAIR_OVERLAP
+
+  S_sum[common, common] <- S_sum[common, common] + ifelse(valid, S_sub, 0)
+  S_n[common, common]   <- S_n[common, common] + ifelse(valid, 1, 0)
+}
+
+if (any(S_n == 0)) {
+  zero_pairs <- which(S_n == 0, arr.ind = TRUE)
+  stop(
+    "Some cancer pairs received no layer contributions after applying the ",
+    "per-pair overlap floor. First affected pair: ",
+    rownames(S_n)[zero_pairs[1, 1]], " / ", colnames(S_n)[zero_pairs[1, 2]]
+  )
+}
+
+average_similarity <- S_sum / S_n
+diag(average_similarity) <- 1
+
+average_distance <- as.dist(1 - average_similarity)
+```
+
+## Hierarchical clustering with optimal leaf ordering
+
+```{r}
+hc_pw_opt    <- hcopt(average_distance, method = "ward.D2")
+cancer_order <- hc_pw_opt$labels[hc_pw_opt$order]
+```
+
+## Save clustering results
+
+The saved object preserves every field the figure script reads
+(`selected_layers`, `layer_matrices`, `similarity_by_layer`,
+`pair_overlap_by_layer`, `average_similarity`, `hclust`, `thresholds`) and
+adds the diagnostic context (`layer_diagnostics`, `excluded_layers`,
+`all_*` siblings) so the inclusion decisions are reproducible from this
+file alone.
+
+```{r}
+pancancer_clustering_results <- list(
+  # Decisions and parameters
+  selected_layers   = selected_layers,
+  excluded_layers   = excluded_layers,
+  baseline_layers   = baseline_layers,
+  layer_diagnostics = layer_diagnostics,
+  thresholds        = list(
+    MIN_PAIR_OVERLAP = MIN_PAIR_OVERLAP
+  ),
+
+  # Per-layer data — retained layers (used downstream)
+  layer_ids             = selected_layers,
+  layer_matrices        = layer_matrices,
+  similarity_by_layer   = similarity_by_layer,
+  pair_overlap_by_layer = pair_overlap_by_layer,
+
+  # Per-layer data — full set (kept for transparency / diagnostics)
+  all_layer_matrices        = all_layer_matrices,
+  all_similarity_by_layer   = all_similarity_by_layer,
+  all_pair_overlap_by_layer = all_pair_overlap_by_layer,
+
+  # Combined similarity and clustering
+  average_similarity = average_similarity,
+  n_layers_per_pair  = S_n,
+  average_distance   = average_distance,
+  hclust             = hc_pw_opt,
+  cancer_order       = cancer_order
+)
+
+saveRDS(
+  pancancer_clustering_results,
+  file.path(out_dir, "pancancer_clustering_results.rds")
+)
+
+utils::write.csv(
+  layer_diagnostics,
+  file = file.path(tables_dir, "fig1b_layer_diagnostics.csv"),
+  row.names = FALSE
+)
+
+utils::write.csv(
+  data.frame(Project = cancer_order),
+  file = file.path(tables_dir, "fig1b_cancer_order.csv"),
+  row.names = FALSE
+)
+```
+
+## Quick checks
+
+```{r}
+selected_layers
+excluded_layers
+baseline_layers
+range(S_n)
+cancer_order
+```

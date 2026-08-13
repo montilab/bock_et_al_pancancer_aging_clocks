@@ -1,0 +1,156 @@
+---
+title: "Downloading TCGA RNAseq Data"
+subtitle: "TCGA PanCancer Aging"
+author: "Payton Bock - Monti Lab"
+date:   "`r format(Sys.Date(), '%B %d, %Y')`"
+params: 
+  dummy: "dummy"
+output:
+  html_document:
+    theme: united
+    code_folding: hide
+    css: style.css
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+```{r, include = FALSE}
+#Load TCGA biolinks library
+.libPaths("/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/r-library/")
+
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(dplyr)
+library(edgeR)
+library(DESeq2)
+
+```
+
+## Script Summary 
+- Downloads raw RNAseq data using TCGAbiolinks queries
+- 33 total cancer types
+- Creates SummarizedExperiment objects for each cancer type
+
+## Set up
+```{r projects to download}
+projects <- c(
+  "TCGA-BRCA", "TCGA-OV","TCGA-GBM", "TCGA-LUAD", "TCGA-UCEC", 
+  "TCGA-KIRC", "TCGA-HNSC", "TCGA-LGG", "TCGA-THCA", "TCGA-LUSC", 
+  "TCGA-PRAD", "TCGA-SKCM", "TCGA-COAD", "TCGA-STAD", "TCGA-BLCA", 
+  "TCGA-LIHC", "TCGA-CESC", "TCGA-KIRP", "TCGA-SARC", "TCGA-LAML", 
+  "TCGA-ESCA", "TCGA-PAAD", "TCGA-PCPG", "TCGA-READ", "TCGA-TGCT", 
+  "TCGA-THYM", "TCGA-KICH", "TCGA-ACC", "TCGA-MESO", "TCGA-UVM", 
+  "TCGA-DLBC", "TCGA-UCS", "TCGA-CHOL"
+)
+
+#Sets the CBMDATA directory path
+Sys.setenv(CBMDATA = "/restricted/projectnb/agedisease/CBMrepositoryData")
+
+#Combines CBMDATA path with sub-directories for data output
+PATH <- file.path(Sys.getenv("CBMDATA"), "TCGA-GDC", "RNAseq", "raw_data")
+PATH_rawdl <- file.path(PATH,"project_downloads")
+PATH_se <- file.path(PATH,"raw_SE")
+```
+
+
+## Downloading Raw Data - Function
+Here we use TCGAbiolinks to download the RNAseq data from all TCGA projects. 
+- This script (in its current form) only includes primary tumor data
+- It retrieves RNAseq data that underwent alignment with STAR
+- It creates a SummarizedExperiment object with GDCprepare(), which contains both raw and normalized versions of the sequencing
+data
+- We also add an additional assays to the SummarizedExperiment object called "DESeq2_log" and "edgeR_log" which contain the normalized (using DESeq2 and edgeR TMM) and log2-transformed counts 
+
+
+Note, we have a seperate query specifically for the LAML project where we do not specify the "Primary Tumor" sample type (since its a blood-based cancer, there is not primary vs non-primary tumor)
+
+The resulting SummarizedExperiment objects have 8 assays available:
+
+1. **unstranded**: Contains raw count data without considering the strand specificity of the RNAseq reads (from what I know, the RNAseq data was quantified using an unstranded library). I would use this for most analyses
+
+2. **stranded_first**: Contains raw count data that accounts for reads coming from the first strand of the DNA. This assay is used when the RNAseq library preparation method preserves the strand orientation relative to the original RNA molecule. (not sure why TCGA includes this? Should be investigated)
+
+3. **stranded_second**: Contains raw count data that accounts for reads coming from the second strand opposite to the DNA strand used as a template by RNA polymerase. This is relevant for certain strand-specific library preparation methods.
+
+4. **tpm_unstrand**: Represents counts normalized to Transcripts Per Million (TPM) for unstranded data. TPM normalization accounts for both the sequencing depth and the gene length, making it suitable for comparing expression levels between genes within the same sample.
+
+5. **fpkm_unstrand**: Contains counts normalized to Fragments Per Kilobase of transcript per Million mapped reads (FPKM) for unstranded data. Like TPM, FPKM normalization considers sequencing depth and gene length but is more traditionally used.
+
+6. **fpkm_uq_unstrand**: Provides Upper Quartile normalized FPKM values for unstranded data. The normalization factor is the upper quartile of the counts per feature across samples, which helps to mitigate the impact of highly expressed genes on the normalization factor.
+
+7. **edgeR_log**: This assay contains log-transformed count data, normalized using edgeR's TMM (Trimmed Mean of M-values) normalization. The log transformation (log2) stabilizes variance across the range of expression values.
+
+8. **DESeq2_log**: Features log-transformed count data normalized by DESeq2, which uses a model based on the negative binomial distribution. The normalization accounts for library size and other factors affecting read counts, aiming to make data from different samples directly comparable. 
+
+
+More info on queries:
+https://bioconductor.org/packages/devel/bioc/vignettes/TCGAbiolinks/inst/doc/query.html
+
+```{r Download project data}
+RNA_download <- function(project) {
+  if (project == "TCGA-LAML") {
+    project.hg38 <- TCGAbiolinks::GDCquery(
+      project = "TCGA-LAML",
+    data.category = "Transcriptome Profiling",
+    data.type = "Gene Expression Quantification",
+    workflow.type = "STAR - Counts",
+    )
+  } else {
+    project.hg38 <- GDCquery(
+    project = project,
+    data.category = "Transcriptome Profiling",
+    data.type = "Gene Expression Quantification",
+    workflow.type = "STAR - Counts",
+    sample.type = "Primary Tumor"
+  )
+}
+#Download query
+TCGAbiolinks::GDCdownload(project.hg38,directory = PATH_rawdl)
+#Assigns query to global variable (so we can use it for summarized experiment object creation)
+assign(paste0(project, "_queryRNAseq.hg38"), project.hg38, envir = .GlobalEnv)
+
+}
+
+
+## This will create and download data to "GDCdata" folder in PATH_rawdl directory
+for (project in projects) {
+  cat("Downloading RNAseq data for", project, "\n")
+  query_obj <- RNA_download(project)
+  
+  data.hg38 <- TCGAbiolinks::GDCprepare(query_obj, directory = PATH_rawdl, summarizedExperiment = TRUE)
+  SE_output_filename <- paste0(project, "_RNAseq.rds")
+  
+  # Extract the raw counts
+  raw_counts <- SummarizedExperiment::assay(data.hg38, "unstranded")
+  
+  # Normalize using edgeR
+  dge <- edgeR::DGEList(counts = raw_counts)
+  dge <- edgeR::calcNormFactors(dge, method = "TMM")
+  log_cpm <- log2(edgeR::cpm(dge) + 1)  # log2 CPM transformation
+  SummarizedExperiment::assay(data.hg38, "edgeR_log") <- log_cpm
+  
+  # Normalize using DESeq2
+  dds <- DESeq2::DESeqDataSetFromMatrix(countData = raw_counts, colData = SummarizedExperiment::colData(data.hg38), design = ~ 1)
+  dds <- DESeq2::estimateSizeFactors(dds)
+  norm_counts <- DESeq2::counts(dds, normalized = TRUE)
+  log_counts <- log2(norm_counts + 1)  # log2 transformation
+  SummarizedExperiment::assay(data.hg38, "DESeq2_log") <- log_counts
+  
+  # Save object
+  saveRDS(data.hg38, file = file.path(PATH_se, SE_output_filename))
+  Sys.sleep(5) # Optional: Adds a delay of 5 seconds between downloads to avoid overwhelming the server
+}
+
+```
+
+
+## Session Info
+```{r sys info}
+sessionInfo()
+```
+
+

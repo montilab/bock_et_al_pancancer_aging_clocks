@@ -1,0 +1,224 @@
+---
+title: "Downloading TCGA miRNA Data"
+subtitle: "TCGA PanCancer Aging"
+author: "Payton Bock - Monti Lab"
+date:   "`r format(Sys.Date(), '%B %d, %Y')`"
+params: 
+  dummy: "dummy"
+output:
+  html_document:
+    theme: united
+    code_folding: hide
+    css: style.css
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+```{r, include = FALSE}
+#Load TCGA biolinks library
+.libPaths("/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/r-library/")
+
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(dplyr)
+library(edgeR)
+library(DESeq2)
+```
+
+## Script Summary 
+- Downloads raw miRNA data using TCGAbiolinks queries
+- 33 total cancer types
+- Creates SummarizedExperiment objects for each cancer type containing both raw counts
+and normalized reads-per-million (RPM) assays.
+
+## Set up
+```{r projects to download}
+projects <- c(
+  "TCGA-BRCA", "TCGA-OV","TCGA-GBM", "TCGA-LUAD", "TCGA-UCEC", 
+  "TCGA-KIRC", "TCGA-HNSC", "TCGA-LGG", "TCGA-THCA", "TCGA-LUSC", 
+  "TCGA-PRAD", "TCGA-SKCM", "TCGA-COAD", "TCGA-STAD", "TCGA-BLCA", 
+  "TCGA-LIHC", "TCGA-CESC", "TCGA-KIRP", "TCGA-SARC", "TCGA-LAML", 
+  "TCGA-ESCA", "TCGA-PAAD", "TCGA-PCPG", "TCGA-READ", "TCGA-TGCT", 
+  "TCGA-THYM", "TCGA-KICH", "TCGA-ACC", "TCGA-MESO", "TCGA-UVM", 
+  "TCGA-DLBC", "TCGA-UCS", "TCGA-CHOL"
+)
+
+#Sets the CBMDATA directory path
+Sys.setenv(CBMDATA = "/restricted/projectnb/agedisease/CBMrepositoryData")
+
+#Combines CBMDATA path with sub-directories for data output
+PATH <- file.path(Sys.getenv("CBMDATA"), "TCGA-GDC", "miR", "raw_data")
+PATH_rawdl <- file.path(PATH,"project_downloads")
+PATH_se <- file.path(PATH,"raw_SE")
+```
+
+
+## Downloading Raw Data - Function
+Here we use TCGAbiolinks to download the miRNA data from all TCGA projects. 
+- This script (in its current form) only includes primary tumor data
+- It creates a SummarizedExperiment object with GDCprepare()
+- We also add an additional assays to the SummarizedExperiment object called "DESeq2_log" and "edgeR_log" which contain the normalized (using DESeq2 and edgeR TMM) and log2-transformed counts) 
+
+However, the miRNA layer is unique, and the GDCprepare() function returns a table containing various columns for each miRNA Id.
+Namely, we get "read_count_", "reads_per_million_miRNA_mapped", and "cross-mapped_" per sample.
+
+- "read_count" is the raw read count for each miRNA.
+- "reads_per_million_miRNA_mapped" counts normalized to reads per million mapped reads (RPM)
+- "cross_mapped" which refers to if a given miRNA had reads mapping to other miRNA. Here is a description:
+
+"Alternatively, a read could map exactly to different miRNAs that have sequences that are similar but not identical, when the read sequence did not capture the bases that differ between these miRNAs. For such a case, we reported the read as cross-mapped (10). Supplementary Table S1 shows an example from a TCGA head-and-neck tumor library in which a 17-nt isomiR read had exact-match alignments to 22-nt 3p mature strands of both hsa-mir-30a at 6q13 and hsa-mir-30e at 1p34.2, whose sequences differ only at position 18. When a read cross-mapped, we incremented the read count by one for each miRNA to which it cross-mapped."
+
+Since the cross_mapped is specific to each miRNA-sample combination, it will not be included in the metadata. 
+
+More info on miRNA data preprocesssing: https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4705681/
+
+More info on queries:
+https://bioconductor.org/packages/devel/bioc/vignettes/TCGAbiolinks/inst/doc/query.html
+
+Note, we have a separate query specifically for the LAML project where we do not specify the "Primary Tumor" sample type (since its a blood-based cancer, there is not primary vs non-primary tumor)
+
+
+
+The resulting SummarizedExperiment objects for miRNA data contain 4 assays, each serving a unique purpose in the data analysis pipeline:
+
+1. **raw_counts**
+
+Description: Contains the raw read counts for each miRNA across all samples. These counts represent the direct output from the sequencing experiment without any normalization or transformation.
+
+Usage: Ideal for analyses that require unprocessed data, such as initial quality assessments or when applying custom normalization methods.
+
+2. **reads_per_million**
+
+Description: Represents the counts normalized to Reads Per Million (RPM). This normalization accounts for differences in sequencing depth between samples by scaling the raw counts so that the total counts per sample sum to one million.
+
+Usage: Suitable for comparing miRNA expression levels within the same sample, allowing for the assessment of relative abundance of miRNAs irrespective of varying sequencing depths.
+
+3. **edgeR_log**
+
+Description: Contains log2-transformed Counts Per Million (CPM) normalized using edgeR's Trimmed Mean of M-values (TMM) normalization method. The TMM normalization adjusts for compositional differences between samples, ensuring that the majority of miRNAs are comparably expressed across samples. The log2 transformation stabilizes the variance, making the data more amenable to downstream statistical analyses.
+
+Usage: Ideal for differential expression analyses and other statistical methods that assume normally distributed data. The edgeR normalization helps mitigate biases due to library size and composition.
+
+4. **DESeq2_log**
+
+Description: Features log2-transformed normalized counts calculated using DESeq2's normalization approach. DESeq2 estimates size factors to account for differences in library sizes and other technical variations, providing normalized counts that are suitable for comparison across samples. The log2 transformation further stabilizes variance across the range of expression values.
+
+Usage: Best suited for differential expression analyses and other comparative studies where accurate normalization across samples is crucial (same as edgeR TMM). DESeq2 normalization facilitates the detection of true biological differences by controlling for technical variability.
+
+
+```{r Download project data}
+## Function to download miRNA data for a given project
+miRNA_download <- function(project) {
+  if (project == "TCGA-LAML") {
+    project.hg38 <- TCGAbiolinks::GDCquery(
+      project = "TCGA-LAML",
+      data.category = "Transcriptome Profiling",
+      data.type = "miRNA Expression Quantification",
+      workflow.type = "BCGSC miRNA Profiling"
+    )
+  } else {
+    project.hg38 <- GDCquery(
+      project = project,
+      data.category = "Transcriptome Profiling",
+      data.type = "miRNA Expression Quantification",
+      workflow.type = "BCGSC miRNA Profiling",
+      sample.type = "Primary Tumor"
+    )
+  }
+  
+  # Download query
+  GDCdownload(project.hg38, directory = PATH_rawdl)
+  
+  # Assigns query to global variable (so we can use it for summarized experiment object creation)
+  assign(paste0(project, "_query.hg38"), project.hg38, envir = .GlobalEnv)
+}
+
+## Loop through each project to download data and create SummarizedExperiment objects
+for (project in projects) {
+  cat("Downloading miRNA data for", project, "\n") # Print message to keep track
+  
+  # Download data with query
+  miRNA_download(project)
+  
+  # Retrieve query variable
+  data_name <- paste0(project, "_query.hg38")
+  query_obj <- get(data_name)
+  
+  # Prepare data
+  data.hg38 <- GDCprepare(query_obj, directory = PATH_rawdl, summarizedExperiment = TRUE)
+  
+  # Extract RPM values and set sample ID to first 12 characters
+  rpm <- data.hg38[, grep("reads_per_million_miRNA_mapped_", colnames(data.hg38))] 
+  rownames(rpm) <- data.hg38$miRNA_ID
+  colnames(rpm) <- sub("reads_per_million_miRNA_mapped_", "", colnames(rpm))
+  colnames(rpm) <- substr(colnames(rpm), 1, 12)
+  
+  # Extract raw counts and set sample ID to first 12 characters
+  counts <- data.hg38[, grep("read_count_", colnames(data.hg38))] 
+  rownames(counts) <- data.hg38$miRNA_ID
+  colnames(counts) <- sub("read_count_", "", colnames(counts))
+  colnames(counts) <- substr(colnames(counts), 1, 12)
+  
+  # Create initial SummarizedExperiment with raw counts and RPM
+  se <- SummarizedExperiment::SummarizedExperiment(
+    assays = list(
+      raw_counts = as.matrix(counts),
+      reads_per_million = as.matrix(rpm)
+    )
+  )
+  
+  # ===========================
+  # Normalization using edgeR
+  # ===========================
+  cat("Normalizing data using edgeR for", project, "\n")
+  dge <- edgeR::DGEList(counts = counts)
+  dge <- edgeR::calcNormFactors(dge, method = "TMM")
+  log_cpm <- log2(edgeR::cpm(dge) + 1)  # log2 CPM transformation
+  
+  # Add edgeR normalized assay to SummarizedExperiment
+  SummarizedExperiment::assay(se, "edgeR_log") <- log_cpm
+  
+  # =============================
+  # Normalization using DESeq2
+  # =============================
+  cat("Normalizing data using DESeq2 for", project, "\n")
+  # Create DESeq2 dataset
+  dds <- DESeq2::DESeqDataSetFromMatrix(
+    countData = counts,
+    colData = SummarizedExperiment::colData(se),
+    design = ~ 1
+  )
+  
+  # Estimate size factors
+  dds <- DESeq2::estimateSizeFactors(dds)
+  
+  # Get normalized counts
+  norm_counts <- DESeq2::counts(dds, normalized = TRUE)
+  log_counts <- log2(norm_counts + 1)  # log2 transformation
+  
+  # Add DESeq2 normalized assay to SummarizedExperiment
+  SummarizedExperiment::assay(se, "DESeq2_log") <- log_counts
+  
+  # =============================
+  # Save the SummarizedExperiment
+  # =============================
+  SE_output_filename <- paste0(project, "_miRNA.rds")
+  saveRDS(se, file = file.path(PATH_se, SE_output_filename))
+  
+  # Optional: Adds a delay of 5 seconds between downloads to avoid overwhelming the server
+  Sys.sleep(5)
+}
+
+```
+
+
+## Session Info
+```{r sys info}
+sessionInfo()
+```
+
+

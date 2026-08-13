@@ -1,0 +1,348 @@
+---
+title: "Differential Protein Expression Analysis"
+subtitle: "TCGA PanCancer Aging"
+author: "Payton Bock - Monti Lab"
+date:   "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: united
+    code_folding: hide
+    css: style.css
+    toc: true
+    toc_float: true
+params:
+  cancer_type: NULL
+  include_gender: NULL
+  include_race: NULL
+  include_hpv : NULL
+  include_subtype : NULL
+  races_to_include : NULL
+  include_purity : NULL
+---
+
+# `r if (!is.null(params$cancer_type)) paste(params$cancer_type)`
+
+```{r, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+
+selected_cancer_type <- params$cancer_type
+include_gender <- params$include_gender
+include_race <- params$include_race
+include_hpv <- params$include_hpv
+include_subtype <- params$include_subtype
+races_to_include <- params$races_to_include
+include_purity <- params$include_purity
+
+```
+
+
+```{r library, include = FALSE}
+.libPaths("/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/r-library/")
+
+library(dplyr)
+library(vctrs)
+library(SummarizedExperiment)
+library(ggplot2)
+library(reshape2)
+library(limma)
+library(reactable)
+library(openxlsx)
+library(forcats)
+
+source("/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/r-library/MLscripts-main/R/ggplot_volcano.R")
+
+#get environmental variables
+PATH <- file.path( Sys.getenv("PCANAGE","/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/")) 
+TCGA <- file.path( Sys.getenv("CBMDATA","/restricted/projectnb/agedisease/CBMrepositoryData/"), "TCGA-GDC")
+```
+
+
+## Script Summary 
+This script relies on `02_PanCancer-RenderReport-RPPA.Rmd` to provide input (TCGA project to perform analysis on) and covariates
+that were dynamically determined as part of meta data harmonization. 
+
+This script: 
+
+- Utilizes processed SummarizedExperiment RPPA RDS file
+
+- Performs differential protein expression (DPEA) analysis using `limma` to 
+identify proteins whose expression is associated with age, with provided covariates
+
+
+```{r file paths}
+se_directory <- file.path(TCGA, "RPPA/processed_data/filtered/")
+
+output_dir_limma <- file.path(PATH,"results/RPPA/DPE_analysis/")
+```
+
+
+## Data Loading
+Here we load in the filtered RPPA SummarizedExperiment object. 
+```{r Load in se object}
+#Summarized Experiment
+RPPA_se <- readRDS(paste0(se_directory,selected_cancer_type,"_RPPA.rds"))
+```
+
+
+```{r}
+print(paste0("Running RPPA Limma differential analysis for ", selected_cancer_type ))
+```
+
+
+```{r, include = FALSE}
+create_reactable_table <- function(se, covariate_name) {
+  if (!is.null(colData(se)[[covariate_name]])) {
+    # Generate frequency table
+    freq_table <- table(colData(se)[[covariate_name]])
+    
+    # Convert to data frame for reactable
+    df <- as.data.frame(freq_table)
+    names(df) <- c(covariate_name, "Count")
+    
+    # Create reactable
+    reactable::reactable(df, highlight = TRUE)
+  } else {
+    cat(paste0("Covariate '", covariate_name, "' not found.\n"))
+  }
+}
+```
+
+
+## Protein-Wise Differential Analysis: Limma Linear Regression
+Here we use Limma to identify RPPA protein expression that are associated with age. 
+
+### Statistical Analysis of RPPA Data Using `limma`
+
+`limma` (Linear Models for Microarray Data) is a statistical package in R originally designed for analyzing gene expression data but has been effectively adapted for other omics type (like RPPA data). Here is a general overview of `limma`.
+
+1. **Linear Model Fitting:**
+   - For each protein, `limma` fits a separate linear model. This involves modeling the expression level as a linear combination of various explanatory variables (such as age, disease status, gender, etc.) specified in a design matrix.
+   - The design matrix is a critical component that maps the relationship between samples and covariates. It includes columns for each covariate, including categorical variables (like disease subtypes) and continuous variables (like age).
+
+2. **Coefficient Estimation:**
+   - `limma` employs ordinary least squares regression to estimate the coefficients of the linear models. 
+
+3. **Empirical Bayes Moderation:**
+   - One of `limma`'s key features is the use of an empirical Bayes method to moderate the standard errors of the estimated coefficients. This approach borrows information across all proteins to improve the reliability of standard error estimates, especially beneficial when dealing with small sample sizes.
+
+4. **Differential Analysis:**
+   - `limma` tests for differential expression by assessing whether the coefficients associated with specific covariates (like treatment effect) are significantly different from zero.
+   - Moderated t-statistics, moderated F-statistics, and log-odds of differential expression are computed for each protein, providing a statistical basis for determining the significance of protein changes.
+
+5. **Multiple Testing Correction:**
+   - Given the high number of CpG sites analyzed simultaneously, `limma` applies multiple testing correction methods, like False Discovery Rate (FDR), to control for false positives.
+
+6. **Result Interpretation:**
+   - The output includes statistics such as coefficients, t-statistics, P-values, and adjusted P-values for each protein. 
+
+   
+More info:https://bioconductor.org/packages/release/bioc/html/limma.html
+
+## Covariate Prepartation 
+```{r Prepare Covariates for Limma}
+# Start with a basic model including only the age variable
+model_formula <- "~ Age"
+
+#Remove samples with missing age
+RPPA_se <- RPPA_se[,!is.na(RPPA_se$Age)]
+
+# Include purity only if selected_cancer_type is not "TCGA-LAML"
+if (include_purity) {
+  model_formula <- paste(model_formula, "+ purity")
+  # Remove samples with missing purity
+  RPPA_se <- RPPA_se[, !is.na(RPPA_se$purity)]
+  }
+
+# Dynamically add covariates and filter SE based on parameters
+if (include_gender) {
+  model_formula <- paste(model_formula, "+ gender")
+  #Drop NA gender samples
+  RPPA_se <- RPPA_se[,!is.na(RPPA_se$gender)]
+  create_reactable_table(RPPA_se, "gender")
+  }
+
+if (include_race) {
+  
+  model_formula <- paste(model_formula, "+ race")
+  #Drop NA race samples
+  RPPA_se <- RPPA_se[,!is.na(RPPA_se$race)]
+  
+  races_to_keep <- strsplit(as.character(races_to_include), ",\\s*")[[1]]
+  #print(paste0("Only keeping samples in these racial categories: ", races_to_include))
+  RPPA_se <- RPPA_se[, RPPA_se$race %in% races_to_keep]
+  create_reactable_table(RPPA_se, "race")
+
+}
+
+if (include_subtype) {
+  model_formula <- paste(model_formula, "+ subtype_selected")
+  #Drop NA tumor subtypes samples
+  RPPA_se <- RPPA_se[,!is.na(RPPA_se$subtype_selected)]
+  create_reactable_table(RPPA_se, "subtype_selected")
+}
+
+if (include_hpv) {
+    #drop HPV positive samples (should be for HNSC only as of now)
+    RPPA_se <- RPPA_se[, !is.na(RPPA_se$HPV.status) & RPPA_se$HPV.status == "Negative"]
+    create_reactable_table(RPPA_se, "HPV.status")
+}
+
+# Convert model formula to a formula object
+model_formula <- as.formula(model_formula)
+
+# Print model being used in limma
+# Here we use deparse to convert the formula to a string
+model_formula_str <- deparse(model_formula)
+paste0("Limma Model Formula: ", model_formula_str)
+```
+
+
+
+```{r}
+# Prepare the design matrix for Limma
+design <- model.matrix(model_formula, data = colData(RPPA_se))
+head(unique(design))
+```
+
+```{r check-samples, echo=FALSE}
+# Calculate the number of samples remaining
+num_samples <- ncol(RPPA_se)
+
+# Print the number of samples
+cat("Number of samples remaining after covariate filtering:", num_samples, "\n")
+
+# Check if the number of samples is less than 50
+if (num_samples < 50) {
+  # Stop the R Markdown rendering with a custom message
+  stop("Less than 50 samples remaining. Analysis requires 50 samples.")
+}
+```
+
+## Age Distribution
+```{r}
+# Creating a boxplot for age distribution with individual points
+ggplot2::ggplot(data = data.frame(age = colData(RPPA_se)$Age), aes(x = factor(1), y = age)) +
+  ggplot2::geom_boxplot() +
+  ggplot2::geom_jitter(width = 0.1, color = "blue", alpha = 0.5) +  # Adding jittered points
+  ggplot2::labs(title = "Age Distribution",
+       y = "Age",
+       x = "") +
+  ggplot2::theme_minimal()
+```
+
+
+## Limma Analysis
+First, we use limma to to perform regression.  
+
+We then use Ebayes to rank the results from the linear regression:
+Ebayes: Given a linear model fit from lmFit, compute moderated t-statistics, moderated F-statistic, and log-odds of differential expression by empirical Bayes moderation of the standard errors towards a global value. https://rdrr.io/bioc/limma/man/ebayes.html
+
+We then use "topTable" to rank the results in accordance the age correlation and
+perform FDR multiple hypothesis correction to get an adjusted p-value
+```{r Limma Analysis}
+# Ensure you're working with the correct assay data and design matrix
+fit <- limma::lmFit(SummarizedExperiment::assay(RPPA_se), design)  
+
+# Proceed with the usual Limma workflow (eBayes, topTable, etc.)
+fit_ebayes <- limma::eBayes(fit)
+results <- limma::topTable(fit_ebayes, coef="Age", adjust="fdr", number=Inf, confint=TRUE)
+```
+
+## Limma Results
+Here we create and save the limma results table containing significant proteins (adjusted p.value <= 0.05).
+Finally, we plot the most significant protein. 
+```{r}
+  #filter(adj.P.Val <= 0.05) %>%
+#filter to keep only 3 sig figs (columns with decimals only)
+results_formatted <- results %>%
+  dplyr::mutate(across(where(~is.numeric(.) && any(. %% 1 != 0, na.rm = TRUE)), ~signif(., digits = 3)))
+
+# Now use reactable to display the formatted results
+reactable::reactable(results_formatted, searchable = TRUE, resizable = TRUE)
+
+#Filter results and output
+filtered_results <- results[results$adj.P.Val <= 0.05,]
+paste0("Number of Proteins wit Adjusted P-value <= 0.05: ", dim(filtered_results)[1])
+
+#Save results
+saveRDS(results,paste0(output_dir_limma,selected_cancer_type,"_RPPA_Proteins_limma.rds"))
+write.csv(results, gzfile(paste0(output_dir_limma, selected_cancer_type, "_RPPA_Proteins_limma.csv.gz")))
+
+
+#Define direction of age-related change
+results <- results %>% 
+  dplyr::mutate(direction = ifelse(logFC > 0, "Up", "Down"))
+
+# Creating summary table
+summary_stats <- results |>
+  dplyr::mutate(direction = ifelse(logFC > 0, "Up", "Down")) |>
+  dplyr::summarise(
+    Total_Proteins = n(), # Counts total number of proteins
+    Q_Value_0.05 = sum(adj.P.Val <= 0.05, na.rm = TRUE), # Counts proteins with adj.P.Val <= 0.05
+    Q_Value_0.025 = sum(adj.P.Val <= 0.025, na.rm = TRUE), # Counts proteins with adj.P.Val <= 0.025
+    Q_Value_0.01 = sum(adj.P.Val <= 0.01, na.rm = TRUE), # Counts proteins with adj.P.Val <= 0.01
+    IncreasedExp_with_Age = sum(adj.P.Val <= 0.05 & direction == "Up", na.rm = TRUE), # Counts proteins increased with age
+    DecreasedExp_with_Age = sum(adj.P.Val <= 0.05 & direction == "Down", na.rm = TRUE) # Counts proteins decreased with age
+  )
+
+# Printing the summary table
+reactable(summary_stats)
+```
+
+
+Plot the most significant protein's expression in relation to age. 
+```{r, echo = FALSE}
+protein_name <- rownames(results)[which.min(results$adj.P.Val)]  # Adjust if necessary
+
+# Extract expression data for the most significant protein
+expression_data <- SummarizedExperiment::assay(RPPA_se)[protein_name, ]
+
+# Combine age and expression data into a data frame for plotting
+plot_data <- data.frame(
+  SampleID = rownames(expression_data), # or a similar method to retrieve Sample IDs
+  Age = colData(RPPA_se)$Age,  # Make sure this matches the order of samples in expression_data
+  Expression = as.numeric(expression_data)  # Ensuring the expression data is numeric
+)
+
+ggplot2::ggplot(plot_data, aes(x = Age, y = Expression)) +
+  ggplot2::geom_point(alpha = 0.6) +
+  ggplot2::geom_smooth(method = "lm", se = TRUE, color = "blue") +
+  ggplot2::labs(title = cat(protein_name," Expression vs. Age"),
+       x = "Age",
+       y = "Expression Level") +
+  ggplot2::theme_minimal()
+```
+
+
+```{r}
+results$Protein <- rownames(results)
+
+min_diff <- 0  # Adjust this threshold as per your requirement
+max_fdr <- 0.05
+dat <- results |> 
+  dplyr::mutate(gene_type = case_when(
+    logFC >  min_diff & adj.P.Val <= max_fdr ~ "up",
+    logFC < -min_diff & adj.P.Val <= max_fdr ~ "dn",
+    .default = "ns"))
+
+print(ggplot_volcano(
+  dat = dat,
+  xaxis = "logFC",  # Changed from logFC to meandiff
+  yaxis = "adj.P.Val",
+  gene_label = "Protein",  # Adjust if necessary
+  xlab = "logFC",  # Updated label
+  title = "Limma Volcano Plot",
+  yintercept = max_fdr,
+  xintercept = c(-min_diff, min_diff),  # Adjusted for meandiff
+  sig_il_genes = TRUE,
+  up_il_genes = TRUE,
+  dn_il_genes = TRUE,
+  top_n = 3
+))
+```
+
+# Session Info
+```{r session info}
+sessionInfo()
+```
+

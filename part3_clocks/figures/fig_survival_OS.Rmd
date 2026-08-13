@@ -1,0 +1,617 @@
+---
+title: "Figure (Survival) — BRCA + SCAN-B deviation → OS"
+subtitle: "Panels A (Cox forest), B (KM by deviation tertile), C (pathway × PAM50)"
+author: "Pan-cancer aging project"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: united
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  out_root: "/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/manuscript_analyses/results/derived/GTEx"
+  brca_analysis_id: "BRCA__BREAST"
+  feature_set: "PC"
+  clinical_csv: "/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/manuscript_analyses/data/survival/2018_TCGA-IntegratedClinical.csv"
+  scanb_inputs_rds: "/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/manuscript_analyses/results/derived/GTEx/BRCA__BREAST/scanb_pathway_inputs.rds"
+  fig_dir: "/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/manuscript_analyses/results/figures/fig_survival"
+  poi_pathways:
+    - "G2m Checkpoint"
+    - "Glycolysis"
+    - "Myogenesis"
+    - "P53 Pathway"
+    - "Wnt Beta Catenin Signaling"
+    - "Unfolded Protein Response"
+  save_figures: true
+  seed: 2026
+---
+
+## Purpose
+
+Three panels:
+
+- **Panel A:** BRCA + SCAN-B Cox forest of `Surv ~ age + Deviation`,
+  including PAM50-adjusted aggregate and within-subtype rows. Stacked
+  vertically (TCGA on top, SCAN-B on bottom), shared x-axis. HR colored
+  blue when HR<1 (youthward = worse) and red when HR>1 (aged-like = worse).
+
+- **Panel B:** KM by within-cohort deviation tertile, both cohorts.
+  Stacked vertically with shared x-axis (time in years). SCAN-B
+  follow-up ends earlier; that asymmetry is honest representation.
+
+- **Panel C:** Per-pathway mean φ across PAM50 subtypes for both
+  cohorts. Six driver pathways. NAT anchored leftmost (TCGA only).
+
+Endpoint: **Overall Survival (OS)** in both cohorts. PFI (TCGA) and
+RFi (SCAN-B) sensitivity analyses live in a supplementary script.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(tidyr)
+  library(purrr)
+  library(ggplot2)
+  library(survival)
+  library(knitr)
+  library(ClockSHAP)
+})
+set.seed(params$seed)
+
+out_dir <- params$fig_dir
+if (isTRUE(params$save_figures)) {
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+}
+```
+
+## Helpers
+
+```{r helpers}
+get_patient12 <- function(x) substr(as.character(x), 1, 12)
+
+harmonize_pam50 <- function(x) {
+  x <- as.character(x)
+  x[is.na(x) | x == ""] <- "Unclassified"
+  x <- dplyr::recode(x, "Normal" = "Normal-Like")
+  factor(x, levels = c("Normal-Like", "LumA", "LumB", "Her2", "Basal", "Unclassified"))
+}
+
+cox_term <- function(df, formula_str, term_name) {
+  fit <- survival::coxph(stats::as.formula(formula_str), data = df)
+  co <- summary(fit)$coefficients
+  if (!term_name %in% rownames(co)) return(NULL)
+  tibble::tibble(
+    HR      = exp(co[term_name, "coef"]),
+    CI_low  = exp(co[term_name, "coef"] - 1.96 * co[term_name, "se(coef)"]),
+    CI_high = exp(co[term_name, "coef"] + 1.96 * co[term_name, "se(coef)"]),
+    p_value = co[term_name, "Pr(>|z|)"]
+  )
+}
+```
+
+## Load TCGA-BRCA + build phi
+
+```{r load_brca}
+proc_dir <- file.path(params$out_root, params$brca_analysis_id)
+suffix   <- paste0("-", params$feature_set)
+
+metadata_brca    <- readRDS(file.path(proc_dir, "sample_metadata.rds"))
+clockshap_bundle <- readRDS(file.path(proc_dir, paste0("clockshap_objects", suffix, ".rds")))
+clinical         <- utils::read.csv(
+  params$clinical_csv,
+  na.strings        = c("NA", "", "#N/A"),
+  stringsAsFactors  = FALSE,
+  check.names       = TRUE
+)
+
+# Take everything from the saved cs object — no recomputation.
+cs_brca  <- clockshap_bundle$pt
+phi_brca <- cs_brca$phi
+dev_brca <- cs_brca$deviation
+age_pt   <- cs_brca$age
+ids_brca <- rownames(phi_brca)
+feat     <- colnames(phi_brca)   # feature/pathway names, needed for SCAN-B alignment
+
+# Adjacent normal (TCGA-BRCA only), for Panel C's NAT anchor.
+phi_nat <- clockshap_bundle$nat$phi
+dev_nat <- clockshap_bundle$nat$deviation
+age_nat <- clockshap_bundle$nat$age
+```
+
+## Load SCAN-B + build phi
+
+```{r load_scanb}
+stopifnot(file.exists(params$scanb_inputs_rds))
+scanb_inputs <- readRDS(params$scanb_inputs_rds)
+stopifnot(all(feat %in% rownames(scanb_inputs$ssgsea_scores)))
+
+X_scanb  <- t(scanb_inputs$ssgsea_scores[feat, , drop = FALSE])
+scanb_cd <- scanb_inputs$coldata
+common   <- intersect(rownames(scanb_cd), rownames(X_scanb))
+scanb_cd <- scanb_cd[common, , drop = FALSE]
+X_scanb  <- X_scanb[common, , drop = FALSE]
+
+# Named age vector — ClockSHAP requires names(age) to match rownames(features).
+age_scanb <- stats::setNames(as.numeric(scanb_cd$age_years), rownames(scanb_cd))
+ok_s      <- is.finite(age_scanb)
+X_scanb   <- X_scanb[ok_s, , drop = FALSE]
+age_scanb <- age_scanb[ok_s]
+scanb_cd  <- scanb_cd[ok_s, , drop = FALSE]
+
+# Compute cs_scanb via the ClockSHAP API using the saved BRCA reference.
+# Same call as the deviation figure — no hand-rolled GTEx-line math here.
+cs_scanb  <- ClockSHAP::clockshap(
+  features  = X_scanb,
+  age       = age_scanb,
+  clock     = clockshap_bundle$clock,
+  reference = clockshap_bundle$reference
+)
+phi_scanb <- cs_scanb$phi
+dev_scanb <- cs_scanb$deviation
+
+# Sanity: invariant from the deviation script
+stopifnot(max(abs(rowSums(phi_scanb) - dev_scanb)) < 1e-8)
+```
+
+## Assemble OS survival data frames
+
+```{r assemble_surv}
+# Canonical PAM50 ordering with NAT anchor for Panel C
+pam50_order <- c("Adjacent Normal", "Normal-Like", "LumA", "LumB", "Her2", "Basal")
+
+# ---- TCGA-BRCA OS ----
+tum_brca <- tibble::tibble(
+  sample_id = ids_brca,
+  age_years = age_pt,
+  Deviation = dev_brca,
+  PAM50     = harmonize_pam50(metadata_brca[ids_brca, "Subtype_Selected"])
+) %>%
+  dplyr::mutate(patient12 = get_patient12(metadata_brca[sample_id, "tcga.tcga_barcode"]))
+
+clin2 <- clinical %>%
+  dplyr::mutate(patient12 = get_patient12(bcr_patient_barcode)) %>%
+  dplyr::distinct(patient12, .keep_all = TRUE)
+
+surv_brca <- tum_brca %>%
+  dplyr::left_join(clin2, by = "patient12") %>%
+  dplyr::mutate(
+    time   = suppressWarnings(as.numeric(OS.time)),
+    event  = suppressWarnings(as.numeric(OS)) == 1,
+    cohort = "TCGA-BRCA"
+  ) %>%
+  dplyr::filter(is.finite(time), !is.na(event), is.finite(age_years),
+                is.finite(Deviation), !is.na(PAM50), PAM50 != "Unclassified") %>%
+  dplyr::mutate(PAM50 = factor(droplevels(factor(PAM50)), levels = pam50_order))
+
+# ---- SCAN-B OS ----
+# phi_scanb / dev_scanb / age_scanb / scanb_cd are all parallel-aligned
+# (same rownames; enforced in load_scanb after the is.finite(age) filter).
+scanb_ids  <- rownames(phi_scanb)
+surv_scanb <- tibble::tibble(
+  sample_id = scanb_ids,
+  age_years = age_scanb[scanb_ids],
+  Deviation = dev_scanb,                                 # aligned to phi by construction
+  PAM50     = harmonize_pam50(scanb_cd[scanb_ids, "SSP.PAM50"]),
+  time      = as.numeric(scanb_cd[scanb_ids, "OS_days"]),
+  event     = as.numeric(scanb_cd[scanb_ids, "OS_event"]) > 0,
+  cohort    = "SCAN-B"
+) %>%
+  dplyr::filter(is.finite(time), !is.na(event), is.finite(age_years),
+                is.finite(Deviation), !is.na(PAM50), PAM50 != "Unclassified") %>%
+  dplyr::mutate(PAM50 = factor(droplevels(factor(PAM50)), levels = pam50_order))
+
+cohort_summary <- dplyr::bind_rows(
+  surv_brca  %>% dplyr::summarise(cohort = "TCGA-BRCA (OS)", n = dplyr::n(), events = sum(event)),
+  surv_scanb %>% dplyr::summarise(cohort = "SCAN-B (OS)",    n = dplyr::n(), events = sum(event))
+)
+knitr::kable(cohort_summary, caption = "OS cohort sizes after filtering.")
+```
+
+---
+
+# Panel A — Cox forest (stacked, shared x-axis)
+
+Aggregate `age + Deviation`, PAM50-adjusted aggregate, and within-subtype
+rows for both cohorts. No event-count filter — Normal-Like in TCGA shows
+with wide CI for directional context. HR < 1 in blue (younger-looking
+tumors at higher risk), HR > 1 in red (older-looking tumors at higher
+risk).
+
+```{r panelA_table}
+run_aggregate_set <- function(df, cohort_label) {
+  rows <- list()
+
+  rows[[1]] <- cox_term(
+    df, "survival::Surv(time, event) ~ age_years + Deviation", "Deviation"
+  ) %>% dplyr::mutate(model = "All tumors",
+                      n = nrow(df), events = sum(df$event))
+
+  if (nlevels(droplevels(df$PAM50)) > 1) {
+    rows[[2]] <- cox_term(
+      df, "survival::Surv(time, event) ~ age_years + Deviation + PAM50", "Deviation"
+    ) %>% dplyr::mutate(model = "All tumors (PAM50-adjusted)",
+                        n = nrow(df), events = sum(df$event))
+  }
+
+  sub_rows <- purrr::map_dfr(levels(droplevels(df$PAM50)), function(s) {
+    d <- dplyr::filter(df, PAM50 == s)
+    # Bare-minimum Cox feasibility floor (need at least 2 events for a model)
+    if (nrow(d) < 5 || sum(d$event) < 2) return(NULL)
+    res <- cox_term(
+      d, "survival::Surv(time, event) ~ age_years + Deviation", "Deviation"
+    )
+    if (is.null(res)) return(NULL)
+    res %>% dplyr::mutate(
+      model = paste("Subtype:", s),
+      n = nrow(d), events = sum(d$event)
+    )
+  })
+
+  out <- dplyr::bind_rows(rows, sub_rows)
+  if (nrow(out) == 0) return(out)
+  out %>%
+    dplyr::mutate(
+      cohort      = cohort_label,
+      sig         = ifelse(p_value < 0.05, "p < 0.05", "p ≥ 0.05"),
+      hr_dir      = ifelse(HR < 1, '"youth-like" deviation, increased risk',
+                                   'less "youth-like" deviation, increased risk')
+    ) %>%
+    dplyr::select(cohort, model, n, events, HR, CI_low, CI_high, p_value, sig, hr_dir)
+}
+
+panelA_tbl <- dplyr::bind_rows(
+  run_aggregate_set(surv_brca,  "TCGA-BRCA (OS)"),
+  run_aggregate_set(surv_scanb, "SCAN-B (OS)")
+)
+
+knitr::kable(panelA_tbl, digits = 4,
+             caption = "Panel A — OS Cox forest data, all subtypes shown.")
+```
+
+```{r panelA_plot, fig.width=3.7, fig.height=4.0}
+panelA_df <- panelA_tbl %>%
+  dplyr::mutate(
+    label  = model,   # n/events live in the caption now to keep labels compact
+    cohort = factor(cohort, levels = c("TCGA-BRCA (OS)", "SCAN-B (OS)")),
+    hr_dir = factor(hr_dir,
+                    levels = c('"youth-like" deviation, increased risk',
+                               'less "youth-like" deviation, increased risk'))
+  ) %>%
+  dplyr::group_by(cohort) %>%
+  dplyr::mutate(label = factor(label, levels = rev(unique(label)))) %>%
+  dplyr::ungroup()
+
+hr_pal <- c(
+  '"youth-like" deviation, increased risk'      = "#2c7bb6",  # blue
+  'less "youth-like" deviation, increased risk' = "#d7191c"   # red
+)
+
+p_panelA <- ggplot(panelA_df, aes(x = HR, y = label, colour = hr_dir)) +
+  geom_errorbarh(aes(xmin = CI_low, xmax = CI_high), height = 0.2, linewidth = 0.55) +
+  geom_point(aes(shape = sig), size = 2.6) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey55") +
+  scale_x_log10() +
+  scale_shape_manual(values = c("p < 0.05" = 19, "p ≥ 0.05" = 1), name = NULL) +
+  scale_colour_manual(values = hr_pal, name = NULL) +
+  facet_wrap(~ cohort, scales = "free_y", ncol = 1) +
+  labs(
+    x = "HR per +1 yr of Deviation, age-adjusted (log scale)",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 9) +
+  theme(
+    strip.text         = element_text(face = "bold", size = 9),
+    strip.background   = element_rect(fill = "grey95", colour = NA),
+    panel.grid.major.y = element_blank(),
+    legend.position    = "bottom",
+    legend.box         = "vertical",
+    legend.spacing.y   = unit(1, "pt"),
+    legend.margin      = margin(0, 0, 0, 0),
+    legend.text        = element_text(size = 8),
+    axis.text          = element_text(size = 8),
+    axis.title         = element_text(size = 9),
+    plot.margin        = margin(4, 4, 4, 4)
+  )
+
+p_panelA
+```
+
+```{r panelA_save}
+if (isTRUE(params$save_figures)) {
+  ggsave(
+    filename = file.path(out_dir, "PanelA_OS_forest.pdf"),
+    plot     = p_panelA,
+    width    = 4,
+    height   = 4.5,
+    units    = "in"
+  )
+  message("Saved: ", file.path(out_dir, "PanelA_OS_forest.pdf"))
+}
+```
+
+---
+
+# Panel B — KM by deviation tertile (stacked, shared x-axis)
+
+Within-cohort deviation tertiles. T1 = most aged-like (least negative
+deviation), T3 = most youthward (most negative deviation). Both cohorts
+share a time axis; SCAN-B follow-up ends earlier than TCGA's, which is
+visible as the SCAN-B curves stopping at a shorter x-value.
+
+```{r panelB_data}
+add_dev_tertile <- function(df) {
+  qs <- stats::quantile(df$Deviation, probs = c(0, 1/3, 2/3, 1), na.rm = TRUE)
+  # cut() assigns the lowest 1/3 of values to the FIRST label.
+  # Since deviation is signed and predominantly negative in tumor cohorts,
+  # the most-negative third = most youthward = T1.
+  df$dev_tertile <- cut(
+    df$Deviation, breaks = qs,
+    labels = c('T1: Most "youth-like"', "T2: Middle", 'T3: Least "youth-like"'),
+    include.lowest = TRUE
+  )
+  df
+}
+
+km_data <- dplyr::bind_rows(
+  add_dev_tertile(surv_brca)  %>% dplyr::mutate(cohort = "TCGA-BRCA (OS)"),
+  add_dev_tertile(surv_scanb) %>% dplyr::mutate(cohort = "SCAN-B (OS)")
+) %>%
+  dplyr::mutate(
+    cohort      = factor(cohort, levels = c("TCGA-BRCA (OS)", "SCAN-B (OS)")),
+    dev_tertile = factor(dev_tertile,
+                         levels = c('T1: Most "youth-like"', "T2: Middle", 'T3: Least "youth-like"'))
+  )
+
+# Truncation horizon = SCAN-B's natural max follow-up. We administratively
+# censor BOTH the plot data (km_curves) and the log-rank test (survdiff) at
+# this horizon so the panel is internally consistent: visual range and the
+# reported p-value cover the same patient-time. SCAN-B is effectively
+# untouched (no events past this point); TCGA's late tail is censored,
+# which slightly tightens the test (full vs trunc: chisq 6.95→7.19,
+# p 0.031→0.027 in BRCA) but does not change the qualitative result.
+x_max <- km_data %>%
+  dplyr::filter(cohort == "SCAN-B (OS)") %>%
+  dplyr::pull(time) %>%
+  max(na.rm = TRUE) / 365.25
+
+trunc_data <- function(d, t_max_years) {
+  t_max_days <- t_max_years * 365.25
+  d %>% dplyr::mutate(
+    event = event & time <= t_max_days,
+    time  = pmin(time, t_max_days)
+  )
+}
+
+km_data_view <- trunc_data(km_data, x_max)
+
+km_curves <- km_data_view %>%
+  dplyr::group_by(cohort, dev_tertile) %>%
+  dplyr::group_modify(function(d, .) {
+    if (nrow(d) < 5 || sum(d$event) < 1) return(tibble::tibble())
+    fit <- survival::survfit(survival::Surv(time, event) ~ 1, data = d)
+    tibble::tibble(time = fit$time, surv = fit$surv,
+                   n_risk = fit$n.risk, n_event = fit$n.event)
+  }) %>%
+  dplyr::ungroup()
+
+# Per-cohort log-rank on truncated data (unadjusted — descriptive companion
+# to Panel A's age-adjusted Cox HR; see figure legend for division of labor).
+lr_brca  <- survival::survdiff(
+  survival::Surv(time, event) ~ dev_tertile,
+  data = dplyr::filter(km_data_view, cohort == "TCGA-BRCA (OS)")
+)
+lr_scanb <- survival::survdiff(
+  survival::Surv(time, event) ~ dev_tertile,
+  data = dplyr::filter(km_data_view, cohort == "SCAN-B (OS)")
+)
+lr_p <- function(sd) 1 - stats::pchisq(sd$chisq, length(sd$n) - 1)
+
+logrank_tbl <- tibble::tibble(
+  cohort         = c("TCGA-BRCA (OS)", "SCAN-B (OS)"),
+  log_rank_chisq = c(lr_brca$chisq, lr_scanb$chisq),
+  p_value        = c(lr_p(lr_brca), lr_p(lr_scanb))
+)
+knitr::kable(
+  logrank_tbl, digits = 4,
+  caption = sprintf(
+    "Panel B unadjusted log-rank test by deviation tertile, per cohort (administratively censored at %.2f years to match SCAN-B follow-up).",
+    x_max
+  )
+)
+```
+
+```{r panelB_plot, fig.width=3.7, fig.height=4.0}
+# x_max defined in panelB_data (= SCAN-B max follow-up, years).
+# km_curves and the log-rank in panelB_data are already truncated to this
+# horizon, so coord_cartesian below is just a redundant visual safety net.
+
+logrank_labels <- logrank_tbl %>%
+  dplyr::mutate(
+    cohort  = factor(cohort, levels = c("TCGA-BRCA (OS)", "SCAN-B (OS)")),
+    p_label = dplyr::case_when(
+      p_value < 0.001 ~ "log-rank p < 0.001",
+      TRUE            ~ sprintf("log-rank p = %.3f", p_value)
+    )
+  )
+
+p_panelB <- ggplot(km_curves, aes(x = time / 365.25, y = surv, colour = dev_tertile)) +
+  geom_step(linewidth = 0.85) +
+  scale_colour_manual(
+    values = c('T1: Most "youth-like"'  = "#2c7bb6",   # blue — matches deviation figure (most-negative)
+               "T2: Middle"             = "grey45",
+               'T3: Least "youth-like"' = "#d7191c"),  # red  — matches deviation figure (most-positive)
+    name = "Deviation tertile"
+  ) +
+  facet_wrap(~ cohort, ncol = 1) +
+  geom_text(
+    data        = logrank_labels,
+    aes(label = p_label),
+    x = -Inf, y = -Inf, hjust = -0.1, vjust = -0.8,
+    inherit.aes = FALSE, size = 3.4, colour = "grey20"
+  ) +
+  coord_cartesian(xlim = c(0, x_max), ylim = c(0, 1)) +
+  labs(
+    x = "Time (years)",
+    y = "Survival probability"
+  ) +
+  theme_minimal(base_size = 9) +
+  theme(
+    strip.text         = element_text(face = "bold", size = 9),
+    strip.background   = element_rect(fill = "grey95", colour = NA),
+    panel.grid         = element_blank(),
+    legend.position    = "bottom",
+    legend.text        = element_text(size = 8),
+    legend.title       = element_text(size = 9),
+    legend.spacing.y   = unit(1, "pt"),
+    legend.margin      = margin(0, 0, 0, 0),
+    axis.text          = element_text(size = 8),
+    axis.title         = element_text(size = 9),
+    plot.margin        = margin(4, 4, 4, 4)
+  )
+
+p_panelB
+```
+
+```{r panelB_save}
+if (isTRUE(params$save_figures)) {
+  ggsave(
+    filename = file.path(out_dir, "PanelB_OS_KM_tertile.pdf"),
+    plot     = p_panelB,
+    width    = 3,
+    height   = 4.5,
+    units    = "in"
+  )
+  message("Saved: ", file.path(out_dir, "PanelB_OS_KM_tertile.pdf"))
+}
+```
+
+---
+
+# Panel C — Pathway × PAM50 mean φ (both cohorts)
+
+Six pathways across PAM50 subtypes, both cohorts overlaid. Adjacent
+Normal anchored leftmost as grey square (TCGA only). Reference at
+φ = 0 (GTEx age expectation).
+
+```{r panelC_data}
+build_pathway_long <- function(surv_df, phi_mat, cohort_label, poi) {
+  common <- intersect(surv_df$sample_id, rownames(phi_mat))
+  surv_df <- surv_df[match(common, surv_df$sample_id), , drop = FALSE]
+  phi_sub <- phi_mat[common, intersect(colnames(phi_mat), poi), drop = FALSE]
+
+  as.data.frame(phi_sub) %>%
+    tibble::rownames_to_column("sample_id") %>%
+    tidyr::pivot_longer(cols = -sample_id, names_to = "pathway", values_to = "phi") %>%
+    dplyr::left_join(
+      surv_df %>% dplyr::select(sample_id, age_years, PAM50, event),
+      by = "sample_id"
+    ) %>%
+    dplyr::mutate(cohort = cohort_label)
+}
+
+phi_long_c <- dplyr::bind_rows(
+  build_pathway_long(surv_brca,  phi_brca,  "TCGA-BRCA (OS)", params$poi_pathways),
+  build_pathway_long(surv_scanb, phi_scanb, "SCAN-B (OS)",    params$poi_pathways)
+) %>%
+  dplyr::mutate(
+    pathway = factor(pathway, levels = params$poi_pathways),
+    PAM50   = factor(PAM50,   levels = pam50_order)
+  )
+
+# NAT per-pathway (BRCA only)
+phi_nat_sub <- phi_nat[, intersect(colnames(phi_nat), params$poi_pathways), drop = FALSE]
+nat_long <- as.data.frame(phi_nat_sub) %>%
+  tibble::rownames_to_column("sample_id") %>%
+  tidyr::pivot_longer(cols = -sample_id, names_to = "pathway", values_to = "phi") %>%
+  dplyr::mutate(
+    PAM50     = factor("Adjacent Normal", levels = pam50_order),
+    cohort    = "TCGA-BRCA (OS)",
+    event     = NA,
+    age_years = age_nat[sample_id],
+    pathway   = factor(pathway, levels = params$poi_pathways)
+  )
+
+phi_long_c <- dplyr::bind_rows(phi_long_c, nat_long) %>%
+  dplyr::mutate(PAM50 = factor(as.character(PAM50), levels = pam50_order))
+
+phi_subtype_means <- phi_long_c %>%
+  dplyr::group_by(cohort, pathway, PAM50) %>%
+  dplyr::summarise(
+    n        = dplyr::n(),
+    mean_phi = mean(phi, na.rm = TRUE),
+    sd_phi   = stats::sd(phi, na.rm = TRUE),
+    se_phi   = sd_phi / sqrt(n),
+    .groups  = "drop"
+  ) %>%
+  dplyr::mutate(PAM50 = factor(as.character(PAM50), levels = pam50_order))
+
+knitr::kable(phi_subtype_means, digits = 3,
+             caption = "Panel C data — per-cohort, per-pathway, per-subtype mean φ.")
+```
+
+```{r panelC_plot, fig.width=7.5, fig.height=5.5}
+p_panelC <- ggplot(phi_subtype_means,
+                   aes(x = PAM50, y = mean_phi, group = cohort)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey55") +
+  geom_vline(xintercept = 1.5, linetype = "dotted", colour = "grey70") +
+  # Connecting line through tumor subtypes only
+  geom_line(data = phi_subtype_means %>% dplyr::filter(PAM50 != "Adjacent Normal"),
+            aes(colour = cohort),
+            linewidth = 0.7, alpha = 0.85) +
+  # Tumor subtype points
+  geom_point(data = phi_subtype_means %>% dplyr::filter(PAM50 != "Adjacent Normal"),
+             aes(colour = cohort),
+             shape = 16, size = 2.8) +
+  # NAT — solid grey square, no outline
+  geom_point(data = phi_subtype_means %>% dplyr::filter(PAM50 == "Adjacent Normal"),
+             shape = 15, size = 3.2, colour = "#777777") +
+  scale_x_discrete(limits = pam50_order, drop = FALSE) +
+  scale_colour_manual(
+    values = c("TCGA-BRCA (OS)" = "#7b3294",   # purple
+               "SCAN-B (OS)"    = "#e66101"),  # orange
+    name = NULL
+  ) +
+  facet_wrap(~ pathway, scales = "free_y", ncol = 3) +
+  labs(
+    x = "Tissue category",
+    y = "Mean Deviation Per Pathway (ClockSHAP, years)"
+  ) +
+  theme_minimal(base_size = 9) +
+  theme(
+    strip.text         = element_text(face = "bold", size = 9),
+    strip.background   = element_rect(fill = "grey95", colour = NA),
+    panel.grid.major.x = element_blank(),
+    axis.text.x        = element_text(face = "bold", size = 7, angle = 25, hjust = 1),
+    axis.text.y        = element_text(size = 8),
+    axis.title         = element_text(size = 9),
+    legend.position    = "bottom",
+    legend.text        = element_text(size = 8),
+    plot.margin        = margin(4, 4, 4, 4)
+  )
+
+p_panelC
+```
+
+```{r panelC_save}
+if (isTRUE(params$save_figures)) {
+  ggsave(
+    filename = file.path(out_dir, "PanelC_pathway_phi_by_pam50.pdf"),
+    plot     = p_panelC,
+    width    = 7,
+    height   = 5,
+    units    = "in"
+  )
+  message("Saved: ", file.path(out_dir, "PanelC_pathway_phi_by_pam50.pdf"))
+}
+```
+
+---
+
+# Session info
+
+```{r session}
+sessionInfo()
+```

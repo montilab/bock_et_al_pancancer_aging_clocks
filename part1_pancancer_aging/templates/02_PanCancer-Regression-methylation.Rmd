@@ -1,0 +1,727 @@
+---
+title: "Differential Methylation Analysis - DMP and DMR"
+subtitle: "TCGA PanCancer Aging"
+author: "Payton Bock - Monti Lab"
+date:   "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: united
+    code_folding: hide
+    css: style.css
+    toc: true
+    toc_float: true
+params:
+  cancer_type: NULL
+  include_gender: NULL
+  include_race: NULL
+  include_hpv : NULL
+  include_subtype : NULL
+  races_to_include : NULL
+  include_purity : NULL
+
+---
+
+# `r if (!is.null(params$cancer_type)) paste(params$cancer_type)`
+
+```{r, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+
+selected_cancer_type <- params$cancer_type
+include_gender <- params$include_gender
+include_race <- params$include_race
+include_hpv <- params$include_hpv
+include_subtype <- params$include_subtype
+races_to_include <- params$races_to_include
+include_purity <- params$include_purity
+
+```
+
+
+```{r library, include = FALSE}
+#r library
+.libPaths("/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/r-library/")
+
+#load libraries
+library(dplyr)
+library(SummarizedExperiment)
+library(ggplot2)
+library(reshape2)
+library(limma)
+library(minfi)
+library(minfiData)
+library(reactable)
+library(tidyverse)
+library(DMRcate)
+library(BiocManager)
+library(dbplyr)
+library(DMRcatedata)
+library(msigdbr)
+library(missMethyl)
+
+#get environmental variables
+PATH <- file.path( Sys.getenv("PCANAGE","/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/")) 
+TCGA <- file.path( Sys.getenv("CBMDATA","/restricted/projectnb/agedisease/CBMrepositoryData/"), "TCGA-GDC")
+```
+
+
+```{r file paths}
+se_directory <- file.path(PATH, "data/methylation/processed_SummarizedExperiments/")
+output_dir_limma <- file.path(PATH,"results/methylation/DMP_analysis/")
+output_dir_dmr <- file.path(PATH,"results/methylation/DMR_analysis/")
+output_dir_gsea <- file.path(PATH, "results/methylation/GSEA/gsaregion/")
+```
+
+## Script Summary 
+This script relies on `02_PanCancer-RenderReport.Rmd` to provide input (TCGA project to perform analysis on) and covariates
+that were dynamically determined as part of meta data harmonization. 
+
+This script: 
+
+- Utilizes processed SummarizedExperiment DNA methylation RDS file
+
+- Performs differentially methylated probe (DMP) analysis using `limma` to 
+identify CpG sites whose methylation is associated with age, with provided covariates
+
+- Performs differentially methylated region (DMR) analysis with `DMRCate` using
+the results from DMP analysis 
+
+
+## Data Loading
+Here we load in the filtered SummarizedExperiment object and get the annotation data for the 
+Illumina 450k methylation array (minfiData package). 
+```{r Load in se object}
+#Summarized Experiment
+methyl_se <- readRDS(paste0(se_directory,selected_cancer_type,"_methylation.rds"))
+
+#annotation data for 450k array
+ann450k <- minfi::getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+```
+
+
+```{r}
+print(paste0("Running Limma differential analysis and Comp-B DMR analysis for ", selected_cancer_type ))
+```
+
+
+
+```{r, include = FALSE}
+create_reactable_table <- function(se, covariate_name) {
+  if (!is.null(colData(se)[[covariate_name]])) {
+    # Generate frequency table
+    freq_table <- table(colData(se)[[covariate_name]])
+    
+    # Convert to data frame for reactable
+    df <- as.data.frame(freq_table)
+    names(df) <- c(covariate_name, "Count")
+    
+    # Create reactable
+    reactable::reactable(df, highlight = TRUE)
+  } else {
+    cat(paste0("Covariate '", covariate_name, "' not found.\n"))
+  }
+}
+```
+
+# Probe-Wise Differential Analysis: Limma Linear Regression
+Here we use Limma to identify indivdual CpG sites that are associated with age. 
+
+### Statistical Analysis of Methylation Data Using `limma`
+
+`limma` (Linear Models for Microarray Data) is a statistical package originally designed for analyzing gene expression data but has been  adapted for methylation data analysis. The core statistical methodologies implemented by `limma` for methylation data include the following steps:
+
+1. **Linear Model Fitting:**
+   - For each CpG site, `limma` fits a separate linear model. This involves modeling the methylation level as a linear combination of various explanatory variables (such as age, disease status, gender, etc.) specified in a design matrix.
+   - The design matrix is a critical component that maps the relationship between samples and covariates. It includes columns for each covariate, including categorical variables (like disease subtypes) and continuous variables (like age).
+
+2. **Coefficient Estimation:**
+   - `limma` employs ordinary least squares regression to estimate the coefficients of the linear models. These coefficients quantify the effect of each covariate on the methylation level at each CpG site.
+
+3. **Empirical Bayes Moderation:**
+   - One of `limma`'s key features is the use of an empirical Bayes method to moderate the standard errors of the estimated coefficients. This approach borrows information across all CpG sites to improve the reliability of standard error estimates, especially beneficial when dealing with small sample sizes.
+
+4. **Differential Methylation Analysis:**
+   - `limma` tests for differential methylation by assessing whether the coefficients associated with specific covariates (like treatment effect) are significantly different from zero.
+   - Moderated t-statistics, moderated F-statistics, and log-odds of differential methylation are computed for each CpG site.
+
+5. **Multiple Testing Correction:**
+   - Given the high number of CpG sites analyzed simultaneously, `limma` applies multiple testing correction methods.
+
+6. **Result Interpretation:**
+   - The output includes statistics such as coefficients, t-statistics, P-values, and adjusted P-values for each CpG site, helping identify sites with significant methylation changes in relation to the covariate of interest.
+   
+More info:https://bioconductor.org/packages/release/bioc/html/limma.html
+
+## Covariate Prepartation 
+```{r Prepare Covariates for Limma}
+# Start with a basic model including only the age variable
+model_formula <- "~ Age"
+
+# Remove samples with missing age
+methyl_se <- methyl_se[, !is.na(SummarizedExperiment::colData(methyl_se)$Age)]
+
+# Include purity only if selected_cancer_type is not "TCGA-LAML"
+if (include_purity) {
+  model_formula <- paste(model_formula, "+ purity")
+  # Remove samples with missing purity
+  methyl_se <- methyl_se[, !is.na(SummarizedExperiment::colData(methyl_se)$purity)]
+}
+
+# Dynamically add covariates and filter SE based on parameters
+if (include_gender) {
+  model_formula <- paste(model_formula, "+ gender")
+  # Drop NA gender samples
+  methyl_se <- methyl_se[, !is.na(SummarizedExperiment::colData(methyl_se)$gender)]
+  create_reactable_table(methyl_se, "gender")
+}
+
+if (include_race) {
+  model_formula <- paste(model_formula, "+ race")
+  # Drop NA race samples
+  methyl_se <- methyl_se[, !is.na(SummarizedExperiment::colData(methyl_se)$race)]
+  
+  races_to_keep <- strsplit(as.character(races_to_include), ",\\s*")[[1]]
+  methyl_se <- methyl_se[, SummarizedExperiment::colData(methyl_se)$race %in% races_to_keep]
+  create_reactable_table(methyl_se, "race")
+}
+
+if (include_subtype) {
+  model_formula <- paste(model_formula, "+ subtype_selected")
+  # Drop NA tumor subtypes samples
+  methyl_se <- methyl_se[, !is.na(SummarizedExperiment::colData(methyl_se)$subtype_selected)]
+  create_reactable_table(methyl_se, "subtype_selected")
+}
+
+if (include_hpv) {
+    #drop HPV positive samples (should be for HNSC only as of now)
+    methyl_se <- methyl_se[, !is.na(methyl_se$HPV.status) & methyl_se$HPV.status == "Negative"]
+    create_reactable_table(methyl_se, "HPV.status")
+}
+
+# Convert model formula to a formula object
+model_formula <- as.formula(model_formula)
+
+# Print model being used in limma
+# Here we use deparse to convert the formula to a string
+model_formula_str <- deparse(model_formula)
+paste0("Limma Model Formula: ", model_formula_str)
+```
+
+
+
+```{r}
+# Prepare the design matrix for Limma
+design <- model.matrix(model_formula, data = SummarizedExperiment::colData(methyl_se))
+head(unique(design))
+
+```
+
+
+
+```{r check-samples, echo=FALSE}
+# Calculate the number of samples remaining
+num_samples <- ncol(methyl_se)
+
+# Print the number of samples
+cat("Number of samples remaining after covariate filtering:", num_samples, "\n")
+
+# Check if the number of samples is less than 50
+if (num_samples < 50) {
+  # Stop the R Markdown rendering with a custom message
+  stop("Less than 50 samples remaining. Analysis requires 50 samples.")
+}
+```
+
+## Age Distribution
+```{r}
+# Creating a boxplot for age distribution with individual points
+ggplot2::ggplot(data = data.frame(age = SummarizedExperiment::colData(methyl_se)$Age), ggplot2::aes(x = factor(1), y = age)) +
+  ggplot2::geom_boxplot() +
+  ggplot2::geom_jitter(width = 0.1, color = "blue", alpha = 0.5) +  # Adding jittered points
+  ggplot2::labs(title = "Age Distribution",
+       y = "Age",
+       x = "") +
+  ggplot2::theme_minimal()
+
+```
+
+
+## Limma Analysis
+First, we use limma to to perform regression.  
+We then add gene annotations to the results (ann450k) 
+
+We the use Ebayes to rank the results from the linear regression:
+Ebayes: Given a linear model fit from lmFit, compute moderated t-statistics, moderated F-statistic, and log-odds of differential expression by empirical Bayes moderation of the standard errors towards a global value. https://rdrr.io/bioc/limma/man/ebayes.html
+
+We then use "topTable" to rank the results (related to age coefficient) and
+perform FDR multiple hypothesis correction to get an adjusted p-value
+
+```{r Limma Analysis}
+# Ensure you're working with the correct assay data and design matrix
+fit <- limma::lmFit(assay(methyl_se,"M-values"), design)  # Replace 'assay_data' with your actual methylation data
+
+
+ann450kSub <- ann450k[match(rownames(methyl_se),ann450k$Name),
+                      c(1:4,12:19,24:ncol(ann450k))]
+
+# Proceed with the usual Limma workflow (eBayes, topTable, etc.)
+fit_ebayes <- limma::eBayes(fit)
+results <- limma::topTable(fit_ebayes, coef="Age", adjust="fdr", number=Inf,confint=TRUE, genelist = ann450kSub)
+```
+
+## Limma Results
+Here we create and save the limma results table containing significant CpG sites (adjusted p.value <= 0.05).
+We also plot a CpG beta value vs age scatterplot of the most significant result (based on adjusted p.value)
+```{r}
+# Filter to keep only 3 significant figures (columns with decimals only)
+results_formatted <- results %>%
+  dplyr::filter(adj.P.Val <= 0.05) %>%
+  dplyr::mutate(across(where(~is.numeric(.) && any(. %% 1 != 0, na.rm = TRUE)), ~signif(., digits = 3)))
+
+# Use reactable to display the formatted results
+reactable::reactable(results_formatted, searchable = TRUE, resizable = TRUE)
+
+# Plot most significant differentially methylated CpG
+most_significant_cpg <- results[which.min(results$adj.P.Val), 'Name']
+minfi::plotCpg(SummarizedExperiment::assay(methyl_se), cpg = most_significant_cpg, pheno = round(SummarizedExperiment::colData(methyl_se)$Age), ylab = "Beta values", xlab = "Age in Years")
+
+# Filter results and output
+filtered_results <- results[results$adj.P.Val <= 0.05, ]
+paste0("Number of CpG Sites with Adjusted P-value <= 0.05: ", dim(filtered_results)[1])
+
+# Save results
+saveRDS(results, paste0(output_dir_limma, selected_cancer_type, "_CpG-Sites_hg19_limma.rds"))
+write.csv(results, gzfile(paste0(output_dir_limma, selected_cancer_type, "_CpG-Sites_hg19_limma.csv.gz")))
+
+# Create summary table
+summary_stats <- results |>
+  dplyr::mutate(direction = ifelse(logFC > 0, "Up", "Down")) |>
+  dplyr::summarise(
+    Total_CpG_Sites = dplyr::n(),
+    Q_Value_0.05 = sum(adj.P.Val <= 0.05),
+    Q_Value_0.025 = sum(adj.P.Val <= 0.025),
+    Q_Value_0.01 = sum(adj.P.Val <= 0.01),
+    Hypermethylation_with_Age = sum(adj.P.Val <= 0.05 & direction == "Up"),
+    Hypomethylation_with_Age = sum(adj.P.Val <= 0.05 & direction == "Down")
+  )
+
+reactable::reactable(summary_stats, searchable = TRUE, resizable = TRUE)
+
+```
+
+# Differentially Methylated Region Analysis with DMRcate
+
+In this section, we use the `DMRcate` package to identify differentially methylated regions (DMRs) associated with age. `DMRcate` detects and corrects for spatial correlations in the methylation data, providing robust DMR detection.
+
+Note that need to specify to input paramters for DMR analysis with `DMRcate`: lambda and C. 
+
+lambda sets the scale of the smoothing window. A larger lambda means that the test statistics are smoothed over a wider genomic distance, incorporating more neighboring probes.
+
+The C parameter is a scaling factor that adjusts the relative influence of individual probe test statistics before smoothing. It modulates the weight given to each probe's evidence in the context of its neighbors.
+
+While the default parameters set lambda = 1000 and C = 2, results from a 2019 DMR methods comparison found that parameters of lambda = 500 and C = 5 provided the most accurate results for Illumina methylation arrays (which TCGA uses). We will utilize these parameters
+
+Methods paper: https://doi.org/10.1093/bib/bby085
+
+## `DMRcate` Analysis
+
+```{r DMRcate Analysis}
+# Annotate the CpG sites
+myAnnotation <- DMRcate::cpg.annotate(
+  datatype = "array",
+  object = assay(methyl_se, "M-values"),
+  what = "M",
+  annotation= c(array = "IlluminaHumanMethylation450k", annotation = "ilmn12.hg19"),
+  arraytype = "450K",
+  analysis.type = "differential",
+  design = design,
+  coef = "Age"
+)
+
+# Run DMRcate to identify DMRs
+# Run DMRcate to identify DMRs with error handling
+dmrcoutput <- tryCatch({
+  DMRcate::dmrcate(myAnnotation, lambda = 500, C = 5)
+}, error = function(e) {
+  cat("Error running DMRcate: ", e$message, "\n")
+  NULL  # Return NULL to indicate failure
+})
+
+# Check if DMRcate ran successfully and DMRs were found
+if (!is.null(dmrcoutput)) {
+  # Extract the results
+  resultsRanges <- extractRanges(dmrcoutput, genome = "hg19")
+  results_dmr_dataframe <- as.data.frame(resultsRanges)
+  
+  cat("DMRcate identified ", nrow(results_dmr_dataframe), " potential DMRs.\n")
+  # Save results
+  dir.create(output_dir_dmr, recursive = TRUE, showWarnings = FALSE)
+  saveRDS(results_dmr_dataframe, file.path(output_dir_dmr, paste0(selected_cancer_type, "_DMR_hg19_dmrcate.rds")))
+  write.csv(results_dmr_dataframe, gzfile(file.path(output_dir_dmr, paste0(selected_cancer_type, "_DMR_hg19_dmrcate.csv.gz"))))
+  
+    
+  # Display and save results
+  results_dmr_dataframe_rct <- results_dmr_dataframe %>%
+      dplyr::mutate(across(where(~is.numeric(.) && any(. %% 1 != 0, na.rm = TRUE)), ~signif(., digits = 3)))
+  reactable::reactable(results_dmr_dataframe_rct, searchable = TRUE, resizable = TRUE)
+  
+  
+} else {
+  # DMRcate failed or no DMRs were found
+  cat("DMRcate did not identify any DMRs for ", selected_cancer_type, ". Skipping DMRcate analysis and GSEA.\n")
+  
+  # Optionally create empty results for consistency
+  results_dmr_dataframe <- data.frame()
+  dir.create(output_dir_dmr, recursive = TRUE, showWarnings = FALSE)
+  saveRDS(results_dmr_dataframe, file.path(output_dir_dmr, paste0(selected_cancer_type, "_DMR_hg19_dmrcate.rds")))
+}
+```
+
+## `DMRcate` Summary Results
+```{r}
+if (!is.null(dmrcoutput)) {
+  summary_stats_dmr <- results_dmr_dataframe %>% 
+    dplyr::mutate(direction = ifelse(meandiff > 0, "Up", "Down")) %>%
+    dplyr::summarise(
+      Total_DMRs = n(),
+      Fisher_Value_0.05 = sum(Fisher <= 0.05),
+      Fisher_Value_0.025 = sum(Fisher <= 0.025),
+      Fisher_Value_0.01 = sum(Fisher <= 0.01),
+      Hypermethylation_with_Age = sum(Fisher <= 0.05 & direction == "Up"),
+      Hypomethylation_with_Age = sum(Fisher <= 0.05 & direction == "Down")
+    )
+  
+  reactable::reactable(summary_stats_dmr)
+} else {
+  cat("No DMR summary statistics to display.\n")
+}
+```
+
+# GSEA with `Goregion`
+Finally, we perform gene set enrichment analysis using the `gsaregion()` function from the `missMethyl` package, which implements a unique approach to DNA methylation analysis and is one of the only tools that can perform gene set analysis on identified differentially methylated regions. 
+
+Paper: https://doi.org/10.1186/s13059-021-02388-x
+
+Function: https://rdrr.io/bioc/missMethyl/man/gsaregion.html
+
+We split this three ways: GSEA including all DMRs (regardless of direction), GSEA with dmrs that are hypermethylated (meandiff > 0 from DMRcate results), and GSEA with dmrs that are hypomethylated (meandiff < 0 from DMRcate results)
+
+## Split DMRs by direction
+Here we split the DMRs into three objects: all DMRs, hypermethylated regions, and hypomethylated regions
+```{r}
+if (exists("resultsRanges") && length(resultsRanges) > 0) {
+  # All DMRs
+  dmrs_all <- resultsRanges
+  
+  # Hypermethylated DMRs (meandiff > 0)
+  dmrs_hyper <- resultsRanges[resultsRanges$meandiff > 0]
+  
+  # Hypomethylated DMRs (meandiff < 0)
+  dmrs_hypo <- resultsRanges[resultsRanges$meandiff < 0]
+  
+  # Proceed to Hallmark Gene Sets and GSEA
+} else {
+  cat("No DMRs available for GSEA. Skipping GSEA analysis.\n")
+}
+```
+
+
+## Hallmark Gene Sets
+First, lets load in our gene sets of interest (the 50 HALLMARK gene sets)
+```{r}
+hallmark_sets <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  dplyr::select(gs_name, entrez_gene)
+
+# Create a named list where each element is a vector of Entrez Gene IDs for a gene set
+collection <- split(hallmark_sets$entrez_gene, hallmark_sets$gs_name)
+
+```
+
+## Run GSEA {.tabset}
+With gene sets prepared we now run the `gsaregion()` function from `missMethyl` to test for enrichment of our 50 HALLMARK gene sets.
+
+We also include a plot of the probe-wise bias that is adjusted for by `gsaregion()` where we (should) observe an increase in differential methylation with an increasing number of CpGs associated with a given gene. This is just to visualize the bias being adjusted for. See the paper for more information.
+
+
+### All DMRs
+```{r}
+# GSEA with all DMRs
+if (exists("dmrs_all") && length(dmrs_all) > 0) {
+  gsea_all <- missMethyl::gsaregion(
+    regions = dmrs_all,
+    all.cpg = rownames(methyl_se),
+    collection = collection,
+    array.type = "450K",
+    plot.bias = TRUE,        # Adjusts for methylation data biases
+    prior.prob = TRUE,       # Adjusts for methylation data biases
+    anno = NULL,
+    equiv.cpg = TRUE,        # Adjusts for methylation data biases
+    fract.counts = TRUE,     # Adjusts for methylation data biases
+    genomic.features = "ALL",
+    sig.genes = TRUE
+  )
+  
+  #save results
+  saveRDS(gsea_all, paste0(output_dir_gsea, "/all/", selected_cancer_type, "_GSEA_all.rds"))
+  write.csv(gsea_all, gzfile(paste0(output_dir_gsea,"/all/", selected_cancer_type, "_GSEA_all.csv.gz")))
+  
+   # Display the results
+  gsea_all_rct <- gsea_all %>%
+    dplyr::mutate(across(where(is.numeric), ~signif(., digits = 3)))
+  reactable::reactable(gsea_all_rct, searchable = TRUE)
+} else {
+  cat("No DMRs found. Skipping GSEA for all DMRs.\n")
+}
+```
+
+
+### Hypermethylated Regions
+```{r}
+# Check if there are hypermethylated DMRs
+if (exists("dmrs_hyper") && length(dmrs_hyper) > 0) {
+  # GSEA with hypermethylated DMRs
+  gsea_hyper <- missMethyl::gsaregion(
+    regions = dmrs_hyper,
+    all.cpg = rownames(methyl_se),
+    collection = collection,
+    array.type = "450K",
+    plot.bias = TRUE,
+    prior.prob = TRUE,
+    anno = NULL,
+    equiv.cpg = TRUE,
+    fract.counts = TRUE,
+    genomic.features = "ALL",
+    sig.genes = TRUE
+  )
+  
+  #save results
+  saveRDS(gsea_hyper, paste0(output_dir_gsea, "/hypermethylated/", selected_cancer_type, "_GSEA_hypermethylated.rds"))
+  write.csv(gsea_hyper, gzfile(paste0(output_dir_gsea,"/hypermethylated/", selected_cancer_type, "_GSEA_hypermethylated.csv.gz")))
+  
+  gsea_hyper_rct <- gsea_hyper %>%
+    dplyr::mutate(across(where(is.numeric), ~signif(., digits = 3)))
+  reactable::reactable(gsea_hyper_rct, searchable = TRUE)
+  
+} else {
+  cat("No hypermethylated DMRs found. Skipping GSEA for hypermethylated DMRs.\n")
+} 
+```
+
+### Hypomethylated Regions
+```{r}
+# Check if there are hypomethylated DMRs
+if (exists("dmrs_hypo") && length(dmrs_hypo) > 0) {
+  # GSEA with hypomethylated DMRs
+  gsea_hypo <- missMethyl::gsaregion(
+    regions = dmrs_hypo,
+    all.cpg = rownames(methyl_se),
+    collection = collection,
+    array.type = "450K",
+    plot.bias = TRUE,
+    prior.prob = TRUE,
+    anno = NULL,
+    equiv.cpg = TRUE,
+    fract.counts = TRUE,
+    genomic.features = "ALL",
+    sig.genes = TRUE
+  )
+  
+  #save results
+  saveRDS(gsea_hypo, paste0(output_dir_gsea, "/hypomethylated/", selected_cancer_type, "_GSEA_hypomethylated.rds"))
+  write.csv(gsea_hypo, gzfile(paste0(output_dir_gsea,"/hypomethylated/", selected_cancer_type, "_GSEA_hypomethylated.csv.gz")))
+  
+    # Display the results
+  gsea_hypo_rct <- gsea_hypo %>%
+    dplyr::mutate(across(where(is.numeric), ~signif(., digits = 3)))
+  reactable::reactable(gsea_hypo_rct, searchable = TRUE)
+} else {
+  cat("No hypomethylated DMRs found. Skipping GSEA for hypomethylated DMRs.\n")
+}
+```
+
+## GSEA Summary Results
+Finally we summarize our GSEA results showing for each DMR category (all, hypermethylated, and hypomethylated) the number of significantly erniched gene sets identified with the `GOregion` analysis. We consider adjusted p-values < 0.05 as significant. 
+```{r}
+# Function to summarise GSEA results
+summarise_gsea <- function(gsea_result, description) {
+  gsea_result_name <- deparse(substitute(gsea_result))
+  if (exists(gsea_result_name) && nrow(gsea_result) > 0) {
+    summary_stats <- gsea_result %>%
+      summarise(
+        Total_Pathways = n(),
+        FDR_0.05 = sum(FDR <= 0.05)
+      ) %>%
+      mutate(Type = description)
+    return(summary_stats)
+  } else {
+    summary_stats <- data.frame(
+      Total_Pathways = 0,
+      FDR_0.05 = 0,
+      Type = description
+    )
+    return(summary_stats)
+  }
+}
+
+# Summarise and combine GSEA results
+gsea_summaries <- list(
+  summarise_gsea(gsea_all, "All DMRs"),
+  summarise_gsea(gsea_hyper, "Hypermethylated DMRs"),
+  summarise_gsea(gsea_hypo, "Hypomethylated DMRs")
+)
+
+gsea_summary_table <- do.call(rbind, gsea_summaries) %>%
+  select(Type, everything())
+
+# Display the combined summary table
+reactable::reactable(gsea_summary_table)
+```
+
+## Run GSEA (Probewise) {.tabset}
+With gene sets prepared we now run the `gometh()` function from `missMethyl` to test for enrichment of our 50 HALLMARK gene sets.
+
+We also include a plot of the probe-wise bias that is adjusted for by `where we (should) observe an increase in differential methylation with an increasing number of CpGs associated with a given gene. This is just to visualize the bias being adjusted for. See the paper for more information.
+
+```{r}
+
+```
+
+
+### All DMRs
+```{r}
+# GSEA with all DMRs
+if (exists("dmrs_all") && length(dmrs_all) > 0) {
+  gsea_all <- missMethyl::gsaregion(
+    regions = dmrs_all,
+    all.cpg = rownames(methyl_se),
+    collection = collection,
+    array.type = "450K",
+    plot.bias = TRUE,        # Adjusts for methylation data biases
+    prior.prob = TRUE,       # Adjusts for methylation data biases
+    anno = NULL,
+    equiv.cpg = TRUE,        # Adjusts for methylation data biases
+    fract.counts = TRUE,     # Adjusts for methylation data biases
+    genomic.features = "ALL",
+    sig.genes = TRUE
+  )
+  
+  #save results
+  saveRDS(gsea_all, paste0(output_dir_gsea, "/all/", selected_cancer_type, "_GSEA_all.rds"))
+  write.csv(gsea_all, gzfile(paste0(output_dir_gsea,"/all/", selected_cancer_type, "_GSEA_all.csv.gz")))
+  
+   # Display the results
+  gsea_all_rct <- gsea_all %>%
+    dplyr::mutate(across(where(is.numeric), ~signif(., digits = 3)))
+  reactable::reactable(gsea_all_rct, searchable = TRUE)
+} else {
+  cat("No DMRs found. Skipping GSEA for all DMRs.\n")
+}
+```
+
+
+### Hypermethylated Regions
+```{r}
+# Check if there are hypermethylated DMRs
+if (exists("dmrs_hyper") && length(dmrs_hyper) > 0) {
+  # GSEA with hypermethylated DMRs
+  gsea_hyper <- missMethyl::gsaregion(
+    regions = dmrs_hyper,
+    all.cpg = rownames(methyl_se),
+    collection = collection,
+    array.type = "450K",
+    plot.bias = TRUE,
+    prior.prob = TRUE,
+    anno = NULL,
+    equiv.cpg = TRUE,
+    fract.counts = TRUE,
+    genomic.features = "ALL",
+    sig.genes = TRUE
+  )
+  
+  #save results
+  saveRDS(gsea_hyper, paste0(output_dir_gsea, "/hypermethylated/", selected_cancer_type, "_GSEA_hypermethylated.rds"))
+  write.csv(gsea_hyper, gzfile(paste0(output_dir_gsea,"/hypermethylated/", selected_cancer_type, "_GSEA_hypermethylated.csv.gz")))
+  
+  gsea_hyper_rct <- gsea_hyper %>%
+    dplyr::mutate(across(where(is.numeric), ~signif(., digits = 3)))
+  reactable::reactable(gsea_hyper_rct, searchable = TRUE)
+  
+} else {
+  cat("No hypermethylated DMRs found. Skipping GSEA for hypermethylated DMRs.\n")
+} 
+```
+
+### Hypomethylated Regions
+```{r}
+# Check if there are hypomethylated DMRs
+if (exists("dmrs_hypo") && length(dmrs_hypo) > 0) {
+  # GSEA with hypomethylated DMRs
+  gsea_hypo <- missMethyl::gsaregion(
+    regions = dmrs_hypo,
+    all.cpg = rownames(methyl_se),
+    collection = collection,
+    array.type = "450K",
+    plot.bias = TRUE,
+    prior.prob = TRUE,
+    anno = NULL,
+    equiv.cpg = TRUE,
+    fract.counts = TRUE,
+    genomic.features = "ALL",
+    sig.genes = TRUE
+  )
+  
+  #save results
+  saveRDS(gsea_hypo, paste0(output_dir_gsea, "/hypomethylated/", selected_cancer_type, "_GSEA_hypomethylated.rds"))
+  write.csv(gsea_hypo, gzfile(paste0(output_dir_gsea,"/hypomethylated/", selected_cancer_type, "_GSEA_hypomethylated.csv.gz")))
+  
+    # Display the results
+  gsea_hypo_rct <- gsea_hypo %>%
+    dplyr::mutate(across(where(is.numeric), ~signif(., digits = 3)))
+  reactable::reactable(gsea_hypo_rct, searchable = TRUE)
+} else {
+  cat("No hypomethylated DMRs found. Skipping GSEA for hypomethylated DMRs.\n")
+}
+```
+
+## GSEA Summary Results
+Finally we summarize our GSEA results showing for each DMR category (all, hypermethylated, and hypomethylated) the number of significantly erniched gene sets identified with the `GOregion` analysis. We consider adjusted p-values < 0.05 as significant. 
+```{r}
+# Function to summarise GSEA results
+summarise_gsea <- function(gsea_result, description) {
+  gsea_result_name <- deparse(substitute(gsea_result))
+  if (exists(gsea_result_name) && nrow(gsea_result) > 0) {
+    summary_stats <- gsea_result %>%
+      summarise(
+        Total_Pathways = n(),
+        FDR_0.05 = sum(FDR <= 0.05)
+      ) %>%
+      mutate(Type = description)
+    return(summary_stats)
+  } else {
+    summary_stats <- data.frame(
+      Total_Pathways = 0,
+      FDR_0.05 = 0,
+      Type = description
+    )
+    return(summary_stats)
+  }
+}
+
+# Summarise and combine GSEA results
+gsea_summaries <- list(
+  summarise_gsea(gsea_all, "All DMRs"),
+  summarise_gsea(gsea_hyper, "Hypermethylated DMRs"),
+  summarise_gsea(gsea_hypo, "Hypomethylated DMRs")
+)
+
+gsea_summary_table <- do.call(rbind, gsea_summaries) %>%
+  select(Type, everything())
+
+# Display the combined summary table
+reactable::reactable(gsea_summary_table)
+```
+
+# Session Info
+```{r session info}
+sessionInfo()
+```
+

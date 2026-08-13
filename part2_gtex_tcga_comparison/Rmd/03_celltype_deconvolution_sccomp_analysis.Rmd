@@ -1,0 +1,644 @@
+---
+title: "03. Cell-type deconvolution and compositional age modeling"
+author: "Pan-cancer aging pipeline, Part 2"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: united
+    code_folding: hide
+    toc: true
+    toc_float: true
+params:
+  processing_root: "results/derived/part2/01_processing"
+  out_root: "results/derived/part2/03_celltype_age"
+  tables_root: "results/tables/part2"
+  figures_root: "results/figures/part2/qc"
+  cores: 4
+  fdr_threshold: 0.05
+  meta_min_studies: 3
+  seed: 2026
+  verbose: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+## Overview
+
+This script estimates cell-type composition for every retained GTEx tissue and TCGA cancer, models compositional shifts with age within each project, and combines results into within-cohort meta-analyses and matched-tissue tables for figure generation.
+
+Cell-type proportions are estimated with EPIC using the default TRef reference profile on both GTEx and TCGA. EPIC's reference profiles are derived from blood and melanoma tumor microenvironment data and were not optimized for normal tissue. We interpret these results as a broad compositional sanity check on the gene-level age associations from script 02, rather than as definitive characterization of immune cell biology. 
+
+Analytical commitments:
+
+- **EPIC deconvolution with TRef on both cohorts.** Identical reference profile applied symmetrically so within-pair comparisons are interpretable.
+- **Per-project sccomp age modeling.** Compositional age effects estimated independently per tissue or cancer, adjusting for sex when both sexes have >= 5 samples (matching the threshold used in script 02).
+- **Random-effects meta-analysis.** Cell-type age effects are pooled across projects within each cohort using metafor.
+- **Matched-tissue pairings.** Each TCGA cancer is paired to its GTEx tissue of origin for the figure-level comparison.
+
+Figure assembly is left to the figure Rmd; this script writes the data tables that the figure script uses.
+
+## Libraries
+
+```{r}
+suppressPackageStartupMessages({
+  library(edgeR)
+  library(EPIC)
+  library(sccomp)
+  library(metafor)
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(tibble)
+  library(stringr)
+  library(ggplot2)
+  library(reactable)
+  library(here)
+})
+```
+
+## Setup
+
+```{r}
+set.seed(params$seed)
+
+processing_root <- here::here(params$processing_root)
+out_root        <- here::here(params$out_root)
+tables_root     <- here::here(params$tables_root)
+figures_root    <- here::here(params$figures_root)
+
+dir.create(file.path(out_root, "EPIC", "GTEx"),            recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(out_root, "EPIC", "TCGA"),            recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(out_root, "sccomp", "per_project_gtex"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(out_root, "sccomp", "per_project_tcga"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(out_root, "sccomp", "stan_gtex"),     recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(out_root, "sccomp", "stan_tcga"),     recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(out_root, "meta"),                    recursive = TRUE, showWarnings = FALSE)
+dir.create(tables_root,  recursive = TRUE, showWarnings = FALSE)
+dir.create(figures_root, recursive = TRUE, showWarnings = FALSE)
+
+msg <- function(...) {
+  if (isTRUE(params$verbose)) message(...)
+}
+```
+
+## Helpers
+
+```{r}
+reactable_pretty <- function(df) {
+  reactable::reactable(
+    df,
+    searchable = TRUE,
+    resizable = TRUE,
+    defaultPageSize = 10
+  )
+}
+
+# Load shared processing outputs and align metadata to count columns.
+load_project_inputs <- function(cohort, project, processing_root) {
+  dir_proj <- file.path(processing_root, cohort, project)
+  counts_sym <- readRDS(file.path(dir_proj, "counts_sym.rds"))
+  metadata   <- readRDS(file.path(dir_proj, "sample_metadata.rds")) %>%
+    as.data.frame()
+  metadata <- metadata[match(colnames(counts_sym), metadata$sample_id), , drop = FALSE]
+  if (!identical(metadata$sample_id, colnames(counts_sym))) {
+    stop("Metadata rows do not align to count columns for ", cohort, " / ", project)
+  }
+  list(counts_sym = counts_sym, metadata = metadata)
+}
+
+# Run EPIC deconvolution on a raw count matrix.
+# Returns a samples x cell-types proportion matrix.
+run_epic_from_counts <- function(counts_sym, scale_expr = FALSE) {
+  logcpm_sym <- edgeR::cpm(counts_sym, log = TRUE, prior.count = 1)
+
+  epic_out <- EPIC::EPIC(
+    bulk = as.matrix(logcpm_sym),
+    scaleExprs = scale_expr
+  )
+
+  props <- as.data.frame(epic_out$cellFractions)
+
+  if (identical(rownames(props), colnames(logcpm_sym))) {
+    out <- as.matrix(props)
+  } else if (identical(colnames(props), colnames(logcpm_sym))) {
+    out <- t(as.matrix(props))
+  } else {
+    stop("EPIC output orientation did not match input sample IDs.")
+  }
+
+  colnames(out) <- gsub("\\.", "_", colnames(out))
+  out
+}
+
+# Reshape proportions plus metadata into the long-form input sccomp expects.
+make_sccomp_long <- function(props_mat, metadata, group_value, group_var) {
+  df <- as.data.frame(props_mat)
+  df$sample_id <- rownames(df)
+
+  metadata_small <- metadata %>%
+    dplyr::select(sample_id, age_years, sex)
+
+  df %>%
+    dplyr::left_join(metadata_small, by = "sample_id") %>%
+    dplyr::filter(is.finite(age_years), !is.na(sex)) %>%
+    dplyr::mutate(!!group_var := group_value) %>%
+    tidyr::pivot_longer(
+      cols = -c(sample_id, age_years, sex, !!rlang::sym(group_var)),
+      names_to = "Cell_Group",
+      values_to = "Abundance"
+    ) %>%
+    dplyr::mutate(
+      SampleID   = as.factor(sample_id),
+      Age        = as.numeric(age_years),
+      Sex        = as.factor(sex),
+      Cell_Group = as.factor(Cell_Group)
+    ) %>%
+    dplyr::select(SampleID, Age, Sex, !!rlang::sym(group_var), Cell_Group, Abundance)
+}
+
+# Check whether both sexes have at least min_per_sex samples.
+# Matches the threshold used in script 02 (DESeq2 age modeling).
+has_sex_variation <- function(df, min_per_sex = 5) {
+  sex_tab <- table(df$Sex)
+  length(sex_tab) >= 2 && all(sex_tab >= min_per_sex)
+}
+
+# Fit one project's sccomp model. Returns a list with results, design, and n_samples.
+fit_sccomp_one <- function(df, output_directory, group_col, group_value, cores = 4) {
+
+  use_sex <- has_sex_variation(df)
+
+  formula_composition <- if (use_sex) {
+    stats::as.formula("~ Age + Sex")
+  } else {
+    stats::as.formula("~ Age")
+  }
+  design_label <- if (use_sex) "~ Age + Sex" else "~ Age"
+
+  fit <- tryCatch(
+    sccomp::sccomp_estimate(
+      .data               = df,
+      formula_composition = formula_composition,
+      formula_variability = ~ Age,
+      .sample             = SampleID,
+      .cell_group         = Cell_Group,
+      .abundance          = Abundance,
+      inference_method    = "pathfinder",
+      cores               = cores,
+      output_directory    = output_directory,
+      verbose             = FALSE
+    ),
+    error = function(e) e
+  )
+  if (inherits(fit, "error")) {
+    warning("sccomp_estimate failed for ", group_value, ": ", fit$message)
+    return(NULL)
+  }
+
+  res <- tryCatch(
+    sccomp::sccomp_test(
+      contrasts = "Age",
+      .data = fit,
+      test_composition_above_logit_fold_change = 0
+    ),
+    error = function(e) e
+  )
+  if (inherits(res, "error")) {
+    warning("sccomp_test failed for ", group_value, ": ", res$message)
+    return(NULL)
+  }
+
+  results_tbl <- res %>%
+    dplyr::filter(parameter == "Age") %>%
+    dplyr::mutate(!!group_col := group_value, SexAdjusted = use_sex)
+
+  list(
+    results      = results_tbl,
+    design_label = design_label,
+    n_samples    = dplyr::n_distinct(df$SampleID)
+  )
+}
+
+# Pick the most appropriate SE column from sccomp output and fall back to CI if needed.
+extract_sccomp_se <- function(df) {
+  candidate_cols <- c("se", "c_se", "c_sd", "sd")
+  present_cols   <- intersect(candidate_cols, colnames(df))
+
+  if (length(present_cols) > 0) {
+    se_vec <- suppressWarnings(as.numeric(df[[present_cols[1]]]))
+    if (any(is.finite(se_vec) & se_vec > 0, na.rm = TRUE)) {
+      return(se_vec)
+    }
+  }
+  if (all(c("c_lower", "c_upper") %in% colnames(df))) {
+    return((df$c_upper - df$c_lower) / (2 * 1.96))
+  }
+  stop("Could not obtain sccomp uncertainty: no direct SE column and no c_lower/c_upper columns found.")
+}
+
+# Random-effects meta-analysis across projects, per cell type.
+run_meta_by_celltype <- function(df, cohort_label, min_studies = 3) {
+  df %>%
+    dplyr::group_by(Cell_Group) %>%
+    dplyr::group_modify(function(.x, .y) {
+      dat <- .x %>%
+        dplyr::filter(is.finite(c_effect), is.finite(se), se > 0)
+
+      if (nrow(dat) < min_studies) {
+        return(tibble::tibble(
+          k = nrow(dat), est = NA_real_, se_meta = NA_real_,
+          ci_lb = NA_real_, ci_ub = NA_real_, pval = NA_real_, tau2 = NA_real_
+        ))
+      }
+
+      fit <- tryCatch(
+        metafor::rma.uni(yi = dat$c_effect, sei = dat$se, method = "REML"),
+        error = function(e) NULL
+      )
+      if (is.null(fit)) {
+        return(tibble::tibble(
+          k = nrow(dat), est = NA_real_, se_meta = NA_real_,
+          ci_lb = NA_real_, ci_ub = NA_real_, pval = NA_real_, tau2 = NA_real_
+        ))
+      }
+
+      tibble::tibble(
+        k       = fit$k,
+        est     = as.numeric(fit$b),
+        se_meta = as.numeric(fit$se),
+        ci_lb   = as.numeric(fit$ci.lb),
+        ci_ub   = as.numeric(fit$ci.ub),
+        pval    = as.numeric(fit$pval),
+        tau2    = as.numeric(fit$tau2)
+      )
+    }) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(Cohort = cohort_label)
+}
+```
+
+## Load processing manifest
+
+```{r}
+project_manifest <- readRDS(file.path(processing_root, "project_manifest.rds"))
+
+gtex_manifest <- project_manifest %>% dplyr::filter(cohort == "GTEx", kept)
+tcga_manifest <- project_manifest %>% dplyr::filter(cohort == "TCGA", kept)
+```
+
+GTEx tissues to model: `r nrow(gtex_manifest)`. TCGA cancers to model: `r nrow(tcga_manifest)`.
+
+## EPIC deconvolution: GTEx
+
+```{r}
+epic_gtex_files <- character(nrow(gtex_manifest))
+names(epic_gtex_files) <- gtex_manifest$project
+
+for (i in seq_len(nrow(gtex_manifest))) {
+  tissue   <- gtex_manifest$project[i]
+  out_file <- file.path(out_root, "EPIC", "GTEx", paste0("GTEx_", tissue, "_celltype_props.rds"))
+
+  if (file.exists(out_file)) {
+    msg("Cached EPIC: GTEx ", tissue)
+    epic_gtex_files[tissue] <- out_file
+    next
+  }
+
+  msg("Running EPIC: GTEx ", tissue)
+  x <- load_project_inputs("GTEx", tissue, processing_root)
+  props <- run_epic_from_counts(x$counts_sym)
+  saveRDS(props, out_file)
+  epic_gtex_files[tissue] <- out_file
+}
+
+saveRDS(epic_gtex_files, file.path(out_root, "EPIC", "GTEx", "epic_gtex_manifest.rds"))
+```
+
+## EPIC deconvolution: TCGA
+
+```{r}
+epic_tcga_files <- character(nrow(tcga_manifest))
+names(epic_tcga_files) <- tcga_manifest$project
+
+for (i in seq_len(nrow(tcga_manifest))) {
+  cancer   <- tcga_manifest$project[i]
+  out_file <- file.path(out_root, "EPIC", "TCGA", paste0("TCGA_", cancer, "_celltype_props.rds"))
+
+  if (file.exists(out_file)) {
+    msg("Cached EPIC: TCGA ", cancer)
+    epic_tcga_files[cancer] <- out_file
+    next
+  }
+
+  msg("Running EPIC: TCGA ", cancer)
+  x <- load_project_inputs("TCGA", cancer, processing_root)
+  props <- run_epic_from_counts(x$counts_sym)
+  saveRDS(props, out_file)
+  epic_tcga_files[cancer] <- out_file
+}
+
+saveRDS(epic_tcga_files, file.path(out_root, "EPIC", "TCGA", "epic_tcga_manifest.rds"))
+```
+
+## sccomp age modeling: GTEx
+
+```{r}
+gtex_per_project <- vector("list", nrow(gtex_manifest))
+names(gtex_per_project) <- gtex_manifest$project
+
+for (i in seq_len(nrow(gtex_manifest))) {
+
+  tissue     <- gtex_manifest$project[i]
+  cache_file <- file.path(out_root, "sccomp", "per_project_gtex",
+                          paste0("GTEx-", tissue, "_sccomp_age.rds"))
+
+  if (file.exists(cache_file)) {
+    msg("Cached sccomp: GTEx ", tissue)
+    gtex_per_project[[tissue]] <- readRDS(cache_file)
+    next
+  }
+
+  msg("Fitting sccomp: GTEx ", tissue)
+  props <- readRDS(epic_gtex_files[[tissue]])
+  meta  <- readRDS(gtex_manifest$metadata_file[i])
+
+  sccomp_df <- make_sccomp_long(
+    props_mat   = props,
+    metadata    = meta,
+    group_value = tissue,
+    group_var   = "Tissue"
+  )
+
+  stan_dir <- file.path(out_root, "sccomp", "stan_gtex", paste0("GTEx_", tissue))
+  dir.create(stan_dir, recursive = TRUE, showWarnings = FALSE)
+
+  fit <- fit_sccomp_one(
+    df               = sccomp_df,
+    output_directory = stan_dir,
+    group_col        = "Tissue",
+    group_value      = tissue,
+    cores            = params$cores
+  )
+
+  if (!is.null(fit)) {
+    fit$results <- fit$results %>%
+      dplyr::mutate(se = extract_sccomp_se(.))
+    saveRDS(fit, cache_file)
+    gtex_per_project[[tissue]] <- fit
+  }
+}
+```
+
+## sccomp age modeling: TCGA
+
+```{r}
+tcga_per_project <- vector("list", nrow(tcga_manifest))
+names(tcga_per_project) <- tcga_manifest$project
+
+for (i in seq_len(nrow(tcga_manifest))) {
+
+  cancer     <- tcga_manifest$project[i]
+  cache_file <- file.path(out_root, "sccomp", "per_project_tcga",
+                          paste0("TCGA-", cancer, "_sccomp_age.rds"))
+
+  if (file.exists(cache_file)) {
+    msg("Cached sccomp: TCGA ", cancer)
+    tcga_per_project[[cancer]] <- readRDS(cache_file)
+    next
+  }
+
+  msg("Fitting sccomp: TCGA ", cancer)
+  props <- readRDS(epic_tcga_files[[cancer]])
+  meta  <- readRDS(tcga_manifest$metadata_file[i])
+
+  sccomp_df <- make_sccomp_long(
+    props_mat   = props,
+    metadata    = meta,
+    group_value = cancer,
+    group_var   = "Cancer"
+  )
+
+  stan_dir <- file.path(out_root, "sccomp", "stan_tcga", paste0("TCGA_", cancer))
+  dir.create(stan_dir, recursive = TRUE, showWarnings = FALSE)
+
+  fit <- fit_sccomp_one(
+    df               = sccomp_df,
+    output_directory = stan_dir,
+    group_col        = "Cancer",
+    group_value      = cancer,
+    cores            = params$cores
+  )
+
+  if (!is.null(fit)) {
+    fit$results <- fit$results %>%
+      dplyr::mutate(se = extract_sccomp_se(.))
+    saveRDS(fit, cache_file)
+    tcga_per_project[[cancer]] <- fit
+  }
+}
+```
+
+## Combine sccomp effects across cohorts
+
+```{r}
+gtex_per_project <- purrr::compact(gtex_per_project)
+tcga_per_project <- purrr::compact(tcga_per_project)
+
+gtex_sccomp_effects <- purrr::map_dfr(gtex_per_project, ~ .x$results) %>%
+  dplyr::select(Tissue, Cell_Group, c_effect, se, c_lower, c_upper, c_FDR, SexAdjusted)
+
+tcga_sccomp_effects <- purrr::map_dfr(tcga_per_project, ~ .x$results) %>%
+  dplyr::select(Cancer, Cell_Group, c_effect, se, c_lower, c_upper, c_FDR, SexAdjusted)
+
+saveRDS(gtex_sccomp_effects, file.path(out_root, "sccomp", "GTEx_age_effects_by_tissue.rds"))
+saveRDS(tcga_sccomp_effects, file.path(out_root, "sccomp", "TCGA_age_effects_by_cancer.rds"))
+
+utils::write.csv(
+  gtex_sccomp_effects,
+  file = file.path(tables_root, "GTEx_sccomp_age_effects_by_tissue.csv"),
+  row.names = FALSE
+)
+utils::write.csv(
+  tcga_sccomp_effects,
+  file = file.path(tables_root, "TCGA_sccomp_age_effects_by_cancer.csv"),
+  row.names = FALSE
+)
+```
+
+GTEx sccomp fits: `r length(gtex_per_project)` of `r nrow(gtex_manifest)`. TCGA sccomp fits: `r length(tcga_per_project)` of `r nrow(tcga_manifest)`.
+
+## Cohort-level meta-analysis
+
+```{r}
+celltype_meta_gtex <- run_meta_by_celltype(
+  df           = gtex_sccomp_effects,
+  cohort_label = "GTEx",
+  min_studies  = params$meta_min_studies
+)
+
+celltype_meta_tcga <- run_meta_by_celltype(
+  df           = tcga_sccomp_effects,
+  cohort_label = "TCGA",
+  min_studies  = params$meta_min_studies
+)
+
+celltype_meta_all <- dplyr::bind_rows(celltype_meta_gtex, celltype_meta_tcga)
+
+saveRDS(celltype_meta_all, file.path(out_root, "meta", "celltype_meta_all.rds"))
+utils::write.csv(
+  celltype_meta_all,
+  file = file.path(tables_root, "celltype_meta_all.csv"),
+  row.names = FALSE
+)
+```
+
+## Matched tissue pairings
+
+Each TCGA cancer in the emphasis set is paired to its GTEx tissue of origin for the figure-level cell-type comparison. Pairings match those used in script 02.
+
+```{r}
+matched_sets <- list(
+  BREAST = list(GTEx = "BREAST", TCGA = c("BRCA")),
+  LUNG   = list(GTEx = "LUNG",   TCGA = c("LUAD", "LUSC")),
+  BRAIN  = list(GTEx = "BRAIN",  TCGA = c("GBM", "LGG")),
+  COLON  = list(GTEx = "COLON",  TCGA = c("COAD"))
+)
+
+matched_pair_summary <- purrr::imap_dfr(matched_sets, function(spec, tissue) {
+  tibble::tibble(
+    Tissue       = tissue,
+    GTEx_project = spec$GTEx,
+    TCGA_cancers = paste(spec$TCGA, collapse = ", ")
+  )
+})
+
+reactable_pretty(matched_pair_summary)
+```
+
+```{r}
+celltype_matched_long <- purrr::imap_dfr(matched_sets, function(spec, tissue_name) {
+  gt_tissue  <- spec$GTEx
+  tc_cancers <- spec$TCGA
+
+  cell_types <- sort(unique(c(
+    gtex_sccomp_effects$Cell_Group,
+    tcga_sccomp_effects$Cell_Group
+  )))
+
+  purrr::map_dfr(cell_types, function(cell_type) {
+    gtex_row <- gtex_sccomp_effects %>%
+      dplyr::filter(Tissue == gt_tissue, Cell_Group == cell_type) %>%
+      dplyr::mutate(Cohort = paste0("GTEx-", tissue_name), Tissue = tissue_name)
+
+    tcga_rows <- tcga_sccomp_effects %>%
+      dplyr::filter(Cancer %in% tc_cancers, Cell_Group == cell_type) %>%
+      dplyr::mutate(Cohort = Cancer, Tissue = tissue_name)
+
+    dplyr::bind_rows(gtex_row, tcga_rows)
+  })
+})
+
+saveRDS(celltype_matched_long, file.path(out_root, "meta", "celltype_matched_long.rds"))
+utils::write.csv(
+  celltype_matched_long,
+  file = file.path(tables_root, "celltype_matched_long.csv"),
+  row.names = FALSE
+)
+```
+
+Matched-tissue cell-type results saved to `r file.path(out_root, "meta", "celltype_matched_long.rds")`.
+
+## Per-project run summary
+
+The table below lists every project that was fit, the design that was used, the number of samples that entered the sccomp model, and the number of cell-type compositional age effects that reached FDR < `r params$fdr_threshold` by direction.
+
+```{r}
+summarize_one <- function(per_project_list, cohort_label) {
+  purrr::imap_dfr(per_project_list, function(fit, proj) {
+    res <- fit$results
+    tibble::tibble(
+      Cohort         = cohort_label,
+      Project        = proj,
+      n_samples      = fit$n_samples,
+      Design         = fit$design_label,
+      n_cell_types   = nrow(res),
+      n_FDR_up       = sum(res$c_FDR < params$fdr_threshold & res$c_effect > 0, na.rm = TRUE),
+      n_FDR_down     = sum(res$c_FDR < params$fdr_threshold & res$c_effect < 0, na.rm = TRUE)
+    )
+  })
+}
+
+per_project_summary <- dplyr::bind_rows(
+  summarize_one(gtex_per_project, "GTEx"),
+  summarize_one(tcga_per_project, "TCGA")
+) %>%
+  dplyr::arrange(Cohort, Project)
+
+reactable_pretty(per_project_summary)
+
+utils::write.csv(
+  per_project_summary,
+  file = file.path(tables_root, "part2_celltype_per_project_summary.csv"),
+  row.names = FALSE
+)
+```
+
+## Per-project compositional age signal
+
+A quick QC view of how many cell types reached FDR < `r params$fdr_threshold` in each project. With only `r length(unique(gtex_sccomp_effects$Cell_Group))` EPIC cell groups per fit, counts are bounded; projects with zero significant cell types are typically underpowered or have no detectable compositional age effect.
+
+```{r, fig.width = 8.5, fig.height = 5}
+plot_df <- per_project_summary %>%
+  dplyr::mutate(
+    n_FDR_total = n_FDR_up + n_FDR_down,
+    Project = factor(Project, levels = Project[order(n_FDR_total)])
+  )
+
+ggplot(plot_df, aes(x = n_FDR_total, y = Project, fill = Cohort)) +
+  geom_col() +
+  facet_wrap(~ Cohort, scales = "free_y") +
+  scale_fill_manual(values = c(GTEx = "#4daf4a", TCGA = "#7b3294")) +
+  theme_minimal(base_size = 11) +
+  labs(
+    x = paste0("Cell types with FDR < ", params$fdr_threshold),
+    y = NULL,
+    fill = NULL
+  ) +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(face = "bold")
+  )
+
+ggsave(
+  file.path(figures_root, "per_project_celltype_fdr_counts.pdf"),
+  width = 8.5, height = 5
+)
+```
+
+## Save run summary
+
+```{r}
+run_summary <- list(
+  n_gtex_fits                  = length(gtex_per_project),
+  n_tcga_fits                  = length(tcga_per_project),
+  n_cell_types                 = length(unique(c(gtex_sccomp_effects$Cell_Group,
+                                                 tcga_sccomp_effects$Cell_Group))),
+  matched_pair_rows            = nrow(celltype_matched_long),
+  meta_n_celltypes_fdr05_gtex  = sum(celltype_meta_gtex$pval < params$fdr_threshold, na.rm = TRUE),
+  meta_n_celltypes_fdr05_tcga  = sum(celltype_meta_tcga$pval < params$fdr_threshold, na.rm = TRUE)
+)
+
+saveRDS(run_summary, file.path(out_root, "run_summary.rds"))
+```
+
+## Session info
+
+```{r}
+sessionInfo()
+```

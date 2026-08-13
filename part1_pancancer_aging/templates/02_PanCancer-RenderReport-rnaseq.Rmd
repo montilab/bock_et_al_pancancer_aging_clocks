@@ -1,0 +1,85 @@
+---
+title: "TCGA Pan-Cancer Differential RNAseq Analysis - Render Report"
+author: "Payton Bock"
+date:   "`r format(Sys.Date(), '%B %d, %Y')`"
+output: html_document
+---
+
+# Script Summary
+This function runs differential methylation analysis on TCGA projects using provided covariates from the "{OMICS_LAYER}_covariates.rds" file. 
+You can control which TCGA projects to run by subsetting the covariates file to only include specific projects. 
+
+This script runs/knits `02_PanCancer-Regression-RNAseq.Rmd`
+
+# INPUTS
+ - rmd = Path to RMD to knit (needs to be set up to accept input parameters) 
+ - output_dir = Where the html knitted outputs will be saved
+ - covariate_file = covariates file created from 
+ /restricted/projectnb/agedisease/projects/pancancer_aging/TCGA-GDC/metadata/scripts/05_Covariates.Rmd
+ 
+```{r} 
+render_reports <- function(rmd, output_dir, covariate_file) {
+  for (i in 1:nrow(covariate_file)) {
+    try({
+    #Specify input parameters from covariate file
+    cancer_type <- covariate_file$cancer_type[i]
+    include_gender <- covariate_file$include_gender[i]
+    include_race <- covariate_file$include_race[i]
+    include_hpv <- covariate_file$include_HPV_status [i]
+    include_subtype <- covariate_file$include_subtype[i]
+    races_to_include <- covariate_file$races_included[i]
+    include_purity <- covariate_file$include_purity[i]
+    
+    # Define the specific output file name for each cancer type
+    output_file_name <- paste0(output_dir, cancer_type, "_RNAseq_Differential_Analysis.html")
+    
+    #Print updates
+    print(paste0("Creating output for ", cancer_type, " at ",output_file_name, " ..."))
+    
+    # Render the R Markdown document with the specific parameters
+    rmarkdown::render(input = rmd,
+                      output_file = output_file_name,
+                      params = list(cancer_type = cancer_type,
+                                    include_gender = include_gender,
+                                    include_race = include_race,
+                                    include_hpv = include_hpv,
+                                    include_subtype = include_subtype,
+                                    races_to_include = races_to_include,
+                                    include_purity = include_purity))
+    
+    print("Done!")
+    })
+  }
+}
+
+```
+
+# Paths 
+```{r}
+#Define inputs to "render_reports" input
+regression_rmd <- "/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/scripts/RNAseq/02_PanCancer-Regression-rnaseq.Rmd"
+output <- "/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/results/RNAseq/htmls/"
+covariates <- readRDS("/restricted/projectnb/agedisease/CBMrepositoryData/TCGA-GDC/metadata/covariates/RNASEQ_covariates.rds")
+```
+
+# Example runs 
+Subset to first row of covariate files to test (TCGA-ACC)
+```{r}
+#first row of covariates file which is TCGA-ACC
+covariate_test <- covariates[1,1:dim(covariates)[2]]
+last_15_rows <- tail(covariates, 9)
+```
+
+Subset to a specific project of interest
+```{r}
+#Run specific project
+specific_project <- covariates[covariates$cancer_type == "TCGA-HNSC",]
+```
+
+
+Provide the full "covariates" variable to run all TCGA projects
+```{r}
+#Call function
+render_reports(rmd = regression_rmd, output_dir = output, covariate_file = last_15_rows)
+```
+

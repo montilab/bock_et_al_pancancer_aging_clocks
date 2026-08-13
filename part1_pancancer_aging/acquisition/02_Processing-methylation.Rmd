@@ -1,0 +1,351 @@
+---
+title: "Process Methylation SummarizedExperiment Objects"
+subtitle: "TCGA PanCancer Aging"
+author: "Payton Bock - Monti Lab"
+date:   "`r format(Sys.Date(), '%B %d, %Y')`"
+params: 
+  dummy: "dummy"
+output:
+  html_document:
+    theme: united
+    code_folding: hide
+    css: style.css
+    toc: true
+    toc_float: true
+---
+
+```{r opts, echo=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+```{r setup, include=FALSE}
+.libPaths("/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/r-library/")
+
+library(SummarizedExperiment)
+library(S4Vectors)
+library(maxprobes)
+library(reshape2)
+library(dplyr)
+
+
+#get environmental variables
+PATH <- file.path( Sys.getenv("PCANAGE","/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/")) 
+TCGA <- file.path( Sys.getenv("CBMDATA","/restricted/projectnb/agedisease/CBMrepositoryData/TCGA-GDC"), "TCGA-GDC")
+```
+
+## Script Summary 
+- Loads harmonized meta data RDS file
+
+- Calculates and add M-Values to SummarizedExperiment objects
+
+- Filters probes (CpG sites) in each SummarizedExperiment object (TCGA project) using various criteria
+
+- Adds meta data to all SummarizedExperiment objects for the methylation omics layer
+
+- Save filtered and unfiltered versions of the SummarizedExperiment objects
+
+
+## Data Loading
+
+```{r data loading}
+#Where the meta data RDS file is
+metadata <- readRDS(file.path(TCGA,"metadata/data/harmonized_metadata.rds"))
+
+#Path where the summarized experiment objects you are updating are located
+se_directory <- file.path(TCGA,"methylation/raw_data/raw_SE/")
+```
+
+## Define Filtering Critera
+These are the preprocessing steps taken to remove poor performing probes (CpG sites)
+that may influence downstream analysis. There is no consensus preprocessing steps, so I performed
+the ones that appeared most often in literature. 
+
+Note that we are starting from BETA values (level 3 methylation data) that has already 
+undergone some preprocessing using the Sesame pipeline: 
+
+Link to GDC's explanation of methylation processing
+( https://docs.gdc.cancer.gov/Data/Bioinformatics_Pipelines/Methylation_Pipeline/)
+
+Here we remove (per TCGA project):
+  All NA Probes: These probes are missing all of their values, most likely due to 
+  low detection p-value calculated during Sesame workflow
+  
+  Non-CpG probes: This is a common preprocessing step to remove probes targeting 
+  sites that are not "CpG", usually called "ch" as it indicates a C followed by either A,T, or C. 
+  
+  Probes that Overlap with SNPs: SNPs can affect probe binding and methylation readings. 
+  We remove both "common" SNPs and those with a minor allele frequency greater than 1%. This is determined
+  using the MASK annotations (see next) from a 2017 paper. 
+
+  General Mask Probes: This step helps in removing probes flagged for various issues, 
+  adding another layer of quality control. This is generated from a 2017 study (https://doi.org/10.1093/nar/gkw967) which
+  created all MASK annotations through testing which CpGs methylation levels are heavily affected by SNPs, repetitive regions,
+  etc. 
+  
+  Probes with more than 20% missing values: Setting a threshold (like 20%) for 
+  missing values is standard practice. If a probe has more than 20% of its value 
+  missing across samples, drop it
+  
+  Cross-Reactive probes: Probes that have been proven to bind to multiple sequences
+  We use "maxprobe" here which combines results from two papers identifying cross
+  reactive probes :  https://github.com/markgene/maxprobes
+
+  Removing Probes on Sex Chromosomes: Relevant if sex chromosome-related variations 
+  are not the focus of your study. Sex chromosome probes perform poorly and are 
+  difficult to account for when analyzing both genders. 
+  
+```{r}
+filter_probes <- function(summarized_experiment) {
+    initial_count <- dim(SummarizedExperiment::assay(summarized_experiment))[1]
+    #cat("Number of CpG probes initially: ", initial_count, "\n")
+    
+    # Remove rows with all NAs
+    rows_with_all_na <- rowSums(!is.na(SummarizedExperiment::assay(summarized_experiment))) == 0
+    methyl_subset <- summarized_experiment[!rows_with_all_na, ]
+    post_na_count <- dim(SummarizedExperiment::assay(methyl_subset))[1]
+    #cat("Number of ALL NA CpG probes removed: ", initial_count - post_na_count, "\n")
+    
+    # Remove non-CpG probes
+    methyl_subset <- methyl_subset[SummarizedExperiment::rowData(methyl_subset)$probeType != "ch", ]
+    post_nonCpG_count <- dim(SummarizedExperiment::assay(methyl_subset))[1]
+    #cat("Number of non-CpG probes removed: ", post_na_count - post_nonCpG_count, "\n")
+    
+    # Remove probes that overlap with SNPs (at least 1% MAF in any population)
+    methyl_subset <- methyl_subset[!SummarizedExperiment::rowData(methyl_subset)$MASK_snp5_common, ]
+    post_snp_common_count <- dim(SummarizedExperiment::assay(methyl_subset))[1]
+    #cat("Number of common SNP probes removed: ", post_nonCpG_count - post_snp_common_count, "\n")
+    
+    # Remove any probes that have a GLOBAL minor allele freq >1%
+    methyl_subset <- methyl_subset[!SummarizedExperiment::rowData(methyl_subset)$MASK_snp5_GMAF1p, ]
+    post_snp_GMAF1_count <- dim(SummarizedExperiment::assay(methyl_subset))[1]
+    #cat("Number of probes with SNPS MAF >1% removed: ", post_snp_common_count - post_snp_GMAF1_count, "\n")
+    
+    # Remove any probes that are flagged with MASK_general
+    # This is a combination of multiple flags indicating a problematic probe
+    # Usually only all NA probes are flagged (should already be removed)
+    methyl_subset <- methyl_subset[!SummarizedExperiment::rowData(methyl_subset)$MASK_general, ]
+    post_mask_gen_count <- dim(SummarizedExperiment::assay(methyl_subset))[1]
+    #cat("Number of flagged probes removed: ", post_snp_GMAF1_count - post_mask_gen_count, "\n")
+    
+    # Calculate the proportion of missing values for each probe in the subset
+    proportion_missing <- apply(SummarizedExperiment::assay(methyl_subset), 1, function(x) sum(is.na(x)) / length(x))
+    # Identify probes with more than 20% missing values
+    probes_to_remove <- which(proportion_missing > 0.20)
+    # Remove these probes from the subset
+    methyl_subset <- methyl_subset[-probes_to_remove, ]
+    post_gt20missing_probe_count <- dim(SummarizedExperiment::assay(methyl_subset))[1]
+    #cat("Number of probes with >20% missing values removed: ", post_mask_gen_count - post_gt20missing_probe_count, "\n")
+    
+    # Finally remove cross reactive probes (from the maxprobes library)
+    xloci <- maxprobes::xreactive_probes(array_type = "450K")
+    rows_to_keep <- !rownames(methyl_subset) %in% xloci
+    methyl_subset <- methyl_subset[rows_to_keep, ]
+    post_crossreactive_probe_count <- dim(SummarizedExperiment::assay(methyl_subset))[1]
+    #cat("Number of cross reactive probes removed: ", post_gt20missing_probe_count - post_crossreactive_probe_count, "\n")
+    
+    # Remove any probes that are on sex chromosomes (X and Y)
+    methyl_filtered <- methyl_subset[!SummarizedExperiment::rowData(methyl_subset)$chrm_A %in% c("chrX", "chrY"), ]
+    final_count <- dim(SummarizedExperiment::assay(methyl_filtered))[1]
+    #cat("Number of sex chromosome probes removed: ", post_crossreactive_probe_count - final_count, "\n")
+    
+    #cat("Number of CpG sites after all filtering: ", final_count, "\n")
+    
+    # Return list of results
+    list(
+        filtered_data = methyl_filtered, 
+        initial_count = initial_count, 
+        final_count = final_count,
+        post_na_count = post_na_count,
+        post_nonCpG_count = post_nonCpG_count,
+        post_snp_common_count = post_snp_common_count,
+        post_snp_GMAF1_count = post_snp_GMAF1_count,
+        post_mask_gen_count = post_mask_gen_count,
+        post_gt20missing_probe_count = post_gt20missing_probe_count,
+        post_crossreactive_probe_count = post_crossreactive_probe_count
+    )
+}
+```
+
+
+## M-Value Calculation
+To perform regression, it is standard practice to utilize M-values (logit transformation) instead of the
+downloaded beta values.
+
+Paper about the difference:  https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6449748/
+
+Exerp:
+"The M-value is more statistically valid for the differential analysis of methylation levels because the M-value is approximately homoscedastic (the β-value has severe heteroscedasticity outside the middle methylation range, which imposes serious challenges in applying many statistic models)"
+
+Here we define the calc_mvals function to apply to our SummarizedExperiment objects, adding a "M-values" assay to the objects. 
+
+```{r Calculating M-value}
+calc_mvals <- function(methyl_data) {
+  # Convert to M-value
+  m_values <- log2(SummarizedExperiment::assay(methyl_data) / (1 - SummarizedExperiment::assay(methyl_data)))
+
+  # Handling possible division by zero or undefined values
+  m_values[is.infinite(m_values) | is.na(m_values)] <- NA
+
+  # Add M-values as assay
+  SummarizedExperiment::assays(methyl_data)[["M-values"]] <- m_values
+
+  # Rename default assay
+  names(SummarizedExperiment::assays(methyl_data))[names(SummarizedExperiment::assays(methyl_data)) == ''] <- "Beta-values"
+
+  return(methyl_data)
+}
+```
+
+
+## Process Methylation SummarizedExperiment Objects in folder
+Here we loop through all SummarizedExperiment RDS files, check if the shortened ID is the column names (and sets the barcode as the column if not), and add the harmonzied meta data to the SummarizedObject (which is then saved). We also apply the probe filtering function defined above. 
+
+This assumes the data has only one of each "submitter_id", which should be the case given only primary tumors were downloaded.
+
+We also filter and track the number of probes (CpG sites) removed during each step of the
+filtering process. 
+
+Its important to note this calculates the number of probes removed at each STEP, 
+not necessarily the number of original probes that would be dropped from filtering 
+the category. 
+
+For example, in the BRCA project we had 8657 probes removed for having >20%
+missing values. This occurs after the removal of the ALL NA probes, and thus does
+not represent the # of probes with >20% missing values but just the remaining probes
+at that step of the filtering. 
+
+Finally, we also calculate and add the M-Values as an assay to the SummarizedExperiment objects.
+
+```{r process Folder of Summarized Experiments}
+# Define directories for saving all and filtered data
+filtered_directory <- file.path(TCGA, "methylation/processed_data/filtered")
+all_directory <- file.path(TCGA, "methylation/processed_data/all")
+
+# Create directories if they don't exist
+dir.create(filtered_directory, recursive = TRUE, showWarnings = FALSE)
+dir.create(all_directory, recursive = TRUE, showWarnings = FALSE)
+
+# Create a list of all .rds files in the se_directory
+file_list <- list.files(path = se_directory, pattern = "\\.rds$", full.names = TRUE)
+
+# Initialize removal table
+removal_table <- data.frame(
+  Cancer_Type = character(),
+  All_NA = integer(),
+  Non_CpG = integer(),
+  SNP_Common = integer(),
+  SNP_GMAF1 = integer(),
+  MASK_General = integer(),
+  GT20_Missing = integer(),
+  Cross_Reactive = integer(),
+  ChrX_Y = integer(),
+  Final_Count = integer(),
+  stringsAsFactors = FALSE
+)
+
+# Loop through each file
+for(file in file_list) {
+  
+  cat("Processing file: ", file, "\n")
+  
+  # Read in the SummarizedExperiment object
+  data <- readRDS(file)
+  
+  # Ensure 'submitter_id' is set as the column names
+  if (!identical(colnames(data), SummarizedExperiment::colData(data)$submitter_id)) {
+    colnames(data) <- SummarizedExperiment::colData(data)$submitter_id
+  }
+  
+  # Determine samples to keep based on metadata
+  samples_to_keep <- intersect(colnames(data), rownames(metadata))
+  
+  # Extract project-specific metadata
+  project_specific_metadata <- metadata[samples_to_keep, ]
+  
+  # Convert metadata to DataFrame if necessary
+  project_specific_metadata <- S4Vectors::DataFrame(project_specific_metadata)
+  
+  # Sort the SummarizedExperiment columns to match metadata
+  data_sorted <- data[, match(rownames(project_specific_metadata), colnames(data))]
+  
+  # Verify that the samples match
+  if (identical(colnames(data_sorted), rownames(project_specific_metadata))) {
+    
+    # Add metadata to colData
+    SummarizedExperiment::colData(data_sorted) <- project_specific_metadata
+    
+    # Calculate and add M-values
+    data_sorted <- calc_mvals(data_sorted)
+    
+    # Save the unfiltered SummarizedExperiment to the "all" directory
+    all_output_path <- file.path(all_directory, basename(file))
+    saveRDS(data_sorted, all_output_path)
+    
+    # Apply the probe filtering function
+    filtered_results <- filter_probes(data_sorted)
+    
+    # Save the filtered SummarizedExperiment to the "filtered" directory
+    filtered_output_path <- file.path(filtered_directory, basename(file))
+    saveRDS(filtered_results$filtered_data, filtered_output_path)
+    
+    # Extract removal counts
+    counts <- filtered_results[c(
+      "initial_count",
+      "post_na_count",
+      "post_nonCpG_count",
+      "post_snp_common_count",
+      "post_snp_GMAF1_count",
+      "post_mask_gen_count",
+      "post_gt20missing_probe_count",
+      "post_crossreactive_probe_count",
+      "final_count"
+    )]
+    
+    # Calculate probes removed at each step
+    probes_removed <- c(
+      All_NA = counts$initial_count - counts$post_na_count,
+      Non_CpG = counts$post_na_count - counts$post_nonCpG_count,
+      SNP_Common = counts$post_nonCpG_count - counts$post_snp_common_count,
+      SNP_GMAF1 = counts$post_snp_common_count - counts$post_snp_GMAF1_count,
+      MASK_General = counts$post_snp_GMAF1_count - counts$post_mask_gen_count,
+      GT20_Missing = counts$post_mask_gen_count - counts$post_gt20missing_probe_count,
+      Cross_Reactive = counts$post_gt20missing_probe_count - counts$post_crossreactive_probe_count,
+      ChrX_Y = counts$post_crossreactive_probe_count - counts$final_count,
+      Final_Count = counts$final_count
+    )
+    
+    # Extract cancer type from the file name (assuming format like TCGA-BRCA_methylation.rds)
+    cancer_type <- tools::file_path_sans_ext(basename(file))
+    
+    # Append the removal counts to the removal_table
+    removal_table <- rbind(removal_table, data.frame(
+      Cancer_Type = cancer_type,
+      All_NA = probes_removed["All_NA"],
+      Non_CpG = probes_removed["Non_CpG"],
+      SNP_Common = probes_removed["SNP_Common"],
+      SNP_GMAF1 = probes_removed["SNP_GMAF1"],
+      MASK_General = probes_removed["MASK_General"],
+      GT20_Missing = probes_removed["GT20_Missing"],
+      Cross_Reactive = probes_removed["Cross_Reactive"],
+      ChrX_Y = probes_removed["ChrX_Y"],
+      Final_Count = probes_removed["Final_Count"],
+      stringsAsFactors = FALSE
+    ))
+    
+  } else {
+    # If there's a mismatch in sample names, throw an erroram
+    stop(paste("Mismatch between column names and metadata samples in file:", file))
+  }
+}
+
+reactable::reactable(removal_table,searchable = TRUE, resizable = TRUE)
+
+```
+
+## Session Info
+```{r}
+sessionInfo()
+```
+
+
+

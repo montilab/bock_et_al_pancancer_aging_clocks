@@ -1,0 +1,196 @@
+---
+title: "Downloading TCGA Mutation Data"
+subtitle: "TCGA PanCancer Aging"
+author: "Payton Bock - Monti Lab"
+date:   "`r format(Sys.Date(), '%B %d, %Y')`"
+params: 
+  dummy: "dummy"
+output:
+  html_document:
+    theme: united
+    code_folding: hide
+    css: style.css
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+```{r, include = FALSE}
+#Load TCGA biolinks library
+.libPaths("/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/r-library/")
+
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(dplyr)
+library(maftools)
+```
+
+## Script Summary 
+- Downloads raw mutation data using TCGAbiolinks queries
+- 33 total cancer types
+- Creates SummarizedExperiment objects for each cancer type 
+
+## Set up
+```{r projects to download}
+projects <- c(
+  "TCGA-BRCA", "TCGA-OV","TCGA-GBM", "TCGA-LUAD", "TCGA-UCEC", 
+  "TCGA-KIRC", "TCGA-HNSC", "TCGA-LGG", "TCGA-THCA", "TCGA-LUSC", 
+  "TCGA-PRAD", "TCGA-SKCM", "TCGA-COAD", "TCGA-STAD", "TCGA-BLCA", 
+  "TCGA-LIHC", "TCGA-CESC", "TCGA-KIRP", "TCGA-SARC", "TCGA-LAML", 
+  "TCGA-ESCA", "TCGA-PAAD", "TCGA-PCPG", "TCGA-READ", "TCGA-TGCT", 
+  "TCGA-THYM", "TCGA-KICH", "TCGA-ACC", "TCGA-MESO", "TCGA-UVM", 
+  "TCGA-DLBC", "TCGA-UCS", "TCGA-CHOL"
+)
+
+#Sets the CBMDATA directory path
+Sys.setenv(CBMDATA = "/restricted/projectnb/agedisease/CBMrepositoryData")
+
+#Combines CBMDATA path with sub-directories for data output
+PATH <- file.path(Sys.getenv("CBMDATA"), "TCGA-GDC", "mutation", "raw_data")
+PATH_rawdl <- file.path(PATH,"project_downloads")
+PATH_se <- file.path(PATH,"raw_SE")
+```
+
+
+## Downloading Raw Data - Function
+Here we use TCGAbiolinks to download the mutation data from all TCGA projects. 
+- This script (in its current form) only includes primary tumor data
+- It creates a SummarizedExperiment object with GDCprepare()
+
+More info on queries:
+https://bioconductor.org/packages/devel/bioc/vignettes/TCGAbiolinks/inst/doc/query.html
+
+More information on DNAseq analysis pipeline for TCGA: https://docs.gdc.cancer.gov/Data/Bioinformatics_Pipelines/DNA_Seq_Variant_Calling_Pipeline/
+More information on Mutation Annotation Format (Masked Somatic Mutation files): https://docs.gdc.cancer.gov/Data/File_Formats/MAF_Format/
+
+MAF Reading and Binary Matrix Creation: Mutation Annotation Format (MAF) files are processed with maftools::read.maf to convert mutation counts into a binary format indicating the presence or absence of mutations in each sample for each gene.
+
+Mutation Type-Specific Processing
+- Binary Matrix Generation: For each type of mutation, a separate binary matrix is generated. This matrix undergoes processing to ensure it reflects primary tumor samples only, and sample identifiers are appropriately shortened and deduplicated.
+
+- Mapping to Full Matrix: Each mutation type's data is then mapped to a full matrix representing all possible genes and samples, facilitating easier comparative analyses across different mutation types.
+
+These different categories of mutations (along with the full binary matrix) are packaged into a SummarizedExperiment object as assays. 
+
+```{r Download project data}
+## download of the TCGA project dataset for RPPA
+data_download <- function(project) {
+  project.hg38 <- TCGAbiolinks::GDCquery(
+    project = project,
+    data.category = "Simple Nucleotide Variation", 
+    data.type = "Masked Somatic Mutation",
+    access = "open"
+  )
+
+  # Download query
+  GDCdownload(project.hg38, directory = PATH_rawdl)
+  # Assign query to global variable
+  assign(paste0(project, "_query.hg38"), project.hg38, envir = .GlobalEnv)
+}
+
+
+## This will create and download data to "GDCdata" folder in PATH_rawdl directory
+for (project in projects) {
+  cat("Downloading mutation data for", project, "\n") # Print message to keep track
+  
+  #download data with query
+  data_download(project)
+  
+  #retrieve query variable
+  data_name<- paste0(project, "_query.hg38")
+  query_obj <- get(data_name)
+  data.hg38 <- GDCprepare(query_obj, directory = PATH_rawdl, summarizedExperiment = TRUE)
+  
+  
+  ### BINARY FORMAT ###
+  #read maf
+  maf <- maftools::read.maf(data.hg38)
+  mutation_data <- as.data.frame(maf@data)
+  binary_matrix <- table(mutation_data$Tumor_Sample_Barcode, mutation_data$Hugo_Symbol)
+  binary_matrix[binary_matrix > 0] <- 1
+  
+  # Convert the matrix to a data frame for easier viewing and manipulation
+  mut_genes<-t(binary_matrix)
+
+  # Convert the matrix to a data frame for easier viewing and manipulation
+  mut_genes <- mut_genes[, grepl("-01", colnames(mut_genes))]
+  colnames(mut_genes) = substr(colnames(mut_genes), 1, 12)
+  
+
+  unique_cols <- !duplicated(colnames(mut_genes))
+  mut_genes <- mut_genes[, unique_cols]
+  
+  # Unique genes and samples from the MAF object
+  all_genes <- rownames(mut_genes)
+  all_samples <- colnames(mut_genes)
+
+  # Store all matrices
+  list_matrices <- list(all = mut_genes )
+
+  #PER MUTATION TYPE
+# Loop over each type of mutation to create binary matrices
+  for (type in unique(mutation_data$Variant_Classification)) {
+      # Generate the mutation count matrix for the current mutation type
+      mut_mat <- maftools::mutCountMatrix(maf, includeSyn = FALSE, countOnly = type, removeNonMutated = FALSE)
+      
+      # Convert counts to binary (if there are multiple mutations of the same type, they need to be consolidated)
+      mut_mat <- ifelse(mut_mat > 0, 1, 0)
+      
+      # Filter to primary tumors only and shorten barcodes
+      mut_mat <- mut_mat[, grepl("-01", colnames(mut_mat))]
+      colnames(mut_mat) = substr(colnames(mut_mat), 1, 12)
+      
+      #remove duplicate samples
+      unique_cols <- !duplicated(colnames(mut_mat))
+      mut_mat <- mut_mat[, unique_cols]
+      
+      # Create an empty matrix with the correct dimensions
+      full_matrix <- matrix(0, nrow = length(all_genes), ncol = length(all_samples),
+                            dimnames = list(all_genes, all_samples))
+      
+      # Match rows and columns from mut_mat to full_matrix
+      row_inds <- match(rownames(mut_mat), rownames(full_matrix))
+      col_inds <- match(colnames(mut_mat), colnames(full_matrix))
+      
+      # Loop through each non-zero element in mut_mat and map it to full_matrix
+      for (i in seq_along(row_inds)) {
+          if (!is.na(row_inds[i])) {
+              for (j in seq_along(col_inds)) {
+                  if (!is.na(col_inds[j]) && mut_mat[i, j] == 1) {
+                      full_matrix[row_inds[i], col_inds[j]] <- 1
+                  }
+              }
+          }
+      }
+      # Verify the mapping accuracy
+      if (sum(mut_mat) != sum(full_matrix)) {
+          cat("Mismatch in sum for type", type, ": mut_mat =", sum(mut_mat), ", final =", sum(full_matrix), "\n")
+      } else {
+          list_matrices[[type]] <- full_matrix 
+      }
+  }
+
+
+  # Create the SummarizedExperiment object
+  binary_se <- SummarizedExperiment::SummarizedExperiment(assays = list_matrices)
+  
+  # Save data
+  SE_output_filename <- paste0(project, "_binary-mutation.rds")
+  saveRDS(binary_se, file = file.path(PATH_se, SE_output_filename))
+  
+  # Optional: Adds a delay of 5 seconds between downloads to avoid overwhelming the server
+  Sys.sleep(5)
+}
+
+```
+
+
+## Session Info
+```{r sys info}
+sessionInfo()
+```
+
+

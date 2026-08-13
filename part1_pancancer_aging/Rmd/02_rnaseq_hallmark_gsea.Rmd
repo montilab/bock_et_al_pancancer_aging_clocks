@@ -1,0 +1,251 @@
+---
+title: "02 — RNA-seq Hallmark KS-test GSEA"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+## Overview
+
+This script reruns the RNA-seq Hallmark GSEA used for Fig. 1C.
+
+It does not load legacy GSEA result files. Instead, it reads the official RNA-seq DESeq2 age results imported in step 01 and performs Hallmark KS-test enrichment with `hypeR` for each TCGA cancer type.
+
+The saved output is the combined-table representation needed for the final heatmap.
+
+## Libraries
+
+```{r}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(tibble)
+  library(here)
+  library(hypeR)
+})
+```
+
+## Paths
+
+```{r}
+import_file <- here::here(
+  "results", "derived", "part1", "01_import_official_results", "part1_imported_results.rds"
+)
+
+if (!file.exists(import_file)) {
+  stop("Run 01_import_official_results.Rmd first. Missing file: ", import_file)
+}
+
+out_dir    <- here::here("results", "derived", "part1", "02_rnaseq_hallmark_gsea")
+tables_dir <- here::here("results", "tables", "part1")
+
+dir.create(out_dir,    recursive = TRUE, showWarnings = FALSE)
+dir.create(tables_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Load imported results
+
+```{r}
+part1_imported_results <- readRDS(import_file)
+
+rnaseq_manifest <- part1_imported_results$result_file_manifest %>%
+  dplyr::filter(layer_id == "RNAseq", result_use == "unfiltered_deseq") %>%
+  dplyr::arrange(Project)
+
+if (nrow(rnaseq_manifest) == 0) {
+  stop("No RNA-seq unfiltered DESeq2 files were recorded in the imported-results object.")
+}
+```
+
+## Hallmark gene sets
+
+```{r}
+hallmark_sets <- tryCatch(
+  {
+    hypeR::msigdb_gsets("Homo sapiens", "H", clean = TRUE)
+  },
+  error = function(e) {
+    if (!requireNamespace("msigdbr", quietly = TRUE)) {
+      stop(
+        "Could not retrieve Hallmark gene sets with hypeR::msigdb_gsets(), ",
+        "and package 'msigdbr' is not available for fallback retrieval."
+      )
+    }
+
+    msigdbr::msigdbr(species = "Homo sapiens", category = "H") %>%
+      dplyr::select(gs_name, gene_symbol) %>%
+      dplyr::mutate(
+        gs_name = stringr::str_remove(gs_name, "^HALLMARK_"),
+        gs_name = stringr::str_replace_all(gs_name, "_", " ")
+      ) %>%
+      split(.$gene_symbol, .$gs_name)
+  }
+)
+```
+
+## Run per-cancer Hallmark KS-test enrichment
+
+```{r}
+gsea_long <- purrr::map_dfr(
+  seq_len(nrow(rnaseq_manifest)),
+  function(i) {
+    project   <- rnaseq_manifest$Project[[i]]
+    file_path <- rnaseq_manifest$file_path[[i]]
+
+    deseq_df <- readRDS(file_path) %>%
+      as.data.frame() %>%
+      tibble::rownames_to_column("Feature") %>%
+      dplyr::filter(is.finite(stat))
+
+    ranked_up <- deseq_df %>%
+      dplyr::arrange(dplyr::desc(stat)) %>%
+      dplyr::pull(Feature)
+
+    ranked_down <- deseq_df %>%
+      dplyr::arrange(stat) %>%
+      dplyr::pull(Feature)
+
+    mhype <- hypeR::hypeR(
+      list(
+        Upregulated = ranked_up,
+        Downregulated = ranked_down
+      ),
+      genesets = hallmark_sets,
+      test = "kstest",
+      fdr = 1,
+      plotting = FALSE
+    )
+
+    up_tbl <- mhype$data$Upregulated$data %>%
+      dplyr::mutate(
+        cancertype = project,
+        direction = "Up",
+        adjusted_score = score
+      ) %>%
+      dplyr::select(label, cancertype, direction, pval, fdr, score, adjusted_score)
+
+    down_tbl <- mhype$data$Downregulated$data %>%
+      dplyr::mutate(
+        cancertype = project,
+        direction = "Down",
+        adjusted_score = -score
+      ) %>%
+      dplyr::select(label, cancertype, direction, pval, fdr, score, adjusted_score)
+
+    dplyr::bind_rows(up_tbl, down_tbl)
+  }
+)
+```
+
+## Keep the most significant direction per pathway and cancer
+
+```{r}
+gsea_best <- gsea_long %>%
+  dplyr::arrange(label, cancertype, pval) %>%
+  dplyr::distinct(label, cancertype, .keep_all = TRUE) %>%
+  dplyr::mutate(
+    TH_value = dplyr::case_when(
+      fdr <= 0.01 & direction == "Up" ~ 2,
+      fdr <= 0.05 & direction == "Up" ~ 1,
+      fdr <= 0.01 & direction == "Down" ~ -2,
+      fdr <= 0.05 & direction == "Down" ~ -1,
+      TRUE ~ 0
+    )
+  )
+```
+
+## Combined-table matrices for Fig. 1C
+
+```{r}
+pathway_order <- unique(gsea_best$label)
+cancer_order <- sort(unique(gsea_best$cancertype))
+
+threshold_df <- gsea_best %>%
+  dplyr::select(label, cancertype, TH_value) %>%
+  tidyr::complete(
+    label = pathway_order,
+    cancertype = cancer_order,
+    fill = list(TH_value = 0)
+  ) %>%
+  dplyr::mutate(
+    label = factor(label, levels = pathway_order),
+    cancertype = factor(cancertype, levels = cancer_order)
+  ) %>%
+  dplyr::arrange(label, cancertype) %>%
+  tidyr::pivot_wider(
+    names_from = cancertype,
+    values_from = TH_value
+  )
+
+threshold_matrix <- as.matrix(threshold_df[, -1, drop = FALSE])
+rownames(threshold_matrix) <- as.character(threshold_df$label)
+
+score_df <- gsea_best %>%
+  dplyr::select(label, cancertype, adjusted_score) %>%
+  tidyr::complete(
+    label = pathway_order,
+    cancertype = cancer_order,
+    fill = list(adjusted_score = 0)
+  ) %>%
+  dplyr::mutate(
+    label = factor(label, levels = pathway_order),
+    cancertype = factor(cancertype, levels = cancer_order)
+  ) %>%
+  dplyr::arrange(label, cancertype) %>%
+  tidyr::pivot_wider(
+    names_from = cancertype,
+    values_from = adjusted_score
+  )
+
+score_matrix <- as.matrix(score_df[, -1, drop = FALSE])
+rownames(score_matrix) <- as.character(score_df$label)
+
+threshold_matrix <- apply(threshold_matrix, 2, as.numeric)
+score_matrix     <- apply(score_matrix, 2, as.numeric)
+rownames(threshold_matrix) <- as.character(threshold_df$label)
+rownames(score_matrix) <- as.character(score_df$label)
+```
+
+## Save official GSEA results
+
+```{r}
+rnaseq_hallmark_gsea <- list(
+  gsea_long = gsea_long,
+  gsea_best = gsea_best,
+  threshold_matrix = threshold_matrix,
+  score_matrix = score_matrix
+)
+
+saveRDS(
+  rnaseq_hallmark_gsea,
+  file.path(out_dir, "rnaseq_hallmark_gsea_results.rds")
+)
+
+utils::write.csv(
+  gsea_long,
+  file = file.path(tables_dir, "fig1c_rnaseq_hallmark_gsea_long.csv"),
+  row.names = FALSE
+)
+
+utils::write.csv(
+  gsea_best,
+  file = file.path(tables_dir, "fig1c_rnaseq_hallmark_gsea_best.csv"),
+  row.names = FALSE
+)
+```
+
+## Quick checks
+
+```{r}
+dplyr::count(gsea_long, cancertype)
+
+dim(threshold_matrix)
+dim(score_matrix)
+```

@@ -1,0 +1,347 @@
+---
+title: "Differential miRNA Expression Analysis"
+subtitle: "TCGA PanCancer Aging"
+author: "Payton Bock - Monti Lab"
+date:   "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: united
+    code_folding: hide
+    css: style.css
+    toc: true
+    toc_float: true
+params:
+  cancer_type: NULL
+  include_gender: NULL
+  include_race: NULL
+  include_hpv : NULL
+  include_subtype : NULL
+  races_to_include : NULL
+  include_purity : NULL
+---
+
+# `r if (!is.null(params$cancer_type)) paste(params$cancer_type)`
+
+```{r, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+
+selected_cancer_type <- params$cancer_type
+include_gender <- params$include_gender
+include_race <- params$include_race
+include_hpv <- params$include_hpv
+include_subtype <- params$include_subtype
+races_to_include <- params$races_to_include
+include_purity <-  params$include_purity
+```
+
+
+```{r library, include = FALSE}
+.libPaths("/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/r-library/")
+
+library(dplyr)
+library(vctrs)
+library(SummarizedExperiment)
+library(ggplot2)
+library(reshape2)
+library(DESeq2)
+library(reactable)
+library(openxlsx)
+library(edgeR)
+library(forcats)
+
+source("/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/r-library/MLscripts-main/R/ggplot_volcano.R")
+
+#get environmental variables
+PATH <- file.path( Sys.getenv("PCANAGE","/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/")) 
+TCGA <- file.path( Sys.getenv("CBMDATA","/restricted/projectnb/agedisease/CBMrepositoryData/"), "TCGA-GDC")
+```
+
+
+## Script Summary 
+This script relies on `02_PanCancer-RenderReport-miRNA.Rmd` to provide input (TCGA project to perform analysis on) and covariates
+that were dynamically determined as part of meta data harmonization. 
+
+This script: 
+
+- Utilizes processed SummarizedExperiment miRNA RDS file
+
+- Performs differential expression analysis using `DESeq2` to 
+identify miRNA whose expression is associated with age, with provided covariates
+
+
+```{r file paths}
+se_directory <- file.path(TCGA, "miR/processed_data/all/")
+
+output_dir_dge <- file.path(PATH,"results/mirna/DE_analysis/")
+```
+
+
+## Data Loading
+Here we load in the filtered miRNA SummarizedExperiment object. 
+```{r Load in se object}
+#Summarized Experiment
+se <- readRDS(paste0(se_directory,selected_cancer_type,"_miRNA.rds"))
+```
+
+
+```{r}
+print(paste0("Running differential analysis for ", selected_cancer_type ))
+```
+
+
+```{r, include = FALSE}
+create_reactable_table <- function(se, covariate_name) {
+  if (!is.null(colData(se)[[covariate_name]])) {
+    # Generate frequency table
+    freq_table <- table(colData(se)[[covariate_name]])
+    
+    # Convert to data frame for reactable
+    df <- as.data.frame(freq_table)
+    names(df) <- c(covariate_name, "Count")
+    
+    # Create reactable
+    reactable::reactable(df, highlight = TRUE)
+  } else {
+    cat(paste0("Covariate '", covariate_name, "' not found.\n"))
+  }
+}
+```
+
+```{r, include = FALSE}
+reactable_pretty <- function(results) {
+ results <- results %>% mutate(across(where(~is.numeric(.) && any(. %% 1 != 0, na.rm = TRUE)), ~signif(., digits = 3)))
+ reactable::reactable(results,searchable = TRUE,resizable = TRUE)
+}
+```
+
+## Differential Analysis: DESeq2
+Here we use `DESeq2` to identify features whose expression is associated with age. 
+
+## Covariate Prepartation 
+We dynamically determine the covariates to include in a previous script ("metadata/scripts/05_Covariates.Rmd).
+This script utilizes those covariates to create a design matrix for analysis with `DESeq2`.
+```{r Prepare Covariates for Limma}
+# Start with a basic model including only the age variable
+model_formula <- "~ Age"
+
+#Remove samples with missing age
+se <- se[,!is.na(se$Age)]
+
+# Include purity only if selected_cancer_type is not "TCGA-LAML"
+if (include_purity) {
+  model_formula <- paste(model_formula, "+ purity")
+  # Remove samples with missing purity
+  se <- se[, !is.na(se$purity)]
+  }
+
+
+# Dynamically add covariates and filter SE based on parameters
+if (include_gender) {
+  model_formula <- paste(model_formula, "+ gender")
+  #Drop NA gender samples
+  se <- se[,!is.na(se$gender)]
+  create_reactable_table(se, "gender")
+  }
+
+if (include_race) {
+  
+  model_formula <- paste(model_formula, "+ race")
+  #Drop NA race samples
+  se <- se[,!is.na(se$race)]
+  
+  races_to_keep <- strsplit(as.character(races_to_include), ",\\s*")[[1]]
+  #print(paste0("Only keeping samples in these racial categories: ", races_to_include))
+  se <- se[, se$race %in% races_to_keep]
+  create_reactable_table(se, "race")
+
+}
+
+if (include_subtype) {
+  model_formula <- paste(model_formula, "+ subtype_selected")
+  #Drop NA tumor subtypes samples
+  se <- se[,!is.na(se$subtype_selected)]
+  create_reactable_table(se, "subtype_selected")
+}
+
+if (include_hpv) {
+    #drop HPV positive samples (should be for HNSC only as of now)
+    se <- se[, !is.na(se$HPV.status) & se$HPV.status == "Negative"]
+    create_reactable_table(se, "HPV.status")
+}
+
+# Convert model formula to a formula object
+model_formula <- as.formula(model_formula)
+
+# Print model being used in limma
+# Here we use deparse to convert the formula to a string
+model_formula_str <- deparse(model_formula)
+paste0("Limma Model Formula: ", model_formula_str)
+```
+
+
+```{r}
+# Prepare the design matrix 
+design <- model.matrix(model_formula, data = colData(se))
+head(unique(design))
+```
+
+```{r check-samples, echo=FALSE}
+# Calculate the number of samples remaining
+num_samples <- ncol(se)
+
+# Print the number of samples
+cat("Number of samples remaining after covariate filtering:", num_samples, "\n")
+
+# Check if the number of samples is less than 50
+if (num_samples < 50) {
+  # Stop the R Markdown rendering with a custom message
+  stop("Less than 50 samples remaining. Analysis requires 50 samples.")
+}
+```
+
+## Age Distribution
+Here plot the distribution of age after filtering samples
+```{r}
+# Creating a boxplot for age distribution with individual points
+ggplot2::ggplot(data = data.frame(age = colData(se)$Age), aes(x = factor(1), y = age)) +
+  ggplot2::geom_boxplot() +
+  ggplot2::geom_jitter(width = 0.1, color = "blue", alpha = 0.5) +  # Adding jittered points
+  ggplot2::labs(title = "Age Distribution",
+       y = "Age",
+       x = "") +
+  ggplot2::theme_minimal()
+```
+
+## DEseq2
+Here, we  perform differential gene expression analysis using the `DESeq2` package. Note that we do not need to apply explicit normalization, as this is handled internally by the `DESeq()` function: 
+
+This function performs a default analysis through the steps:
+
+- estimation of size factors: estimateSizeFactors
+
+- estimation of dispersion: estimateDispersions
+
+- Negative Binomial GLM fitting and Wald statistics: nbinomWaldTest
+
+Some rows have missing p-values. Why? some values in the results table can be set to NA for one of the following reasons:
+
+- If within a row, all samples have zero counts, the baseMean column will be zero, and the log2 fold change estimates, p value and adjusted p value will all be set to NA. 
+
+- If a row contains a sample with an extreme count outlier then the p value and adjusted p value will be set to NA. These outlier counts are detected by Cook’s distance
+
+- If a row is filtered by automatic independent filtering, for having a low mean normalized count, then only the adjusted p value will be set to NA. Description and customization of independent filtering is described below
+
+### Run DESeq2
+Here we run `DESeq` with the default parameters and created model formula. 
+```{r deseq2 analysis}
+print(model_formula)
+
+# Extract the filtered counts
+counts_filtered <- SummarizedExperiment::assay(se,"raw_counts")
+
+# Build the DESeq2 dataset object
+dds <- DESeqDataSetFromMatrix(countData = counts_filtered,
+                              colData = colData(se),
+                              design = model_formula)
+
+# Run the DESeq2 pipeline
+dds <- DESeq(dds, parallel = TRUE)
+```
+
+### Retrieve Results
+Next, we retrieve our analysis results.
+
+First, we retrieve our age-regression results including internal filtering by `DESeq2` using the `results()` function. This internal filtering essentially maximizes the number of significant differentially expressed genes by excluding some genes when calculating adjusted p-values. We utilize this report the number of significant DEGs for the cancer type. 
+See more information here: https://bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html#indfilt
+
+Second, we retrieve the unfiltered results (results for ALL genes included in our analysis) with and without shrunken logFC values using the `DESeq2::lfcShrink()` function. 
+
+We also save all versions of these results.
+```{r}
+# Get filtered results (default DESeq2 filtering)
+results_filtered <- results(dds, name = "Age")  # Automatically applies independent filtering
+results_filtered_df <- as.data.frame(results_filtered) %>%
+  filter(!is.na(padj) & !is.na(log2FoldChange))  # Filter rows with missing values
+
+# Save filtered, non-shrunken results
+saveRDS(results_filtered_df, paste0(output_dir_dge, selected_cancer_type, "_filtered_DESeq2_results.rds"))
+write.csv(results_filtered_df, gzfile(paste0(output_dir_dge, selected_cancer_type, "_filtered_DESeq2_results.csv.gz")))
+
+# Save filtered, non-shrunken results
+results_unfiltered <- results(dds, name = "Age", independentFiltering = FALSE)
+saveRDS(results_unfiltered, paste0(output_dir_dge, selected_cancer_type, "_unfiltered_DESeq2_results.rds"))
+write.csv(results_unfiltered, gzfile(paste0(output_dir_dge, selected_cancer_type, "_unfiltered_DESeq2_results.csv.gz")))
+
+# Shrink log2 fold changes for unfiltered results
+results_unfiltered_df <- as.data.frame(results_unfiltered)
+results_shrunken <- lfcShrink(dds, coef = "Age", type = "apeglm")
+results_shrunken_df <- as.data.frame(results_shrunken)
+
+# Save unfiltered, shrunken results
+saveRDS(results_shrunken_df, paste0(output_dir_dge, selected_cancer_type, "_unfiltered_shrunken_DESeq2_results.rds"))
+write.csv(results_shrunken_df, gzfile(paste0(output_dir_dge, selected_cancer_type, "_unfiltered_shrunken_DESeq2_results.csv.gz")))
+
+
+# reactable of filtered results
+reactable_pretty(as.data.frame(results_filtered_df))
+```
+
+
+### Summary Table
+```{r summary deseq2}
+# Summary Table for Filtered Results
+summary_stats <- results_filtered_df %>%
+  mutate(direction = ifelse(log2FoldChange > 0, "Up", "Down")) %>%
+  summarise(
+    Total = n(),
+    Q_Value_0.05 = sum(padj <= 0.05, na.rm = TRUE),
+    Q_Value_0.025 = sum(padj <= 0.025, na.rm = TRUE),
+    Q_Value_0.01 = sum(padj <= 0.01, na.rm = TRUE),
+    IncreasedExp_with_Age = sum(padj <= 0.05 & direction == "Up", na.rm = TRUE),
+    DecreasedExp_with_Age = sum(padj <= 0.05 & direction == "Down", na.rm = TRUE)
+  )
+
+# Print the summary table
+reactable::reactable(summary_stats)
+```
+
+### Volcano Plot
+This volcano plot visualizes the FILTERED results of our age-regression analysis with `DESeq2`.
+```{r volc dseq2}
+results_filtered_df$gene <- rownames(results_filtered_df)
+
+min_diff <- 0  # Adjust this threshold as per your requirement
+max_fdr <- 0.05
+dat <- results_filtered_df |> 
+  dplyr::mutate(gene_type = case_when(
+    log2FoldChange >  min_diff & padj <= max_fdr ~ "up",
+    log2FoldChange < -min_diff & padj <= max_fdr ~ "dn",
+    .default = "ns"))
+
+
+# Using dplyr to remove NAs from specific columns
+dat_cleaned <- dat %>%
+  dplyr::filter(!is.na(padj) & !is.na(log2FoldChange))
+
+# Now you can proceed with your plotting or further analysis
+print(ggplot_volcano(
+  dat = dat_cleaned,
+  xaxis = "log2FoldChange",
+  yaxis = "padj",
+  gene_label = "gene",
+  xlab = "log2FoldChange",
+  title = "DESeq2 Volcano Plot",
+  yintercept = max_fdr,
+  xintercept = c(-min_diff, min_diff),
+  sig_il_genes = TRUE,
+  up_il_genes = TRUE,
+  dn_il_genes = TRUE,
+  top_n = 3
+))
+```
+
+# Session Info
+```{r session info}
+sessionInfo()
+```
+

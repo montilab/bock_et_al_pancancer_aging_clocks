@@ -1,0 +1,587 @@
+---
+title: "04_mutation_regressions.Rmd"
+author: "Pranav Narnur - Monti Lab"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: united
+    css: themes/style.css
+    code_folding: hide
+    toc: true
+    toc_float:
+      collapsed: true
+      smooth_scroll: true
+    toc_depth: 3
+    df_print: paged
+params:
+  cancer_type: "TCGA-BLCA"
+  include_gender: TRUE
+  include_race: TRUE
+  races_included: "asian, black or african american, white"
+  include_subtype: FALSE
+  include_HPV_status: FALSE
+  include_grade: TRUE
+  grades_included: "High Grade, Low Grade"
+  include_purity: TRUE
+---
+
+# `r if (!is.null(params$cancer_type)) paste(params$cancer_type)`
+
+We perform, for each gene, a linear regression to detect whether patient age is significantly associated with mutation status. Mutation data is binarized (0 = no mutation, 1 = mutation present).
+
+```{r, setup, include = FALSE}
+set.seed(1)
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE,
+                      dev = "ragg_png", dpi = 300)
+library(SummarizedExperiment)
+library(dplyr)
+library(ggplot2)
+library(broom)
+library(reactable)
+library(purrr)
+library(patchwork)
+library(ggrepel)
+library(tidyverse)
+```
+
+```{r}
+selected_cancer_type <- params$cancer_type
+include_gender <- params$include_gender
+include_race <- params$include_race
+include_HPV_status <- params$include_HPV_status
+include_subtype <- params$include_subtype
+include_grade <- params$include_grade
+include_purity <- params$include_purity
+
+races_included <- params$races_included
+if (length(races_included) == 1 && !is.na(races_included) && grepl(",", races_included)) {
+  races_included <- trimws(strsplit(races_included, ",")[[1]])
+}
+
+grades_included <- params$grades_included
+if (length(grades_included) == 1 && !is.na(grades_included) && grepl(",", grades_included)) {
+  grades_included <- trimws(strsplit(grades_included, ",")[[1]])
+}
+```
+
+
+```{r}
+DATA_ROOT <- "/restricted/projectnb/agedisease/projects/pancancer_aging/TCGA-GDC/mutation"
+SCRIPT_ROOT <- "/restricted/projectnb/agedisease/projects/pancancer_aging/scripts/mutation"
+RESULTS_ROOT <- "/restricted/projectnb/agedisease/projects/pancancer_aging/results/mutation"
+
+path_filtered_SE <- file.path(DATA_ROOT, "processed_data", "filtered")
+
+result_dir <- file.path(RESULTS_ROOT, selected_cancer_type)
+dir.create(result_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+
+```{r}
+source(file.path(SCRIPT_ROOT, "utils.r"))
+```
+
+```{r}
+covariates <- c()
+if (include_gender) covariates <- c(covariates, "gender")
+if (include_race) covariates <- c(covariates, "race")
+if (include_purity) covariates <- c(covariates, "purity")
+if (include_grade) covariates <- c(covariates, "grade")
+if (include_subtype) covariates <- c(covariates, "subtype_selected")
+
+cat("Covariates for", selected_cancer_type, ":", paste(covariates, collapse = ", "), "\n")
+```
+
+Model covariates for this cancer type:
+
+- Gender: `r include_gender`
+- Race: `r include_race`
+- Subtype: `r include_subtype`
+- HPV Status: `r include_HPV_status`
+- Grade: `r include_grade`
+- Purity: `r include_purity`
+
+# Load Filtered Data
+
+```{r}
+se <- tryCatch(
+  {
+    readRDS(file.path(path_filtered_SE, paste0(selected_cancer_type, "_mutation-filtered-final.rds")))
+  },
+  error = function(e) {
+    stop(paste0("Could not load filtered SE for ", selected_cancer_type, ": ", e$message))
+  }
+)
+
+cat("Loaded filtered SE for", selected_cancer_type, "\n")
+cat("Number of samples:", ncol(se), "\n")
+cat("Number of genes:", nrow(se), "\n")
+
+if (ncol(se) == 0) {
+  stop(paste0("No samples in filtered SE for ", selected_cancer_type))
+}
+```
+
+# Functions
+
+## Linear regression function
+
+```{r}
+run_regression_mutation <- function(se, assay, outcome, covariates = NULL, min_group_size = 10) {
+  mat <- SummarizedExperiment::assay(se, assay)
+  pheno <- as.data.frame(SummarizedExperiment::colData(se)[c(outcome, covariates)])
+
+  if (!is.null(covariates)) {
+    categorical_vars <- c("gender", "race", "grade", "subtype_selected")
+    categorical_vars <- categorical_vars[categorical_vars %in% covariates]
+    pheno[categorical_vars] <- lapply(pheno[categorical_vars], as.factor)
+  }
+
+  if (!is.numeric(pheno[[outcome]])) {
+    pheno[[outcome]] <- as.numeric(pheno[[outcome]])
+  }
+
+  n_with_mutation <- rowSums(mat == 1, na.rm = TRUE)
+  n_without_mutation <- rowSums(mat == 0, na.rm = TRUE)
+
+  genes_to_test <- names(n_with_mutation)[
+    n_with_mutation >= min_group_size & n_without_mutation >= min_group_size
+  ]
+
+  if (length(genes_to_test) == 0) {
+    message(paste("No genes passed the min_group_size filter for", assay))
+    return(data.frame(
+      gene_name = character(),
+      beta = numeric(),
+      p_val = numeric(),
+      adj_p_val = numeric(),
+      se = numeric(),
+      stat = numeric(),
+      n_with_mutation = integer(),
+      n_without_mutation = integer()
+    ))
+  }
+
+  message(paste0("Testing ", length(genes_to_test), " genes (min group size = ", min_group_size, ")"))
+
+  base_formula <- paste0(outcome, " ~ mutation_status")
+
+  if (!is.null(covariates) && length(covariates) > 0) {
+    covariates_part <- paste(covariates, collapse = " + ")
+    model_formula <- as.formula(paste(base_formula, covariates_part, sep = " + "))
+  } else {
+    model_formula <- as.formula(base_formula)
+  }
+
+  cat("Model formula:", deparse(model_formula), "\n")
+
+  results_df <- purrr::map_dfr(genes_to_test, function(gene) {
+    mutation_status <- mat[gene, ]
+    model_data <- cbind(pheno, mutation_status)
+    model_data <- model_data[complete.cases(model_data), ]
+
+    if (nrow(model_data) < min_group_size * 2) {
+      return(NULL)
+    }
+
+    tryCatch(
+      {
+        test_result <- lm(model_formula, data = model_data)
+        tidy_test_result <- broom::tidy(test_result) %>%
+          dplyr::filter(term == "mutation_status")
+
+        if (nrow(tidy_test_result) == 0) {
+          return(NULL)
+        }
+
+        data.frame(
+          p_val = pull(tidy_test_result["p.value"]),
+          beta = pull(tidy_test_result["estimate"]),
+          se = pull(tidy_test_result["std.error"]),
+          stat = pull(tidy_test_result["statistic"])
+        )
+      },
+      error = function(e) {
+        warning(paste0("Regression failed for gene: ", gene, " - ", e$message))
+        return(NULL)
+      }
+    )
+  }, .id = "gene_index")
+
+  if (nrow(results_df) == 0) {
+    warning("All regressions failed.")
+    return(data.frame(
+      gene_name = character(),
+      beta = numeric(),
+      p_val = numeric(),
+      adj_p_val = numeric(),
+      se = numeric(),
+      stat = numeric(),
+      n_with_mutation = integer(),
+      n_without_mutation = integer()
+    ))
+  }
+
+  final_df <- results_df %>%
+    dplyr::mutate(gene_name = genes_to_test[as.integer(gene_index)]) %>%
+    dplyr::mutate(
+      n_with_mutation = n_with_mutation[gene_name],
+      n_without_mutation = n_without_mutation[gene_name]
+    ) %>%
+    dplyr::select(gene_name, beta, p_val, se, stat, n_with_mutation, n_without_mutation)
+
+  final_df <- dplyr::mutate(final_df, adj_p_val = p.adjust(final_df$p_val, method = "BH"), .after = p_val)
+
+  rownames(final_df) <- NULL
+  return(final_df)
+}
+```
+
+## Violin plot function
+
+```{r}
+plot_age_by_mutation <- function(gene_name, se_data, assay, results_df) {
+  mutation_status <- assay(se_data, assay)[gene_name, ]
+
+  plot_data <- data.frame(
+    Age = colData(se_data)$Age,
+    Mutation_Status = factor(mutation_status, levels = c(0, 1), labels = c("WT", "Mutated"))
+  ) %>%
+    filter(!is.na(Age))
+
+  counts <- table(plot_data$Mutation_Status)
+  count_str <- paste(names(counts), "=", counts, collapse = ", ")
+
+  row <- results_df %>% filter(gene_name == !!gene_name)
+
+  if (nrow(row) == 0) {
+    adj_p <- "NA"
+    beta_val <- "NA"
+  } else {
+    adj_p <- format(row$adj_p_val, scientific = TRUE, digits = 3)
+    beta_val <- round(row$beta, 3)
+  }
+
+  ggplot(plot_data, aes(x = Mutation_Status, y = Age, fill = Mutation_Status)) +
+    geom_violin(alpha = 0.7) +
+    geom_boxplot(width = 0.2, alpha = 0.8, outlier.size = 0.5) +
+    geom_jitter(width = 0.1, alpha = 0.3, size = 0.8) +
+    scale_fill_manual(values = c("WT" = "steelblue", "Mutated" = "coral")) +
+    labs(
+      title = paste0(gene_name),
+      subtitle = paste0(count_str, " | β=", beta_val, ", adj_p=", adj_p),
+      x = "Mutation Status",
+      y = "Age (years)",
+      fill = "Status"
+    ) +
+    theme_minimal() +
+    theme(
+      legend.position = "none",
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5, size = 9)
+    )
+}
+```
+
+## Get Binary Mutation Assays
+
+The pancancer_aging SEs use assay names without `_binary` suffix (e.g., `all`, `Missense_Mutation`).
+
+```{r}
+available_assays <- assayNames(se)
+cat("Available assays:", paste(available_assays, collapse = ", "), "\n")
+
+binary_mutation_types <- available_assays
+```
+
+## Linear Regression - WITHOUT Covariates (Age ~ Mutation Status)
+
+```{r}
+results_no_cov_list <- list()
+
+for (mut_type in binary_mutation_types) {
+  type_results <- run_regression_mutation(
+    se = se,
+    assay = mut_type,
+    outcome = "Age",
+    covariates = NULL,
+    min_group_size = 10
+  )
+
+  if (nrow(type_results) > 0) {
+    results_no_cov_list[[mut_type]] <- type_results
+  }
+}
+
+if (length(results_no_cov_list) > 0) {
+  full_results_no_cov <- purrr::list_rbind(results_no_cov_list, names_to = "mut_type")
+} else {
+  full_results_no_cov <- data.frame(
+    mut_type = character(),
+    gene_name = character(),
+    beta = numeric(),
+    p_val = numeric(),
+    adj_p_val = numeric(),
+    se = numeric(),
+    stat = numeric(),
+    n_with_mutation = integer(),
+    n_without_mutation = integer()
+  )
+  cat("No genes passed filters for any mutation type.\n")
+}
+
+saveRDS(results_no_cov_list, file.path(result_dir, "lm_no_covariates_results_list.rds"))
+write.csv(full_results_no_cov, file.path(result_dir, "lm_no_covariates_results.csv"), row.names = FALSE)
+cat("Saved no-covariate results.\n")
+```
+
+## Results WITHOUT Covariates {.tabset}
+
+```{r}
+for (mut_type in binary_mutation_types) {
+
+  if (!mut_type %in% names(results_no_cov_list) || nrow(results_no_cov_list[[mut_type]]) == 0) {
+    cat("\n")
+    cat(paste0("### ", mut_type, " - No Results\n"))
+    cat("\n")
+    cat(paste0("*No genes passed the minimum sample size threshold (n=10 per group) for ", mut_type, ".*\n"))
+    cat("\n")
+    next
+  }
+
+  results_df <- results_no_cov_list[[mut_type]]
+
+  cat("\n")
+  cat(paste0("### ", mut_type, "\n"))
+  cat("\n")
+  cat(paste0("**Total genes tested: ", nrow(results_df), "** | **Significant (FDR ≤ 0.05): ", sum(results_df$adj_p_val <= 0.05), "**\n\n"))
+
+  print(htmltools::tagList(
+    results_df %>%
+      arrange(adj_p_val) %>%
+      reactable_pretty()
+  ))
+
+  cat("\n")
+}
+```
+
+## Linear Regression - WITH Covariates
+
+Covariates for `r selected_cancer_type`: `r paste(covariates, collapse = ", ")`
+
+```{r}
+if (length(covariates) > 0) {
+  results_with_cov_list <- list()
+
+  for (mut_type in binary_mutation_types) {
+    type_results <- run_regression_mutation(
+      se = se,
+      assay = mut_type,
+      outcome = "Age",
+      covariates = covariates,
+      min_group_size = 10
+    )
+
+    if (nrow(type_results) > 0) {
+      results_with_cov_list[[mut_type]] <- type_results
+    }
+  }
+
+  if (length(results_with_cov_list) > 0) {
+    full_results_with_cov <- purrr::list_rbind(results_with_cov_list, names_to = "mut_type")
+  } else {
+    full_results_with_cov <- data.frame(
+      mut_type = character(),
+      gene_name = character(),
+      beta = numeric(),
+      p_val = numeric(),
+      adj_p_val = numeric(),
+      se = numeric(),
+      stat = numeric(),
+      n_with_mutation = integer(),
+      n_without_mutation = integer()
+    )
+    cat("No genes passed filters for any mutation type (with covariates).\n")
+  }
+
+  saveRDS(results_with_cov_list, file.path(result_dir, "lm_with_covariates_results_list.rds"))
+  write.csv(full_results_with_cov, file.path(result_dir, "lm_with_covariates_results.csv"), row.names = FALSE)
+  cat("Saved with-covariate results.\n")
+} else {
+  results_with_cov_list <- results_no_cov_list
+  full_results_with_cov <- full_results_no_cov
+  cat("No covariates specified; using no-covariate results.\n")
+}
+```
+
+
+# Results WITH Covariates {.tabset}
+
+```{r}
+for (mut_type in binary_mutation_types) {
+
+  if (!mut_type %in% names(results_with_cov_list) || nrow(results_with_cov_list[[mut_type]]) == 0) {
+    cat("\n")
+    cat(paste0("### ", mut_type, " - No Results\n"))
+    cat("\n")
+    cat(paste0("*No genes passed the minimum sample size threshold (n=10 per group) for ", mut_type, ".*\n"))
+    cat("\n")
+    next
+  }
+
+  results_df <- results_with_cov_list[[mut_type]]
+
+  cat("\n")
+  cat(paste0("### ", mut_type, "\n"))
+  cat("\n")
+  cat(paste0("**Total genes tested: ", nrow(results_df), "** | **Significant (FDR ≤ 0.05): ", sum(results_df$adj_p_val <= 0.05), "**\n\n"))
+
+  print(htmltools::tagList(
+    results_df %>%
+      arrange(adj_p_val) %>%
+      reactable_pretty()
+  ))
+
+  cat("\n")
+}
+```
+
+
+# Comparison: With vs Without Covariates
+
+```{r}
+if ("all" %in% names(results_no_cov_list) && "all" %in% names(results_with_cov_list)) {
+  comparison_df <- full_results_no_cov %>%
+    dplyr::filter(mut_type == "all") %>%
+    dplyr::select(gene_name, beta_no_cov = beta, p_val_no_cov = p_val, adj_p_val_no_cov = adj_p_val) %>%
+    dplyr::left_join(
+      full_results_with_cov %>%
+        dplyr::filter(mut_type == "all") %>%
+        dplyr::select(gene_name, beta_with_cov = beta, p_val_with_cov = p_val, adj_p_val_with_cov = adj_p_val),
+      by = "gene_name"
+    ) %>%
+    dplyr::mutate(
+      beta_change = beta_with_cov - beta_no_cov,
+      sig_no_cov = adj_p_val_no_cov < 0.05,
+      sig_with_cov = adj_p_val_with_cov < 0.05,
+      status = case_when(
+        sig_no_cov & sig_with_cov ~ "Sig Both",
+        sig_no_cov & !sig_with_cov ~ "Lost Sig",
+        !sig_no_cov & sig_with_cov ~ "Gained Sig",
+        TRUE ~ "Not Sig"
+      )
+    )
+} else {
+  comparison_df <- data.frame()
+  cat("'all' assay not available for comparison.\n")
+}
+```
+
+# Summary of Significance Changes
+
+```{r}
+if (nrow(comparison_df) > 0) {
+  comparison_df %>%
+    dplyr::count(status) %>%
+    reactable_pretty()
+} else {
+  cat("No comparison data available.\n")
+}
+```
+
+# Genes That Changed Significance
+
+```{r}
+if (nrow(comparison_df) > 0) {
+  changed_sig <- comparison_df %>%
+    dplyr::filter(status %in% c("Lost Sig", "Gained Sig")) %>%
+    dplyr::select(gene_name, status, beta_no_cov, adj_p_val_no_cov, beta_with_cov, adj_p_val_with_cov) %>%
+    dplyr::arrange(status, adj_p_val_with_cov)
+
+  if (nrow(changed_sig) > 0) {
+    reactable_pretty(changed_sig)
+  } else {
+    cat("No genes changed significance status.\n")
+  }
+} else {
+  cat("No comparison data available.\n")
+}
+```
+
+# Visualize Top Significant Genes (WITH Covariates) {.tabset}
+
+Using 'all' assay results.
+
+
+```{r}
+if ("all" %in% names(results_with_cov_list) && nrow(results_with_cov_list[["all"]]) > 0) {
+  top_genes <- results_with_cov_list[["all"]] %>%
+    dplyr::filter(adj_p_val < 0.20) %>%
+    dplyr::slice_min(adj_p_val, n = 10) %>%
+    dplyr::pull(gene_name)
+
+  if (length(top_genes) > 0) {
+    for (gene in top_genes) {
+      cat("\n")
+      cat(paste0("## ", gene, "\n"))
+      cat("\n")
+      p <- plot_age_by_mutation(gene, se, "all", results_with_cov_list[["all"]])
+      print(p)
+      cat("\n")
+    }
+  } else {
+    cat("No genes with adj_p_val < 0.20 to visualize.\n")
+  }
+} else {
+  cat("'all' results not available for visualization.\n")
+}
+```
+
+# Summary Statistics by Mutation Type
+
+## WITHOUT Covariates
+
+```{r}
+if (nrow(full_results_no_cov) > 0) {
+  summary_no_cov <- full_results_no_cov %>%
+    group_by(mut_type) %>%
+    summarise(
+      Genes_Tested = n(),
+      Sig_FDR_0.05 = sum(adj_p_val < 0.05),
+      Sig_FDR_0.20 = sum(adj_p_val < 0.20),
+      Median_Beta = median(beta, na.rm = TRUE),
+      Mean_N_Mutated = round(mean(n_with_mutation, na.rm = TRUE), 1)
+    ) %>%
+    arrange(desc(Sig_FDR_0.05))
+
+  reactable_pretty(summary_no_cov)
+} else {
+  cat("No results available.\n")
+}
+```
+
+## WITH Covariates
+
+```{r}
+if (nrow(full_results_with_cov) > 0) {
+  summary_with_cov <- full_results_with_cov %>%
+    group_by(mut_type) %>%
+    summarise(
+      Genes_Tested = n(),
+      Sig_FDR_0.05 = sum(adj_p_val < 0.05),
+      Sig_FDR_0.20 = sum(adj_p_val < 0.20),
+      Median_Beta = median(beta, na.rm = TRUE),
+      Mean_N_Mutated = round(mean(n_with_mutation, na.rm = TRUE), 1)
+    ) %>%
+    arrange(desc(Sig_FDR_0.05))
+
+  reactable_pretty(summary_with_cov)
+} else {
+  cat("No results available.\n")
+}
+```
+
+```{r}
+sessionInfo()
+```

@@ -1,0 +1,310 @@
+---
+title: "04 — ClockSHAP: explain GTEx-trained clock in TCGA"
+author: "Pan-can aging pipeline"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: united
+    code_folding: hide
+    toc: true
+    toc_float: true
+params:
+  tcga_project: "BRCA"
+  gtex_project: "BREAST"
+  feature_set: "PC"
+
+  out_root: "results/derived/GTEx"
+  min_nat: 10
+
+  do_one_waterfall: true
+  waterfall_top_k: 10
+
+  seed: 2026
+  verbose: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(here)
+  library(dplyr)
+  library(tibble)
+  library(ggplot2)
+  library(glmnet)
+  library(ClockSHAP)
+  library(reactable)
+})
+
+# Rmd-friendly verbose printing
+vcat <- function(...) if (isTRUE(params$verbose)) cat(..., "\n")
+
+set.seed(params$seed)
+```
+
+```{r}
+reactable_pretty <- function(df, digits = 3) {
+  df2 <- df %>% mutate(across(where(is.numeric), ~ signif(., digits)))
+  reactable::reactable(
+    df2,
+    searchable = TRUE,
+    resizable = TRUE,
+    striped = TRUE,
+    highlight = TRUE,
+    defaultPageSize = 10
+  )
+}
+```
+
+## Load Step 1–2 outputs
+
+```{r}
+analysis_id <- paste0(params$tcga_project, "__", params$gtex_project)
+proc_dir    <- file.path(here::here(params$out_root), analysis_id)
+suffix      <- paste0("-", params$feature_set)
+
+scores_gtex <- readRDS(file.path(proc_dir, paste0("ssgsea_scores_gtex", suffix, ".rds")))
+scores_nt   <- readRDS(file.path(proc_dir, paste0("ssgsea_scores_nt",   suffix, ".rds")))
+scores_pt   <- readRDS(file.path(proc_dir, paste0("ssgsea_scores_pt",   suffix, ".rds")))
+metadata    <- readRDS(file.path(proc_dir, "sample_metadata.rds"))
+
+clock_results <- readRDS(file.path(proc_dir, paste0("clock_and_RAA_objects", suffix, ".rds")))
+
+stopifnot(!anyDuplicated(rownames(metadata)))
+stopifnot(all(colnames(scores_gtex) %in% rownames(metadata)))
+stopifnot(all(colnames(scores_pt)   %in% rownames(metadata)))
+stopifnot(all(colnames(scores_nt)   %in% rownames(metadata)))
+```
+
+## Build matrices in clock feature order
+
+```{r}
+feat <- clock_results$feature_names
+
+# features matrices: samples × features (raw ssGSEA)
+X_gtex <- t(scores_gtex[feat, , drop = FALSE])
+X_pt   <- t(scores_pt  [feat, , drop = FALSE])
+X_nt   <- if (ncol(scores_nt) > 0) t(scores_nt[feat, , drop = FALSE]) else matrix(nrow = 0, ncol = length(feat))
+
+# ages aligned to rownames (sample IDs)
+age_gtex <- metadata[rownames(X_gtex), "age_years"]
+age_pt   <- metadata[rownames(X_pt),   "age_years"]
+age_nt   <- if (nrow(X_nt) > 0) metadata[rownames(X_nt), "age_years"] else numeric()
+
+# Drop missing GTEx ages (required to fit reference profile)
+keep_g <- is.finite(age_gtex)
+X_gtex <- X_gtex[keep_g, , drop = FALSE]
+age_gtex <- age_gtex[keep_g]
+
+# ClockSHAP requires `age` to be a *named* vector when `features` has rownames
+age_gtex <- as.numeric(age_gtex)
+names(age_gtex) <- rownames(X_gtex)
+
+has_nat <- nrow(X_nt) >= params$min_nat
+vcat("GTEx n=", nrow(X_gtex), " | PT n=", nrow(X_pt), " | NAT n=", nrow(X_nt), " | has_nat=", has_nat)
+```
+
+## Build `linear_clock` object (ClockSHAP API)
+
+IMPORTANT: Use the **ClockSHAP-ready** parameterization saved by Step 02 (`clock_results$clock_cs`).
+Do NOT re-extract `coef(enet_model)` and pass `mu/sigma`, because that mismatches scales when glmnet was fit with `standardize=TRUE`.
+
+```{r}
+# pull ClockSHAP-ready params
+cs <- clock_results$clock_cs
+
+# Ensure naming is present for safe alignment
+if (is.null(names(cs$beta)))  names(cs$beta)  <- clock_results$feature_names
+if (is.null(names(cs$mu)))    names(cs$mu)    <- clock_results$feature_names
+if (is.null(names(cs$sigma))) names(cs$sigma) <- clock_results$feature_names
+
+alpha_cs <- cs$alpha
+beta_cs  <- cs$beta[feat]
+mu       <- cs$mu[feat]
+sigma    <- cs$sigma[feat]
+
+stopifnot(all(is.finite(beta_cs)), all(is.finite(mu)), all(is.finite(sigma)))
+
+clock <- linear_clock(
+  alpha = alpha_cs,
+  beta  = beta_cs,
+  mu    = mu,
+  sigma = sigma
+)
+
+# QA: confirm clock parameterization reproduces glmnet predictions on a few GTEx samples
+enet_model <- clock_results$enet_model
+lam <- clock_results$tuning$best_lambda
+
+set.seed(params$seed + 1)
+ix <- sample(seq_len(nrow(X_gtex)), size = min(10, nrow(X_gtex)))
+pred_glmnet <- as.numeric(predict(enet_model, newx = X_gtex[ix, , drop = FALSE], s = lam))
+
+Z <- sweep(sweep(X_gtex[ix, , drop = FALSE], 2, mu, "-"), 2, sigma, "/")
+pred_cs <- alpha_cs + as.numeric(Z %*% beta_cs)
+
+vcat("ClockSHAP clock QA: max |pred_glmnet - pred_cs| = ", signif(max(abs(pred_glmnet - pred_cs)), 6))
+```
+
+## Fit GTEx age-conditioned `reference_profile` (ClockSHAP API)
+
+```{r}
+reference <- fit_reference_profile(
+  features = as.data.frame(X_gtex),
+  age      = age_gtex
+)
+```
+
+## Compute ClockSHAP (TCGA-PT, optional NAT)
+
+```{r}
+# --- PT: drop missing ages (ClockSHAP requires complete age) ---
+ok_pt <- is.finite(age_pt)
+X_pt_cs   <- X_pt[ok_pt, , drop = FALSE]
+age_pt_cs <- age_pt[ok_pt]
+
+# ClockSHAP requires `age` to be named by the same sample IDs as `features`
+age_pt_cs <- as.numeric(age_pt_cs)
+names(age_pt_cs) <- rownames(X_pt_cs)
+stopifnot(identical(names(age_pt_cs), rownames(X_pt_cs)))
+
+cs_pt <- clockshap(
+  features  = X_pt_cs,
+  age       = age_pt_cs,
+  clock     = clock,
+  reference = reference
+)
+
+# --- NAT: only if enough samples AND drop missing ages ---
+cs_nt <- NULL
+if (has_nat) {
+  ok_nt <- is.finite(age_nt)
+  X_nt_cs   <- X_nt[ok_nt, , drop = FALSE]
+  age_nt_cs <- age_nt[ok_nt]
+
+  # ClockSHAP requires `age` to be named by the same sample IDs as `features`
+  age_nt_cs <- as.numeric(age_nt_cs)
+  names(age_nt_cs) <- rownames(X_nt_cs)
+  stopifnot(identical(names(age_nt_cs), rownames(X_nt_cs)))
+
+  if (nrow(X_nt_cs) >= params$min_nat) {
+    cs_nt <- clockshap(
+      features  = X_nt_cs,
+      age       = age_nt_cs,
+      clock     = clock,
+      reference = reference
+    )
+  } else {
+    vcat("Skipping NAT ClockSHAP after age-filter: n=", nrow(X_nt_cs), " < min_nat=", params$min_nat)
+  }
+}
+```
+
+## Quick invariant check (optional QA)
+
+```{r}
+max_abs_err <- max(abs(rowSums(cs_pt$phi) - cs_pt$deviation), na.rm = TRUE)
+vcat("ClockSHAP invariant (PT): max |rowSums(phi) - deviation| = ", signif(max_abs_err, 6))
+```
+
+## Quick demo outputs (tables + plots)
+
+### 1) What did we compute?
+
+```{r}
+vcat(
+  "ClockSHAP outputs (PT): ",
+  "phi dim = ", paste(dim(cs_pt$phi), collapse=" x "),
+  " | deviation n = ", length(cs_pt$deviation),
+  " | expected n = ", length(cs_pt$expected),
+  " | pred n = ", length(cs_pt$pred)
+)
+```
+
+### 2) Deviation distribution
+
+```{r}
+# Use phi rownames as authoritative sample IDs
+sid <- rownames(cs_pt$phi)
+stopifnot(length(cs_pt$deviation) == length(sid))
+
+dev_df <- tibble(
+  sample_id = sid,
+  deviation = as.numeric(cs_pt$deviation)
+) %>%
+  filter(is.finite(deviation))
+
+ggplot(dev_df, aes(x = deviation)) +
+  geom_histogram(bins = 50) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = paste0("ClockSHAP deviation (PT): ", analysis_id),
+    x = "Deviation = predicted − expected (years)",
+    y = "Count"
+  )
+```
+
+### 3) Cohort-level summary: most influential pathways across tumors
+
+```{r}
+phi_mat <- cs_pt$phi  # samples x features
+
+phi_summary <- tibble(
+  feature = colnames(phi_mat),
+  mean_phi = colMeans(phi_mat, na.rm = TRUE),
+  mean_abs_phi = colMeans(abs(phi_mat), na.rm = TRUE),
+  sd_phi = apply(phi_mat, 2, sd, na.rm = TRUE)
+) %>% arrange(desc(mean_abs_phi))
+
+reactable_pretty(phi_summary %>% slice_head(n = 25))
+```
+
+## Waterfall Plot (random sample)
+
+```{r}
+if (isTRUE(params$do_one_waterfall)) {
+  # Choose a random tumour sample (not the most deviated)
+  set.seed(params$seed + 2)
+  sample_id_wf <- sample(rownames(cs_pt$phi), size = 1)
+
+  vcat("Waterfall sample (random): ", sample_id_wf)
+
+  p_wf <- plot_clockshap_waterfall(
+    x       = cs_pt,
+    sample  = sample_id_wf,
+    top_n   = params$waterfall_top_k,
+    show_age_labels   = TRUE,
+    show_delta_label  = TRUE,
+    show_effect_labels = TRUE
+  )
+
+  print(p_wf)
+}
+```
+
+## Save outputs for downstream analyses
+
+```{r}
+out <- list(
+  analysis_id = analysis_id,
+  clock       = clock,
+  reference   = reference,
+  pt          = cs_pt,
+  nat         = cs_nt,
+  demo = list(
+    deviation_table = dev_df,
+    phi_summary = phi_summary
+  )
+)
+
+saveRDS(out, file.path(proc_dir, paste0("clockshap_objects", suffix, ".rds")))
+vcat("Saved: ", file.path(proc_dir, paste0("clockshap_objects", suffix, ".rds")))
+```
+
+## Session info
+
+```{r}
+sessionInfo()
+```

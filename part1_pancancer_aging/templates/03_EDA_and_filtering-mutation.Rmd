@@ -1,0 +1,472 @@
+---
+title: "03_Mutation_EDA.Rmd"
+author: "Pranav Narnur - Monti Lab"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: united
+    css: themes/style.css
+    code_folding: hide
+    toc: true
+    toc_float:
+      collapsed: true
+      smooth_scroll: true
+    toc_depth: 3
+    df_print: paged
+params:
+  cancer_type: "TCGA-HNSC"
+  include_gender: TRUE
+  include_race: TRUE
+  races_included: "asian, black or african american, white"
+  include_subtype: FALSE
+  include_HPV_status: FALSE
+  include_grade: TRUE
+  grades_included: "G1, G2, G3, G4, GX"
+  include_purity: TRUE
+---
+
+# `r if (!is.null(params$cancer_type)) paste(params$cancer_type)`
+
+```{r, setup, include = FALSE}
+set.seed(1)
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = FALSE,
+                      dev = "ragg_png", dpi = 300)
+library(SummarizedExperiment)
+library(tidyverse)
+library(reactable)
+library(ggpmisc)
+library(maftools)
+
+DATA_ROOT <- "/restricted/projectnb/agedisease/projects/pancancer_aging/TCGA-GDC/mutation"
+SCRIPT_ROOT <- "/restricted/projectnb/agedisease/projects/pancancer_aging/scripts/mutation"
+RESULTS_ROOT <- "/restricted/projectnb/agedisease/projects/pancancer_aging/results/mutation"
+```
+
+```{r}
+selected_cancer_type <- params$cancer_type
+include_gender <- params$include_gender
+include_race <- params$include_race
+include_HPV_status <- params$include_HPV_status
+include_subtype <- params$include_subtype
+include_grade <- params$include_grade
+include_purity <- params$include_purity
+
+races_included <- params$races_included
+if (length(races_included) == 1 && !is.na(races_included) && grepl(",", races_included)) {
+  races_included <- trimws(strsplit(races_included, ",")[[1]])
+}
+
+grades_included <- params$grades_included
+if (length(grades_included) == 1 && !is.na(grades_included) && grepl(",", grades_included)) {
+  grades_included <- trimws(strsplit(grades_included, ",")[[1]])
+}
+```
+
+```{r}
+path_SE_input <- file.path(DATA_ROOT, "processed_data", "all")
+path_SE_output <- file.path(DATA_ROOT, "processed_data", "filtered")
+
+dir.create(path_SE_output, recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r}
+source(file.path(SCRIPT_ROOT, "utils.r"))
+```
+
+This script performs EDA and filtering on Mutation data for `r selected_cancer_type`.
+
+Model covariates for this cancer type:
+
+Gender: `r include_gender`
+Race: `r include_race`
+Subtype: `r include_subtype`
+HPV Status: `r include_HPV_status`
+Grade: `r include_grade`
+Purity: `r include_purity`
+
+# Load Data
+
+```{r}
+input_file <- file.path(path_SE_input, paste0(selected_cancer_type, "_binary-mutation.rds"))
+
+if (!file.exists(input_file)) stop("Input SE file not found: ", input_file)
+
+se <- readRDS(input_file)
+
+for (aname in assayNames(se)) {
+  if (inherits(assay(se, aname), "table")) {
+    assay(se, aname) <- unclass(assay(se, aname))
+  }
+}
+
+initial_n <- ncol(se)
+
+cat("Initial number of samples:", initial_n, "\n")
+cat("Initial number of genes:", nrow(se), "\n")
+
+if (ncol(se) == 0) {
+  stop(paste0("No samples found for ", selected_cancer_type, ". Check input data."))
+}
+```
+
+# Calculate TMB (Tumor Mutation Burden)
+
+TMB is calculated using `maftools::tmb()` on the MAF object constructed from raw GDC downloads within pancancer_aging.
+
+```{r}
+maf_dir <- file.path(
+  DATA_ROOT, "raw_data", "project_downloads", selected_cancer_type,
+  "Simple_Nucleotide_Variation", "Masked_Somatic_Mutation"
+)
+
+if (!dir.exists(maf_dir)) stop("MAF download directory not found: ", maf_dir)
+
+maf_files <- list.files(maf_dir, pattern = "\\.maf\\.gz$", recursive = TRUE, full.names = TRUE)
+cat("Reading", length(maf_files), "MAF files for", selected_cancer_type, "\n")
+
+maf_combined <- data.table::rbindlist(
+  lapply(maf_files, function(f) data.table::fread(f, skip = "Hugo_Symbol")),
+  fill = TRUE
+)
+maf <- maftools::read.maf(maf_combined, removeDuplicatedVariants = TRUE, verbose = FALSE)
+
+tmb_df <- maftools::tmb(maf)
+tmb_df$sampleid <- substr(tmb_df$Tumor_Sample_Barcode, 1, 12)
+tmb_df <- tmb_df[!duplicated(tmb_df$sampleid), ]
+
+colData(se)$tmb_total <- tmb_df$total[match(colnames(se), tmb_df$sampleid)]
+cat("Calculated TMB using maftools::tmb() for", sum(!is.na(colData(se)$tmb_total)), "samples\n")
+cat("TMB range:", min(colData(se)$tmb_total, na.rm = TRUE), "-", max(colData(se)$tmb_total, na.rm = TRUE), "\n")
+```
+
+# Rebuild "all" Binary Matrix
+
+Rebuild the "all" assay using `maftools::mutCountMatrix()` to match the oralcancer pipeline methodology (replacing Payton's `table()`-based matrix).
+
+```{r}
+all_count <- maftools::mutCountMatrix(maf, includeSyn = FALSE, removeNonMutated = FALSE)
+
+colnames(all_count) <- substr(colnames(all_count), 1, 12)
+all_count <- all_count[, !duplicated(colnames(all_count))]
+
+all_binary <- ifelse(all_count > 0, 1, 0)
+
+shared_samples <- intersect(colnames(se), colnames(all_binary))
+shared_genes <- intersect(rownames(se), rownames(all_binary))
+
+se <- se[shared_genes, shared_samples]
+assay(se, "all") <- all_binary[shared_genes, shared_samples]
+
+cat("Rebuilt 'all' assay via mutCountMatrix():", nrow(se), "genes x", ncol(se), "samples\n")
+```
+
+# Filter 1: Remove Missing Age
+
+This filter is applied for every cancer type.
+
+```{r}
+cat("Samples with missing age:", sum(is.na(colData(se)$Age)), "\n")
+se <- se[, !is.na(colData(se)$Age)]
+cat("After filtering age:", ncol(se), "\n")
+```
+
+# Filter 2a: Keep Only HPV-Negative Samples (HNSC only)
+
+This filter is only applied when cancer_type = TCGA-HNSC and include_HPV_status = TRUE.
+
+```{r}
+if (selected_cancer_type == "TCGA-HNSC" && include_HPV_status == TRUE) {
+  cat("HPV status distribution BEFORE filtering:\n")
+  print(table(colData(se)$HPV.status, useNA = "always"))
+
+  se <- se[, !is.na(colData(se)$HPV.status) & colData(se)$HPV.status == "Negative"]
+
+  cat("Samples remaining after filtering HPV-negative:", ncol(se), "\n")
+}
+```
+
+# Filter 2b: Remove Samples with Missing Subtype
+
+This filter is applied when include_subtype = TRUE.
+
+```{r}
+if (include_subtype == TRUE) {
+  cat("Samples with missing subtype:", sum(is.na(colData(se)$subtype_selected)), "\n")
+  se <- se[, !is.na(colData(se)$subtype_selected)]
+  cat("Samples remaining after filtering missing subtype:", ncol(se), "\n")
+}
+```
+
+
+# Filter 3: Hypermutation (TMB < 1000)
+
+Per Chatsirisupachai et al. 2021, restricting analysis to <1000 non-silent mutations.
+
+```{r}
+cat("TMB distribution BEFORE filtering:\n")
+print(summary(colData(se)$tmb_total))
+
+n_hyper <- sum(colData(se)$tmb_total >= 1000, na.rm = TRUE)
+cat("Removing", n_hyper, "hypermutated samples (TMB >= 1000).\n")
+
+se <- se[, !is.na(colData(se)$tmb_total) & colData(se)$tmb_total < 1000]
+cat("Samples remaining after hypermutation filter:", ncol(se), "\n")
+```
+
+# Filter 4: Purity
+
+```{r}
+if (include_purity == TRUE) {
+  cat("Samples with missing purity:", sum(is.na(colData(se)$purity)), "\n")
+  se <- se[, !is.na(colData(se)$purity)]
+  cat("After purity filtering:", ncol(se), "\n")
+}
+```
+
+# Filter 5: Grade (Recode & Filter)
+
+Combines G3/G4 into a single category. Removes NAs and filters to specified grade levels.
+
+```{r}
+if (include_grade == TRUE) {
+  cat("\nOriginal grade distribution BEFORE recoding:\n")
+  print(table(colData(se)$histological_grade, useNA = "always"))
+
+  coldata <- colData(se) %>% as.data.frame()
+
+  coldata$grade <- case_when(
+    coldata$histological_grade == "G1" ~ "G1",
+    coldata$histological_grade == "G2" ~ "G2",
+    coldata$histological_grade %in% c("G3", "G4") ~ "G3/G4",
+    coldata$histological_grade == "GX" ~ "GX",
+    coldata$histological_grade == "High Grade" ~ "High Grade",
+    coldata$histological_grade == "Low Grade" ~ "Low Grade",
+    TRUE ~ NA_character_
+  )
+
+  se <- SummarizedExperiment(
+    assays = assays(se),
+    rowData = rowData(se),
+    colData = coldata
+  )
+
+  cat("\nRecoded grade distribution BEFORE removing NAs:\n")
+  print(table(colData(se)$grade, useNA = "always"))
+
+  se <- se[, !is.na(colData(se)$grade)]
+
+  grades_recoded_included <- unique(case_when(
+    grades_included %in% c("G3", "G4") ~ "G3/G4",
+    grades_included %in% c("G1", "G2", "GX") ~ grades_included,
+    TRUE ~ grades_included
+  ))
+
+  se <- se[, colData(se)$grade %in% grades_recoded_included]
+
+  cat("\nAfter grade filtering:", ncol(se), "\n")
+  print(table(colData(se)$grade, useNA = "always"))
+}
+```
+
+# Filter 6: Gender
+
+```{r}
+if (include_gender == TRUE) {
+  cat("Samples with missing gender:", sum(is.na(colData(se)$gender)), "\n")
+  se <- se[, !is.na(colData(se)$gender)]
+  cat("After filtering gender:", ncol(se), "\n")
+}
+```
+
+# Filter 7: Race
+
+Recodes 'not reported' to NA, removes NAs, and filters for included races.
+
+```{r}
+if (include_race == TRUE) {
+  cat("Race distribution BEFORE filtering:\n")
+  print(table(colData(se)$race, useNA = "always"))
+
+  coldata <- colData(se) %>% as.data.frame()
+  coldata$race <- if_else(coldata$race == "not reported", NA_character_, coldata$race)
+
+  se <- SummarizedExperiment(
+    assays = assays(se),
+    rowData = rowData(se),
+    colData = coldata
+  )
+
+  cat("\nRace distribution AFTER recoding 'not reported' to NA:\n")
+  print(table(colData(se)$race, useNA = "always"))
+
+  se <- se[, !is.na(colData(se)$race)]
+
+  cat("\nRace distribution AFTER removing NAs:\n")
+  print(table(colData(se)$race, useNA = "always"))
+
+  se <- se[, colData(se)$race %in% races_included]
+
+  cat("\nRace distribution AFTER keeping only specified races:\n")
+  print(table(colData(se)$race, useNA = "always"))
+}
+
+cat("\nFinal samples after all filters:", ncol(se), "\n")
+
+if (ncol(se) == 0) {
+  stop(paste0("No samples remain for ", selected_cancer_type, " after filtering. Check covariate parameters."))
+}
+
+final_n <- ncol(se)
+
+if ((final_n / initial_n) < 0.7) {
+  stop(paste0(
+    "More than 30% of initial samples were removed for ", selected_cancer_type,
+    " after filtering. Please check metadata and covariate selection carefully before proceeding."
+  ))
+}
+```
+
+# EDA {.tabset}
+
+## TMB Distribution
+
+```{r}
+ggplot(as.data.frame(colData(se)), aes(x = tmb_total)) +
+  geom_histogram(bins = 50, fill = "#4271AE", color = "white") +
+  labs(title = "TMB Distribution (Filtered)", x = "TMB", y = "Count") +
+  theme_minimal()
+```
+
+## Age Distribution (all samples)
+
+```{r}
+ggplot(as.data.frame(colData(se)), aes(x = Age)) +
+  geom_histogram(bins = 30, fill = "#1ABC9C", color = "white") +
+  geom_vline(xintercept = median(colData(se)$Age, na.rm = TRUE), linetype = "dashed", color = "red") +
+  labs(title = paste("Histogram of Age at Index -", selected_cancer_type), x = "Age at index", y = "Frequency") +
+  theme_minimal()
+```
+
+## Top 20 Mutated Genes
+
+```{r}
+if ("all" %in% assayNames(se)) {
+  mat <- assay(se, "all")
+  top_genes <- rowSums(mat) %>%
+    sort(decreasing = TRUE) %>%
+    head(20) %>%
+    as.data.frame() %>%
+    setNames("Count") %>%
+    rownames_to_column("Gene") %>%
+    mutate(Percent = (Count / ncol(se)) * 100)
+
+  ggplot(top_genes, aes(x = reorder(Gene, Count), y = Count, fill = Percent)) +
+    geom_col() +
+    coord_flip() +
+    labs(title = "Top 20 Mutated Genes", x = "Gene") +
+    theme_minimal()
+}
+```
+
+## Missing Value Counts per Variable
+
+```{r}
+covariates <- c("Age", "tmb_total")
+if (include_gender) covariates <- c(covariates, "gender")
+if (include_race) covariates <- c(covariates, "race")
+if (include_subtype) covariates <- c(covariates, "subtype_selected")
+if (include_HPV_status) covariates <- c(covariates, "HPV.status")
+if (include_grade) covariates <- c(covariates, "grade")
+if (include_purity) covariates <- c(covariates, "purity")
+
+available_covariates <- covariates[covariates %in% names(colData(se))]
+cov_data <- as.data.frame(colData(se)[, available_covariates])
+
+missing_summary <- cov_data %>%
+  dplyr::summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  tidyr::pivot_longer(everything(), names_to = "variable", values_to = "n_missing") %>%
+  dplyr::mutate(pct_missing = n_missing / nrow(cov_data) * 100)
+
+reactable_pretty(missing_summary)
+```
+
+## Age Distribution over Categorical Covariate Levels
+
+```{r}
+discrete_vars <- c()
+if (include_gender) discrete_vars <- c(discrete_vars, "gender")
+if (include_race) discrete_vars <- c(discrete_vars, "race")
+if (include_subtype) discrete_vars <- c(discrete_vars, "subtype_selected")
+if (include_HPV_status) discrete_vars <- c(discrete_vars, "HPV.status")
+if (include_grade) discrete_vars <- c(discrete_vars, "grade")
+
+if (length(discrete_vars) > 0) {
+  discrete_vars <- discrete_vars[discrete_vars %in% names(cov_data)]
+
+  if (length(discrete_vars) > 0) {
+    plot_data <- cov_data %>%
+      tidyr::pivot_longer(all_of(discrete_vars), names_to = "name", values_to = "value") %>%
+      dplyr::filter(!is.na(value), !is.na(Age))
+
+    if (nrow(plot_data) > 0 && length(unique(plot_data$name)) > 0) {
+      count_labels <- plot_data %>%
+        dplyr::group_by(name, value) %>%
+        dplyr::summarise(n = n(), .groups = "drop")
+
+      p <- plot_data %>%
+        ggplot(aes(x = value, y = Age)) +
+        geom_boxplot() +
+        geom_text(
+          data = count_labels, aes(label = paste0("n=", n), y = Inf),
+          vjust = 1.5, size = 3
+        ) +
+        ggplot2::facet_wrap(~name, scales = "free_x") +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+      print(p)
+    } else {
+      cat("No non-NA values in discrete covariates after filtering.\n")
+    }
+  } else {
+    cat("Selected discrete covariates not found in data.\n")
+  }
+} else {
+  cat("No discrete covariates selected.\n")
+}
+```
+
+## Age Distribution vs Continuous Covariates
+
+```{r}
+if (include_purity == TRUE && "purity" %in% names(cov_data)) {
+  n_missing_purity <- sum(is.na(cov_data$purity))
+
+  p <- ggplot(cov_data, aes(x = purity, y = Age)) +
+    geom_point(alpha = 0.3) +
+    geom_smooth(method = "lm", se = TRUE, color = "blue") +
+    labs(caption = paste0("n_missing = ", n_missing_purity)) +
+    theme_bw()
+
+  print(p)
+} else {
+  cat("No continuous covariates selected (purity not included or not available).\n")
+}
+```
+
+## TMB vs Age
+
+```{r}
+ggplot(as.data.frame(colData(se)), aes(x = Age, y = tmb_total)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "lm", se = TRUE, color = "blue") +
+  labs(title = "TMB vs Age", x = "Age", y = "TMB (Total)") +
+  theme_bw()
+```
+
+## Save Data
+
+```{r}
+output_file <- file.path(path_SE_output, paste0(selected_cancer_type, "_mutation-filtered-final.rds"))
+saveRDS(se, output_file)
+cat("Saved filtered SE to:", output_file, "\n")
+```

@@ -1,0 +1,211 @@
+---
+title: "Process RNAseq SummarizedExperiment Objects"
+subtitle: "TCGA PanCancer Aging"
+author: "Payton Bock - Monti Lab"
+date:   "`r format(Sys.Date(), '%B %d, %Y')`"
+params: 
+  dummy: "dummy"
+output:
+  html_document:
+    theme: united
+    code_folding: hide
+    css: style.css
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+
+```{r, include = FALSE}
+.libPaths("/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/r-library/")
+
+library(dplyr)
+library(SummarizedExperiment)
+library(ggplot2)
+library(reactable)
+library(S4Vectors)
+library(edgeR)
+library(tibble)
+
+#get environmental variables
+PATH <- file.path( Sys.getenv("PCANAGE","/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/")) 
+TCGA <- file.path( Sys.getenv("CBMDATA","/restricted/projectnb/agedisease/CBMrepositoryData/TCGA-GDC"), "TCGA-GDC")
+```
+
+## Script Summary 
+- Loads harmonized meta data RDS file
+
+- Adds meta data to all SummarizedExperiment objects for the RNAseq Omics layer
+
+- Process and save two forms of SummarizedExperiment objects (all genes, and only genes with adequate expression)
+
+## Path Setting
+Load in metadata RDS object and define directory with SummarizedExperiment objects
+```{r data loading}
+#Where the meta data RDS file is
+metadata <- readRDS(file.path(TCGA,"metadata/data/harmonized_metadata.rds"))
+
+#Path where the summarized experiment objects you are updating are located
+se_directory <- file.path(TCGA,"RNAseq/raw_data/raw_SE/")
+
+#Path to directory you want to output to
+output_directory_all <- file.path(TCGA,"RNAseq/processed_data/all/") 
+output_directory_filtered <- file.path(TCGA,"RNAseq/processed_data/filtered/") 
+```
+
+## Functions
+Here we define three functions to process the SummarizedExperiment objects.
+
+NOTE: The setGeneNames() function is no longer run. This means Ensembl IDs are kept as the row name identifers in the SummarizedExperiment objects. Handling of duplicate genes names should be done on a per analysis basis. 
+
+1. **setGeneNames**:
+   - **Purpose**: This function is designed to manage gene names in `SummarizedExperiment` objects by setting unique gene names as row names. It ensures that each gene is represented only once in the dataset, which is crucial for accurate downstream analysis.
+   - **Operations**:
+     - Identifies duplicate gene names within the `rowData`.
+     - Filters out all but the first occurrence of each duplicate to ensure uniqueness.
+     - Sets the filtered, non-duplicate gene names as row names of the `SummarizedExperiment`.
+
+2. **filterAndSave**:
+   - **Purpose**: Filters out genes with low expression from our `SummarizedExperiment` object. 
+   - **Operations**:
+     - Uses `edgeR`'s `filterByExpr` function to determine which genes have sufficient expression across samples based on a design matrix. This uses default settings ( min.count = 10, min.total.count = 15, large.n = 10, min.prop = 0.7). this means that 70% of the samples (per canceR) need to have at least 10 counts of the gene. 
+     - Retains only the genes passing this filter and saves the filtered `SummarizedExperiment` object to the specified output directory.
+
+3. **addMetadata**:
+   - **Purpose**: Alters `SummarizedExperiment` objects by incorporating our harmonized metadata. 
+   - **Operations**:
+     - Checks and sets the column names of the `SummarizedExperiment` to match the `submitter_id` from the metadata to ensure consistency.
+     - Intersects the samples in the object with those in the metadata to find common entries.
+     - Orders and matches the samples to ensure that the metadata aligns exactly with the samples in the `SummarizedExperiment`.
+     - Adds this metadata as `colData` of our SummarizedExperiment objects. 
+
+```{r}
+# Function to set row names and remove duplicates based on gene names
+setGeneNames <- function(se) {
+  # Identify duplicates in gene names
+  dupl = duplicated(rowData(se)$gene_name)
+  
+  # Filter the SummarizedExperiment to remove duplicates
+  se <- se[!dupl, ]  # Keep only rows with non-duplicated gene names
+
+  # Set row names on the filtered SummarizedExperiment using the non-duplicated gene names
+  rownames(se) <- rowData(se)$gene_name  # rowData(se)$gene_name are now all unique
+
+  return(list(se = se, dropped_duplicates = sum(dupl)))
+}
+
+# Function to filter low expression genes and save the filtered data
+filterAndSave <- function(se) {
+  keep <- filterByExpr(assay(se))
+  se_filtered <- se[keep, ]
+  dropped_low_expr = sum(!keep)
+  # Save the filtered SE object
+  return(list(se_filtered = se_filtered, dropped_low_expr = dropped_low_expr))
+}
+
+
+# Function to add metadata to a SummarizedExperiment object
+addMetadata <- function(se, metadata) {
+  # Ensure patient ID is set as the column names of the object
+  if (!identical(colnames(se), colData(se)$submitter_id)) {
+    message("Setting submitter_id as colnames.")
+    colnames(se) <- colData(se)$submitter_id
+  }
+  
+  # Determines which samples are in the current TCGA project + assay
+  samples_to_keep <- intersect(colnames(se), rownames(metadata))
+  
+  # Only keep metadata for the current project
+  project_specific_metadata <- metadata[rownames(metadata) %in% samples_to_keep,]
+  
+  # Ensure metadata is a DataFrame object (needed to add as colData)
+  project_specific_metadata <- DataFrame(project_specific_metadata)
+  
+  # Ensures the order of samples match between Summarized Experiment and meta data
+  se_sorted <- se[, match(rownames(project_specific_metadata), colnames(se))]
+  
+  # If the samples are identical, add metadata as colData
+  # The same samples and the same order is necessary
+  if (identical(colnames(se_sorted), rownames(project_specific_metadata))) {
+    colData(se_sorted) <- project_specific_metadata
+    return(se_sorted)
+  } else {
+    stop("Mismatch between column names (sample names) and meta data samples")
+  }
+}
+
+```
+
+
+## Process all RNAseq Summarized Experiment Objects
+Here we apply the three functions defined above to our raw SummarizedExperiment objects split into individual cancer types. 
+
+```{r}
+# Initialize a data frame to store results
+results <- tibble(
+  FileName = character(),
+  DroppedDuplicates = integer(),
+  DroppedLowExpr = integer(),
+  RemainingGenes_Filtered = integer()
+)
+
+# Create a list of all files ending in .rds in se_directory
+file_list <- list.files(path = se_directory, pattern = "*.rds", full.names = TRUE)
+
+# Loop through files
+for(file in file_list) {
+  cat("Processing ", file, "\n")
+  
+  # Read in file
+  data <- readRDS(file)
+
+  # Add metadata
+  data <- addMetadata(data, metadata)
+
+  # Set gene names and remove duplicates
+  dropped_duplicates <- 0
+  #processed_data <- setGeneNames(data)
+  #data <- processed_data$se
+  #dropped_duplicates <- processed_data$dropped_duplicates
+
+  # Save the "all" data to the "all" directory
+  output_path_all <- file.path(output_directory_all, basename(file))
+  saveRDS(data, output_path_all)
+
+  # Filter lowly expressed genes and save to the "filtered" directory
+  fs_obj <- filterAndSave(data)
+  filtered_data <- fs_obj$se_filtered
+  
+  # Get the original base file name without the extension
+  original_base_name <- tools::file_path_sans_ext(basename(file))
+  
+  # Create a new file name by appending "_filtered" and then adding back the ".rds" extension
+  new_file_name <- paste0(original_base_name, "_filtered.rds")
+  
+  # Create the full path for the filtered file
+  output_path_filtered <- file.path(output_directory_filtered, new_file_name)
+  
+  # Save the filtered SummarizedExperiment object
+  saveRDS(filtered_data, output_path_filtered)
+  
+  dropped_low_expr <- fs_obj$dropped_low_expr
+  cat("Filtered and saved data with low expression genes removed: ", dropped_low_expr, " genes filtered out.\n")
+  
+  # Record results in the data frame
+  results <- add_row(results, FileName = basename(file), DroppedDuplicates = dropped_duplicates, DroppedLowExpr = dropped_low_expr, RemainingGenes_Filtered = length(rownames(filtered_data)))
+}
+```
+
+## Processing Summary
+```{r}
+reactable::reactable(results)
+```
+
+## Session Info
+```{r}
+sessionInfo()
+```
+

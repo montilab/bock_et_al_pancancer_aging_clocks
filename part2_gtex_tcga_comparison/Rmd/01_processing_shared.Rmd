@@ -1,0 +1,436 @@
+---
+title: "01. Shared processing: recount3 GTEx and TCGA inputs"
+author: "Pan-cancer aging pipeline, Part 2"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: united
+    code_folding: hide
+    toc: true
+    toc_float: true
+params:
+  gtex_age_tsv: "/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/data/GTEx/GTEx_Analysis_2022-06-06_v10_Annotations_SubjectPhenotypesDS.txt"
+  out_root: "results/derived/part2/01_processing"
+  tables_root: "results/tables/part2"
+  min_samples_with_age: 50
+  tcga_keep_sample_types:
+    - "Primary Tumor"
+    - "Primary Blood Derived Cancer - Peripheral Blood"
+  seed: 2026
+  verbose: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+## Overview
+
+This script prepares harmonized GTEx and TCGA inputs for the Part 2 analyses (gene-level age modeling and cell-type deconvolution). All downstream Part 2 scripts read from the outputs produced here.
+
+Data are pulled from recount3 to keep the source consistent with the clock training pipeline. For each retained project we save a protein-coding, gene-symbol-collapsed count matrix together with sample-level metadata (age, sex, sample type).
+
+A few methodological choices are made here and inherited by every downstream Part 2 script:
+
+- **Protein-coding only.** Matches the gene universe used for clock training and reduces noise from low-coverage non-coding annotations.
+- **Drop pseudoautosomal Y duplicates (`_PAR_Y`).** Same convention as the clock pipeline; avoids double-counting reads.
+- **Duplicate symbol collapse via row sums.** The clock pipeline collapses logCPM duplicates by mean, since averaging is the right operation on a log scale. This script collapses raw counts by sum, since summed reads is what DESeq2 expects. 
+- **Retain primary disease samples.** For solid tumors that is `Primary Tumor`. We additionally retain `Primary Blood Derived Cancer - Peripheral Blood` so that TCGA-LAML is included in pan-cancer summaries. Solid-tissue normal and metastatic samples are excluded.
+- **Minimum sample threshold.** Projects with fewer than `r params$min_samples_with_age` samples with non-missing age are flagged in the manifest but skipped for downstream modeling.
+- **Minimal covariate metadata.** We retain only age and sex. Additional TCGA-only covariates (purity, grade, stage) are intentionally not used in Part 2, so that GTEx and TCGA can be modeled symmetrically. Compositional concerns are addressed separately via cell-type deconvolution.
+
+Outputs are written to `results/derived/part2/01_processing/` and `results/tables/part2/`.
+
+## Libraries
+
+```{r}
+suppressPackageStartupMessages({
+  library(recount3)
+  library(SummarizedExperiment)
+  library(dplyr)
+  library(tibble)
+  library(purrr)
+  library(ggplot2)
+  library(reactable)
+  library(here)
+})
+```
+
+## Setup
+
+```{r}
+set.seed(params$seed)
+
+derived_root <- here::here(params$out_root)
+tables_root  <- here::here(params$tables_root)
+cache_root   <- here::here("data", "recount3_cache")
+
+dir.create(derived_root, recursive = TRUE, showWarnings = FALSE)
+dir.create(tables_root,  recursive = TRUE, showWarnings = FALSE)
+dir.create(cache_root,   recursive = TRUE, showWarnings = FALSE)
+
+Sys.setenv(
+  R_USER_CACHE_DIR = cache_root,
+  BIOC_FILE_CACHE  = cache_root
+)
+
+msg <- function(...) {
+  if (isTRUE(params$verbose)) message(...)
+}
+```
+
+## Helpers
+
+```{r}
+reactable_pretty <- function(df) {
+  reactable::reactable(
+    df,
+    searchable = TRUE,
+    resizable = TRUE,
+    defaultPageSize = 10
+  )
+}
+
+# Collapse recount3 rowData to a protein-coding, symbol-level count matrix.
+# Duplicate symbols are summed (appropriate for raw-count input).
+sym_counts_from_rse <- function(rse, protein_coding_only = TRUE, drop_par_y = TRUE) {
+  stopifnot("counts" %in% assayNames(rse))
+
+  rd  <- as.data.frame(rowData(rse))
+  mat <- assay(rse, "counts")
+
+  keep <- !is.na(rd$gene_name) & rd$gene_name != ""
+
+  if (protein_coding_only) {
+    if (!"gene_type" %in% colnames(rd)) {
+      stop("rowData(rse)$gene_type not found; cannot filter to protein-coding genes.")
+    }
+    keep <- keep & rd$gene_type == "protein_coding"
+  }
+
+  if (drop_par_y && "gene_id" %in% colnames(rd)) {
+    keep <- keep & !grepl("_PAR_Y$", rd$gene_id)
+  }
+
+  mat_keep <- mat[keep, , drop = FALSE]
+  syms     <- rd$gene_name[keep]
+
+  rowsum(mat_keep, group = syms)
+}
+
+normalize_sex_gtex <- function(x) {
+  out <- dplyr::case_when(
+    x == 1 ~ "Male",
+    x == 2 ~ "Female",
+    TRUE   ~ NA_character_
+  )
+  factor(out, levels = c("Female", "Male"))
+}
+
+normalize_sex_tcga <- function(x) {
+  out <- dplyr::case_when(
+    x %in% c("MALE", "Male", "male", "M")       ~ "Male",
+    x %in% c("FEMALE", "Female", "female", "F") ~ "Female",
+    TRUE                                        ~ NA_character_
+  )
+  factor(out, levels = c("Female", "Male"))
+}
+
+load_one_project <- function(project_code, projects_df) {
+  info <- dplyr::filter(projects_df, project == project_code)
+  if (nrow(info) == 0) stop("No rows found for project: ", project_code)
+  recount3::create_rse(info)
+}
+```
+
+## Identify recount3 projects
+
+```{r}
+human_projects <- recount3::available_projects()
+
+gtex_projects <- human_projects %>%
+  dplyr::filter(
+    project_type == "data_sources",
+    grepl("gtex", project_home, ignore.case = TRUE),
+    project != "STUDY_NA"
+  )
+
+tcga_projects <- human_projects %>%
+  dplyr::filter(
+    project_type == "data_sources",
+    grepl("tcga", project_home, ignore.case = TRUE)
+  )
+
+gtex_tissues <- sort(unique(gtex_projects$project))
+tcga_cancers <- sort(unique(tcga_projects$project))
+```
+
+GTEx tissues available: `r length(gtex_tissues)`. TCGA cancers available: `r length(tcga_cancers)`.
+
+## Load GTEx phenotype metadata
+
+GTEx age and sex are pulled from the protected subject-level annotations file (v10 release).
+
+```{r}
+if (!file.exists(params$gtex_age_tsv)) {
+  stop("GTEx phenotype file not found: ", params$gtex_age_tsv)
+}
+
+gtex_pheno <- read.delim(
+  params$gtex_age_tsv,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+if (!all(c("SUBJID", "AGE", "SEX") %in% colnames(gtex_pheno))) {
+  stop("GTEx phenotype file must contain SUBJID, AGE, and SEX.")
+}
+```
+
+## Process GTEx tissues
+
+```{r}
+process_one_gtex <- function(tissue) {
+  msg("Processing GTEx tissue: ", tissue)
+
+  rse <- load_one_project(tissue, gtex_projects)
+  assay(rse, "counts") <- recount3::transform_counts(rse)
+
+  age_idx <- match(colData(rse)$gtex.subjid, gtex_pheno$SUBJID)
+  colData(rse)$age_years <- as.numeric(gtex_pheno$AGE[age_idx])
+  colData(rse)$sex       <- normalize_sex_gtex(gtex_pheno$SEX[age_idx])
+
+  n_total    <- ncol(rse)
+  n_with_age <- sum(is.finite(colData(rse)$age_years))
+  n_female   <- sum(colData(rse)$sex == "Female", na.rm = TRUE)
+  n_male     <- sum(colData(rse)$sex == "Male",   na.rm = TRUE)
+
+  dir_proj <- file.path(derived_root, "GTEx", tissue)
+  dir.create(dir_proj, recursive = TRUE, showWarnings = FALSE)
+
+  kept <- n_with_age >= params$min_samples_with_age
+
+  if (kept) {
+    counts_sym <- sym_counts_from_rse(rse)
+
+    metadata <- tibble::tibble(
+      sample_id   = colnames(rse),
+      cohort      = "GTEx",
+      project     = tissue,
+      age_years   = as.numeric(colData(rse)$age_years),
+      sex         = as.character(colData(rse)$sex),
+      gtex.subjid = as.character(colData(rse)$gtex.subjid)
+    )
+
+    saveRDS(counts_sym, file.path(dir_proj, "counts_sym.rds"))
+    saveRDS(metadata,   file.path(dir_proj, "sample_metadata.rds"))
+  }
+
+  tibble::tibble(
+    cohort        = "GTEx",
+    project       = tissue,
+    n_total       = n_total,
+    n_with_age    = n_with_age,
+    n_female      = n_female,
+    n_male        = n_male,
+    kept          = kept,
+    counts_file   = if (kept) file.path(dir_proj, "counts_sym.rds")   else NA_character_,
+    metadata_file = if (kept) file.path(dir_proj, "sample_metadata.rds") else NA_character_
+  )
+}
+
+gtex_manifest <- purrr::map_dfr(gtex_tissues, process_one_gtex)
+```
+
+## Process TCGA cancers
+
+```{r}
+process_one_tcga <- function(cancer) {
+  msg("Processing TCGA cancer: ", cancer)
+
+  rse <- load_one_project(cancer, tcga_projects)
+
+  sample_type_all <- if ("tcga.cgc_sample_sample_type" %in% colnames(colData(rse))) {
+    as.character(colData(rse)$tcga.cgc_sample_sample_type)
+  } else {
+    rep(NA_character_, ncol(rse))
+  }
+
+  keep_primary <- sample_type_all %in% unlist(params$tcga_keep_sample_types)
+  rse <- rse[, keep_primary, drop = FALSE]
+  sample_type <- sample_type_all[keep_primary]
+
+  assay(rse, "counts") <- recount3::transform_counts(rse)
+
+  colData(rse)$age_years <- suppressWarnings(
+    as.numeric(colData(rse)$tcga.cgc_case_age_at_diagnosis)
+  )
+  colData(rse)$sex <- normalize_sex_tcga(colData(rse)$tcga.cgc_case_gender)
+
+  n_total    <- ncol(rse)
+  n_with_age <- sum(is.finite(colData(rse)$age_years))
+  n_female   <- sum(colData(rse)$sex == "Female", na.rm = TRUE)
+  n_male     <- sum(colData(rse)$sex == "Male",   na.rm = TRUE)
+
+  dir_proj <- file.path(derived_root, "TCGA", cancer)
+  dir.create(dir_proj, recursive = TRUE, showWarnings = FALSE)
+
+  kept <- n_with_age >= params$min_samples_with_age
+
+  if (kept) {
+    counts_sym <- sym_counts_from_rse(rse)
+
+    tcga_barcode <- if ("tcga.tcga_barcode" %in% colnames(colData(rse))) {
+      as.character(colData(rse)$tcga.tcga_barcode)
+    } else {
+      rep(NA_character_, ncol(rse))
+    }
+
+    metadata <- tibble::tibble(
+      sample_id         = colnames(rse),
+      cohort            = "TCGA",
+      project           = cancer,
+      age_years         = as.numeric(colData(rse)$age_years),
+      sex               = as.character(colData(rse)$sex),
+      sample_type       = sample_type,
+      tcga.tcga_barcode = tcga_barcode
+    )
+
+    saveRDS(counts_sym, file.path(dir_proj, "counts_sym.rds"))
+    saveRDS(metadata,   file.path(dir_proj, "sample_metadata.rds"))
+  }
+
+  tibble::tibble(
+    cohort        = "TCGA",
+    project       = cancer,
+    n_total       = n_total,
+    n_with_age    = n_with_age,
+    n_female      = n_female,
+    n_male        = n_male,
+    kept          = kept,
+    counts_file   = if (kept) file.path(dir_proj, "counts_sym.rds")    else NA_character_,
+    metadata_file = if (kept) file.path(dir_proj, "sample_metadata.rds") else NA_character_
+  )
+}
+
+tcga_manifest <- purrr::map_dfr(tcga_cancers, process_one_tcga)
+```
+
+## Sample inventory
+
+The two tables below list every project the pipeline considered, the number of samples retained after applying the primary-disease filter (TCGA) or default inclusion rules (GTEx), and the number of samples with non-missing chronological age.
+
+### GTEx
+
+```{r}
+gtex_display <- gtex_manifest %>%
+  dplyr::transmute(
+    Tissue     = project,
+    n_samples  = n_total,
+    n_with_age = n_with_age,
+    n_female   = n_female,
+    n_male     = n_male,
+    Retained   = kept
+  )
+
+reactable_pretty(gtex_display)
+```
+
+GTEx tissues retained for downstream analyses: **`r sum(gtex_manifest$kept)` of `r nrow(gtex_manifest)`**.
+
+### TCGA
+
+```{r}
+tcga_display <- tcga_manifest %>%
+  dplyr::transmute(
+    Cancer     = project,
+    n_samples  = n_total,
+    n_with_age = n_with_age,
+    n_female   = n_female,
+    n_male     = n_male,
+    Retained   = kept
+  )
+
+reactable_pretty(tcga_display)
+```
+
+TCGA cancers retained for downstream analyses: **`r sum(tcga_manifest$kept)` of `r nrow(tcga_manifest)`**.
+
+## Covariates available for Part 2 modeling
+
+Downstream Part 2 models (DESeq2 for gene-level age effects, sccomp for compositional age effects) use the covariates listed here. The same minimal-covariate framework is applied in both cohorts so that GTEx and TCGA results are directly comparable.
+
+```{r}
+covariate_summary <- tibble::tribble(
+  ~Covariate,           ~GTEx,                                   ~TCGA,                                       ~Use,
+  "Chronological age",  "Subject phenotype file (v10)",          "tcga.cgc_case_age_at_diagnosis",            "Primary predictor in all Part 2 models",
+  "Sex",                "Subject phenotype file (v10)",          "tcga.cgc_case_gender",                      "Adjusted for when both sexes are represented",
+  "Project / tissue",   "GTEx tissue label",                     "TCGA cancer code",                          "Stratification variable for per-project models"
+)
+
+reactable_pretty(covariate_summary)
+```
+
+Additional TCGA-only covariates such as tumor purity, grade, and stage are intentionally excluded from Part 2 modeling to preserve symmetric comparison with GTEx. Compositional confounding is addressed separately through cell-type deconvolution.
+
+## Age distribution across cohorts
+
+```{r, fig.width = 8, fig.height = 3.2}
+age_df <- dplyr::bind_rows(
+  gtex_manifest %>%
+    dplyr::filter(kept) %>%
+    purrr::pmap_dfr(function(metadata_file, ...) {
+      readRDS(metadata_file) %>% dplyr::select(age_years) %>% dplyr::mutate(Cohort = "GTEx")
+    }),
+  tcga_manifest %>%
+    dplyr::filter(kept) %>%
+    purrr::pmap_dfr(function(metadata_file, ...) {
+      readRDS(metadata_file) %>% dplyr::select(age_years) %>% dplyr::mutate(Cohort = "TCGA")
+    })
+) %>%
+  dplyr::filter(is.finite(age_years))
+
+ggplot(age_df, aes(x = age_years, fill = Cohort)) +
+  geom_histogram(bins = 30, alpha = 0.7, position = "identity") +
+  facet_wrap(~ Cohort, nrow = 1, scales = "free_y") +
+  scale_fill_manual(values = c(GTEx = "#4daf4a", TCGA = "#7b3294")) +
+  theme_minimal(base_size = 12) +
+  labs(
+    x = "Chronological age (years)",
+    y = "Number of samples",
+    fill = NULL
+  ) +
+  theme(legend.position = "none")
+```
+
+GTEx and TCGA cover overlapping but not identical age ranges. GTEx samples skew toward middle and older age (the donor population is post-mortem), while TCGA covers a wider span anchored on adult cancer onset.
+
+## Save manifest
+
+```{r}
+project_manifest <- dplyr::bind_rows(gtex_manifest, tcga_manifest) %>%
+  dplyr::arrange(cohort, project)
+
+saveRDS(
+  project_manifest,
+  file = file.path(derived_root, "project_manifest.rds")
+)
+
+utils::write.csv(
+  project_manifest,
+  file = file.path(tables_root, "part2_processing_manifest.csv"),
+  row.names = FALSE
+)
+
+msg("Saved processing outputs to: ", derived_root)
+```
+
+## Session info
+
+```{r}
+sessionInfo()
+```

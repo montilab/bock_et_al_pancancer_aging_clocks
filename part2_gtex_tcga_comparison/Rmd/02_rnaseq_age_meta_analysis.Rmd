@@ -1,0 +1,693 @@
+---
+title: "02 — Transcriptional age associations: per-project DESeq2 + meta-analysis"
+author: "Pan-cancer aging pipeline"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: united
+    code_folding: hide
+    toc: true
+    toc_float: true
+params:
+  processing_root: "results/derived/part2/01_processing"
+  out_root: "results/derived/part2/02_rnaseq_age"
+  tables_root: "results/tables/part2"
+  figures_root: "results/figures/part2/qc"
+  min_projects_meta: 10
+  fdr_threshold: 0.05
+  seed: 2026
+  verbose: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+## Overview
+
+This script loads the shared part-2 processing outputs and performs:
+
+1. per-tissue GTEx DESeq2 age models,
+2. per-cancer TCGA DESeq2 age models,
+3. random-effects meta-analysis within GTEx and within TCGA,
+4. Hallmark KS-test pathway enrichment on the meta results, and
+5. matched tissue/cancer Hallmark enrichment tables for figure generation.
+
+Per-project DESeq2 uses a light expression pre-filter (`rowSums(counts) >= 10`) and `independentFiltering = FALSE`, so every gene retains a statistic for the downstream meta-analysis and preranked enrichment rather than being dropped by per-project filtering. Effects are pooled with random-effects meta-analysis (metafor, REML). Hallmark enrichment uses the two-sided hypeR KS test: each pathway is tested against the up-ranked and down-ranked gene lists, and the more significant direction is reported. Sex is included as a covariate when both sexes have at least five samples; otherwise age is modeled alone (this threshold matches the cell-type script).
+
+Complex figure assembly is left to the figure Rmd.
+
+## Libraries
+
+```{r}
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(tibble)
+  library(metafor)
+  library(hypeR)
+  library(ggplot2)
+  library(reactable)
+  library(rlang)
+  library(here)
+})
+```
+
+## Paths + helpers
+
+```{r}
+set.seed(params$seed)
+
+processing_root <- here::here(params$processing_root)
+out_root        <- here::here(params$out_root)
+tables_root     <- here::here(params$tables_root)
+figures_root    <- here::here(params$figures_root)
+
+dir.create(out_root,    recursive = TRUE, showWarnings = FALSE)
+dir.create(tables_root, recursive = TRUE, showWarnings = FALSE)
+dir.create(figures_root, recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(out_root, "GTEx", "per_project"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(out_root, "TCGA", "per_project"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(out_root, "meta"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(out_root, "pathways"), recursive = TRUE, showWarnings = FALSE)
+
+msg <- function(...) {
+  if (isTRUE(params$verbose)) {
+    message(...)
+  }
+}
+
+reactable_pretty <- function(df) {
+  reactable::reactable(
+    df,
+    searchable = TRUE,
+    resizable = TRUE,
+    defaultPageSize = 10
+  )
+}
+```
+
+## Helper functions
+
+```{r}
+load_project_inputs <- function(cohort, project, processing_root) {
+  dir_proj <- file.path(processing_root, cohort, project)
+
+  counts_sym <- readRDS(file.path(dir_proj, "counts_sym.rds"))
+  metadata   <- readRDS(file.path(dir_proj, "sample_metadata.rds"))
+
+  metadata <- as.data.frame(metadata)
+  metadata <- metadata[match(colnames(counts_sym), metadata$sample_id), , drop = FALSE]
+
+  if (!identical(metadata$sample_id, colnames(counts_sym))) {
+    stop("Metadata rows do not align to count columns for ", cohort, " / ", project)
+  }
+
+  list(
+    counts_sym = counts_sym,
+    metadata   = metadata
+  )
+}
+
+# Decide whether to adjust for sex, using a minimum-per-sex threshold.
+# DELTA vs V1: V1 adjusted for sex whenever both sexes were present at all
+# (length(unique(sex)) > 1). Here we require at least `min_per_sex` of each.
+# An earlier audit confirmed this changes the design for zero projects in the
+# current data, so it is behaviorally identical here but more defensible and
+# consistent with the cell-type script.
+decide_design <- function(metadata, min_per_sex = 5) {
+  meta <- metadata[is.finite(metadata$age_years), , drop = FALSE]
+  sex_tab <- table(meta$sex)
+  use_sex <- length(sex_tab) >= 2 && all(sex_tab >= min_per_sex)
+  list(
+    use_sex      = use_sex,
+    design_label = if (use_sex) "~ sex + age_years" else "~ age_years",
+    n_samples    = nrow(meta)
+  )
+}
+
+# Per-project DESeq2 age model. Statistical settings match V1:
+#   - light pre-filter rowSums(counts) >= 10
+#   - round(counts) input
+#   - independentFiltering = FALSE
+# DELTAs vs V1: sex decision uses decide_design (min-5-per-sex); when sex is
+# used, NA-sex samples are dropped defensively so the design has no missing
+# values (V1 did not, which would error if such samples existed; the current
+# data has none, so results are unchanged).
+run_age_deseq <- function(counts_sym, metadata) {
+  keep_samples <- is.finite(metadata$age_years)
+  metadata   <- metadata[keep_samples, , drop = FALSE]
+  counts_sym <- counts_sym[, keep_samples, drop = FALSE]
+
+  dd <- decide_design(metadata)
+
+  if (dd$use_sex) {
+    sex_ok     <- !is.na(metadata$sex)
+    metadata   <- metadata[sex_ok, , drop = FALSE]
+    counts_sym <- counts_sym[, sex_ok, drop = FALSE]
+    metadata$sex   <- factor(metadata$sex)
+    design_formula <- stats::as.formula("~ sex + age_years")
+  } else {
+    design_formula <- stats::as.formula("~ age_years")
+  }
+
+  dds <- DESeq2::DESeqDataSetFromMatrix(
+    countData = round(counts_sym),
+    colData   = metadata,
+    design    = design_formula
+  )
+
+  keep_genes <- rowSums(DESeq2::counts(dds)) >= 10
+  dds <- dds[keep_genes, ]
+
+  dds <- DESeq2::DESeq(dds, quiet = TRUE)
+
+  res <- DESeq2::results(
+    dds,
+    name = "age_years",
+    independentFiltering = FALSE
+  )
+
+  res_df <- as.data.frame(res)
+  res_df$Feature <- rownames(res_df)
+  res_df
+}
+
+prepare_meta_input <- function(result_files, id_values, id_col) {
+  stopifnot(length(result_files) == length(id_values))
+
+  out <- purrr::map2_dfr(
+    result_files,
+    id_values,
+    function(f, id_value) {
+      x <- readRDS(f)
+      x[[id_col]] <- id_value
+      x
+    }
+  )
+
+  out %>%
+    dplyr::select(
+      Feature,
+      log2FoldChange,
+      lfcSE,
+      !!rlang::sym(id_col)
+    )
+}
+
+run_random_effects_meta <- function(combined_df, id_col, min_projects = 10) {
+  feature_counts <- combined_df %>%
+    dplyr::group_by(Feature) %>%
+    dplyr::summarise(
+      Count = dplyr::n_distinct(.data[[id_col]]),
+      .groups = "drop"
+    ) %>%
+    dplyr::filter(Count >= min_projects)
+
+  filtered_df <- combined_df %>%
+    dplyr::semi_join(feature_counts, by = "Feature")
+
+  meta_results <- list()
+  all_features <- unique(filtered_df$Feature)
+
+  for (feat in all_features) {
+    feat_data <- filtered_df %>%
+      dplyr::filter(Feature == feat) %>%
+      dplyr::filter(
+        is.finite(log2FoldChange),
+        is.finite(lfcSE),
+        lfcSE > 0
+      )
+
+    if (nrow(feat_data) < 2) {
+      next
+    }
+
+    fit <- tryCatch(
+      metafor::rma(
+        yi = log2FoldChange,
+        sei = lfcSE,
+        data = feat_data,
+        method = "REML"
+      ),
+      error = function(e) NULL
+    )
+
+    if (is.null(fit)) {
+      next
+    }
+
+    meta_results[[feat]] <- tibble::tibble(
+      Name  = feat,
+      Beta  = as.numeric(fit$beta),
+      SE    = as.numeric(fit$se),
+      pval  = as.numeric(fit$pval),
+      zval  = as.numeric(fit$zval),
+      ci.lb = as.numeric(fit$ci.lb),
+      ci.ub = as.numeric(fit$ci.ub),
+      k     = fit$k
+    )
+  }
+
+  meta_df <- dplyr::bind_rows(meta_results) %>%
+    dplyr::mutate(
+      fdr = stats::p.adjust(pval, method = "fdr"),
+      direction = dplyr::if_else(Beta > 0, "Up", "Down")
+    ) %>%
+    dplyr::arrange(fdr)
+
+  list(
+    meta_df = meta_df,
+    feature_counts = feature_counts
+  )
+}
+
+extract_multihyper_table <- function(mhype_obj, cohort_label) {
+  up_df <- mhype_obj$data$Upregulated$data %>%
+    dplyr::mutate(
+      direction = "Up",
+      signed_score = +score
+    ) %>%
+    dplyr::select(label, fdr, direction, score, signed_score)
+
+  down_df <- mhype_obj$data$Downregulated$data %>%
+    dplyr::mutate(
+      direction = "Down",
+      signed_score = -score
+    ) %>%
+    dplyr::select(label, fdr, direction, score, signed_score)
+
+  dplyr::bind_rows(up_df, down_df) %>%
+    dplyr::group_by(label) %>%
+    dplyr::slice_min(fdr, with_ties = FALSE) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(
+      Cohort = cohort_label,
+      Pathway = label
+    )
+}
+
+run_kstest_from_meta <- function(meta_df, genesets, genes_universe = NULL) {
+  stopifnot(all(c("Name", "zval") %in% colnames(meta_df)))
+
+  if (!is.null(genes_universe)) {
+    meta_df <- meta_df %>%
+      dplyr::filter(Name %in% genes_universe)
+  }
+
+  ranked_up <- meta_df %>%
+    dplyr::arrange(dplyr::desc(zval)) %>%
+    dplyr::pull(Name)
+
+  ranked_down <- meta_df %>%
+    dplyr::arrange(zval) %>%
+    dplyr::pull(Name)
+
+  hypeR::hypeR(
+    list(
+      Upregulated = ranked_up,
+      Downregulated = ranked_down
+    ),
+    genesets = genesets,
+    test = "kstest",
+    fdr = 1,
+    plotting = FALSE
+  )
+}
+
+run_kstest_from_deseq <- function(deseq_df, genesets, genes_universe = NULL) {
+  stopifnot(all(c("Feature", "stat") %in% colnames(deseq_df)))
+
+  if (!is.null(genes_universe)) {
+    deseq_df <- deseq_df %>%
+      dplyr::filter(Feature %in% genes_universe)
+  }
+
+  ranked_up <- deseq_df %>%
+    dplyr::arrange(dplyr::desc(stat)) %>%
+    dplyr::pull(Feature)
+
+  ranked_down <- deseq_df %>%
+    dplyr::arrange(stat) %>%
+    dplyr::pull(Feature)
+
+  hypeR::hypeR(
+    list(
+      Upregulated = ranked_up,
+      Downregulated = ranked_down
+    ),
+    genesets = genesets,
+    test = "kstest",
+    fdr = 1,
+    plotting = FALSE
+  )
+}
+```
+
+## Load processing manifest
+
+```{r}
+project_manifest <- readRDS(file.path(processing_root, "project_manifest.rds"))
+
+gtex_manifest <- project_manifest %>%
+  dplyr::filter(cohort == "GTEx", kept)
+
+tcga_manifest <- project_manifest %>%
+  dplyr::filter(cohort == "TCGA", kept)
+```
+
+GTEx tissues to model: `r nrow(gtex_manifest)`. TCGA cancers to model: `r nrow(tcga_manifest)`.
+
+## Shared within-cohort gene universes
+
+```{r}
+gtex_gene_universe <- Reduce(
+  intersect,
+  purrr::map(gtex_manifest$counts_file, ~ rownames(readRDS(.x)))
+)
+
+tcga_gene_universe <- Reduce(
+  intersect,
+  purrr::map(tcga_manifest$counts_file, ~ rownames(readRDS(.x)))
+)
+
+saveRDS(gtex_gene_universe, file.path(out_root, "meta", "gtex_gene_universe.rds"))
+saveRDS(tcga_gene_universe, file.path(out_root, "meta", "tcga_gene_universe.rds"))
+```
+
+GTEx gene universe: `r length(gtex_gene_universe)`. TCGA gene universe: `r length(tcga_gene_universe)`.
+
+## Per-project GTEx DESeq2 age models
+
+Per-project fits are cached. On rerun, an existing fit is loaded rather than recomputed; delete the corresponding file to force a refit.
+
+```{r}
+gtex_result_files <- character(nrow(gtex_manifest))
+names(gtex_result_files) <- gtex_manifest$project
+gtex_design_info <- vector("list", nrow(gtex_manifest))
+
+for (i in seq_len(nrow(gtex_manifest))) {
+  tissue   <- gtex_manifest$project[i]
+  out_file <- file.path(out_root, "GTEx", "per_project", paste0("GTEx-", tissue, "_DESeq2_age.rds"))
+
+  x <- load_project_inputs("GTEx", tissue, processing_root)
+  counts_sym <- x$counts_sym[gtex_gene_universe, , drop = FALSE]
+  metadata   <- x$metadata
+
+  dd <- decide_design(metadata)
+  gtex_design_info[[i]] <- tibble::tibble(
+    Cohort = "GTEx", Project = tissue,
+    n_samples = dd$n_samples, Design = dd$design_label
+  )
+
+  if (file.exists(out_file)) {
+    msg("Cached GTEx: ", tissue)
+  } else {
+    msg("Fitting GTEx DESeq2 age model: ", tissue)
+    res_df <- run_age_deseq(counts_sym, metadata)
+    saveRDS(res_df, out_file)
+  }
+
+  gtex_result_files[tissue] <- out_file
+}
+
+saveRDS(gtex_result_files, file.path(out_root, "GTEx", "per_project", "gtex_result_manifest.rds"))
+```
+
+## Per-project TCGA DESeq2 age models
+
+```{r}
+tcga_result_files <- character(nrow(tcga_manifest))
+names(tcga_result_files) <- tcga_manifest$project
+tcga_design_info <- vector("list", nrow(tcga_manifest))
+
+for (i in seq_len(nrow(tcga_manifest))) {
+  cancer   <- tcga_manifest$project[i]
+  out_file <- file.path(out_root, "TCGA", "per_project", paste0("TCGA-", cancer, "_DESeq2_age.rds"))
+
+  x <- load_project_inputs("TCGA", cancer, processing_root)
+  counts_sym <- x$counts_sym[tcga_gene_universe, , drop = FALSE]
+  metadata   <- x$metadata
+
+  dd <- decide_design(metadata)
+  tcga_design_info[[i]] <- tibble::tibble(
+    Cohort = "TCGA", Project = cancer,
+    n_samples = dd$n_samples, Design = dd$design_label
+  )
+
+  if (file.exists(out_file)) {
+    msg("Cached TCGA: ", cancer)
+  } else {
+    msg("Fitting TCGA DESeq2 age model: ", cancer)
+    res_df <- run_age_deseq(counts_sym, metadata)
+    saveRDS(res_df, out_file)
+  }
+
+  tcga_result_files[cancer] <- out_file
+}
+
+saveRDS(tcga_result_files, file.path(out_root, "TCGA", "per_project", "tcga_result_manifest.rds"))
+```
+
+## Meta-analysis within GTEx and within TCGA
+
+```{r}
+gtex_combined <- prepare_meta_input(
+  result_files = unname(gtex_result_files),
+  id_values = names(gtex_result_files),
+  id_col = "Tissue"
+)
+
+tcga_combined <- prepare_meta_input(
+  result_files = unname(tcga_result_files),
+  id_values = names(tcga_result_files),
+  id_col = "Cancer"
+)
+
+gtex_meta_out <- run_random_effects_meta(
+  combined_df = gtex_combined,
+  id_col = "Tissue",
+  min_projects = params$min_projects_meta
+)
+
+tcga_meta_out <- run_random_effects_meta(
+  combined_df = tcga_combined,
+  id_col = "Cancer",
+  min_projects = params$min_projects_meta
+)
+
+meta_gtex_df <- gtex_meta_out$meta_df
+meta_tcga_df <- tcga_meta_out$meta_df
+```
+
+GTEx meta: `r nrow(meta_gtex_df)` genes tested in >= `r params$min_projects_meta` tissues, `r sum(meta_gtex_df$fdr < params$fdr_threshold, na.rm = TRUE)` significant at FDR < `r params$fdr_threshold`. TCGA meta: `r nrow(meta_tcga_df)` genes tested in >= `r params$min_projects_meta` cancers, `r sum(meta_tcga_df$fdr < params$fdr_threshold, na.rm = TRUE)` significant at FDR < `r params$fdr_threshold`.
+
+## Save gene-level meta results
+
+```{r}
+saveRDS(meta_gtex_df, file.path(out_root, "meta", "GTEx_meta_RNAseq_results_DESeq2_age.rds"))
+saveRDS(meta_tcga_df, file.path(out_root, "meta", "TCGA_meta_RNAseq_results_DESeq2_age.rds"))
+
+utils::write.csv(
+  meta_gtex_df,
+  file = file.path(tables_root, "GTEx_meta_RNAseq_results_DESeq2_age.csv"),
+  row.names = FALSE
+)
+
+utils::write.csv(
+  meta_tcga_df,
+  file = file.path(tables_root, "TCGA_meta_RNAseq_results_DESeq2_age.csv"),
+  row.names = FALSE
+)
+```
+
+## Meta-level Hallmark KS-test enrichment
+
+```{r}
+hallmark_sets <- hypeR::msigdb_gsets("Homo sapiens", "H", clean = TRUE)
+
+common_meta_genes <- intersect(meta_gtex_df$Name, meta_tcga_df$Name)
+
+gtex_hype_meta <- run_kstest_from_meta(
+  meta_df = meta_gtex_df,
+  genesets = hallmark_sets,
+  genes_universe = common_meta_genes
+)
+
+tcga_hype_meta <- run_kstest_from_meta(
+  meta_df = meta_tcga_df,
+  genesets = hallmark_sets,
+  genes_universe = common_meta_genes
+)
+
+saveRDS(gtex_hype_meta, file.path(out_root, "pathways", "GTEx_meta_hallmark_kstest.rds"))
+saveRDS(tcga_hype_meta, file.path(out_root, "pathways", "TCGA_meta_hallmark_kstest.rds"))
+
+pathway_meta_long <- dplyr::bind_rows(
+  extract_multihyper_table(gtex_hype_meta, "GTEx"),
+  extract_multihyper_table(tcga_hype_meta, "TCGA")
+)
+
+saveRDS(pathway_meta_long, file.path(out_root, "pathways", "pathway_meta_long.rds"))
+utils::write.csv(
+  pathway_meta_long,
+  file = file.path(tables_root, "pathway_meta_long.csv"),
+  row.names = FALSE
+)
+```
+
+## Matched tissue/cancer Hallmark results for figure panels
+
+Each TCGA cancer is paired to its GTEx tissue of origin. For each pair, the two-sided KS-test enrichment is run within each cohort using the intersection of that pair's gene universes as background. The matched-tissue analysis is the analytical core of the tissue-anchored figure.
+
+```{r}
+matched_sets <- list(
+  BREAST = list(GTEx = "BREAST", TCGA = c("BRCA")),
+  LUNG   = list(GTEx = "LUNG",   TCGA = c("LUAD", "LUSC")),
+  BRAIN  = list(GTEx = "BRAIN",  TCGA = c("GBM", "LGG")),
+  COLON  = list(GTEx = "COLON",  TCGA = c("COAD"))
+)
+
+matched_pair_summary <- purrr::imap_dfr(matched_sets, function(spec, tissue) {
+  tibble::tibble(
+    Tissue       = tissue,
+    GTEx_project = spec$GTEx,
+    TCGA_cancers = paste(spec$TCGA, collapse = ", ")
+  )
+})
+
+reactable_pretty(matched_pair_summary)
+```
+
+```{r}
+matched_pathway_long <- purrr::map_dfr(
+  names(matched_sets),
+  function(tissue_name) {
+    gtex_tissue  <- matched_sets[[tissue_name]]$GTEx
+    tcga_cancers <- matched_sets[[tissue_name]]$TCGA
+
+    if (!gtex_tissue %in% names(gtex_result_files)) {
+      warning("Skipping matched set ", tissue_name, ": GTEx tissue missing.")
+      return(NULL)
+    }
+
+    gtex_deseq <- readRDS(gtex_result_files[[gtex_tissue]])
+
+    purrr::map_dfr(
+      tcga_cancers,
+      function(cancer) {
+        if (!cancer %in% names(tcga_result_files)) {
+          warning("Skipping matched pair ", tissue_name, " / ", cancer, ": TCGA cancer missing.")
+          return(NULL)
+        }
+
+        tcga_deseq <- readRDS(tcga_result_files[[cancer]])
+        gene_universe <- intersect(gtex_deseq$Feature, tcga_deseq$Feature)
+
+        gtex_hype <- run_kstest_from_deseq(
+          deseq_df = gtex_deseq,
+          genesets = hallmark_sets,
+          genes_universe = gene_universe
+        )
+
+        tcga_hype <- run_kstest_from_deseq(
+          deseq_df = tcga_deseq,
+          genesets = hallmark_sets,
+          genes_universe = gene_universe
+        )
+
+        dplyr::bind_rows(
+          extract_multihyper_table(gtex_hype, paste0("GTEx-", tissue_name)),
+          extract_multihyper_table(tcga_hype, cancer)
+        ) %>%
+          dplyr::mutate(Tissue = tissue_name)
+      }
+    )
+  }
+)
+
+saveRDS(matched_pathway_long, file.path(out_root, "pathways", "pathway_matched_long.rds"))
+utils::write.csv(
+  matched_pathway_long,
+  file = file.path(tables_root, "pathway_matched_long.csv"),
+  row.names = FALSE
+)
+```
+
+## Per-project run summary
+
+Every project that was fit, the design that was used (showing where sex was adjusted for), the number of genes tested after the light expression filter, and the number of age-associated genes by direction at FDR < `r params$fdr_threshold`.
+
+```{r}
+design_info <- dplyr::bind_rows(gtex_design_info, tcga_design_info)
+
+summarize_one <- function(result_file, cohort, project) {
+  res <- readRDS(result_file)
+  tibble::tibble(
+    Cohort = cohort,
+    Project = project,
+    n_genes_tested = nrow(res),
+    n_FDR_up   = sum(res$padj < params$fdr_threshold & res$log2FoldChange > 0, na.rm = TRUE),
+    n_FDR_down = sum(res$padj < params$fdr_threshold & res$log2FoldChange < 0, na.rm = TRUE)
+  )
+}
+
+per_project_summary <- dplyr::bind_rows(
+  purrr::imap_dfr(gtex_result_files, ~ summarize_one(.x, "GTEx", .y)),
+  purrr::imap_dfr(tcga_result_files, ~ summarize_one(.x, "TCGA", .y))
+) %>%
+  dplyr::left_join(design_info, by = c("Cohort", "Project")) %>%
+  dplyr::select(Cohort, Project, n_samples, Design, n_genes_tested, n_FDR_up, n_FDR_down) %>%
+  dplyr::arrange(Cohort, Project)
+
+reactable_pretty(per_project_summary)
+
+utils::write.csv(
+  per_project_summary,
+  file = file.path(tables_root, "part2_rnaseq_per_project_summary.csv"),
+  row.names = FALSE
+)
+```
+
+## Per-project age-association strength
+
+A quick QC view of how many genes reached FDR < `r params$fdr_threshold` in each project. Projects with very few significant genes are typically underpowered or have unusually low age signal, and should be interpreted cautiously in downstream summaries.
+
+```{r, fig.width = 8.5, fig.height = 5}
+plot_df <- per_project_summary %>%
+  dplyr::mutate(
+    n_FDR_total = n_FDR_up + n_FDR_down,
+    Project = factor(Project, levels = Project[order(n_FDR_total)])
+  )
+
+ggplot(plot_df, aes(x = n_FDR_total, y = Project, fill = Cohort)) +
+  geom_col() +
+  facet_wrap(~ Cohort, scales = "free_y") +
+  scale_fill_manual(values = c(GTEx = "#4daf4a", TCGA = "#7b3294")) +
+  theme_minimal(base_size = 11) +
+  labs(
+    x = paste0("Genes with FDR < ", params$fdr_threshold),
+    y = NULL,
+    fill = NULL
+  ) +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(face = "bold")
+  )
+
+ggsave(file.path(figures_root, "per_project_fdr_counts.pdf"),
+       width = 8.5, height = 5, units = "in")
+message("Saved: per_project_fdr_counts.pdf")
+```
+
+## Session info
+
+```{r}
+sessionInfo()
+```

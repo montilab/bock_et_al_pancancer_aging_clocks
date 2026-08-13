@@ -1,0 +1,397 @@
+---
+title: "03_GISTIC_EDA.Rmd"
+author: "Pranav Narnur - Monti Lab"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: united
+    css: themes/style.css
+    code_folding: hide
+    toc: true
+    toc_float:
+      collapsed: true
+      smooth_scroll: true
+    toc_depth: 3
+    df_print: paged
+params:
+  cancer_type: "TCGA-BLCA"
+  include_gender: TRUE
+  include_race: TRUE
+  races_included: "asian, black or african american, white"
+  include_subtype: FALSE
+  include_HPV_status: FALSE
+  include_grade: TRUE
+  grades_included: "High Grade, Low Grade"
+  include_purity: TRUE
+---
+
+# `r if (!is.null(params$cancer_type)) paste(params$cancer_type)`
+
+```{r, setup, include = FALSE}
+set.seed(1)
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE,
+                      dev = "ragg_png", dpi = 300)
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(maftools)
+library(tidyverse)
+library(biomaRt)
+library(data.table)
+library(DT)
+library(kableExtra)
+library(reshape2)
+library(reactable)
+library(htmlwidgets)
+
+DATA_ROOT <- "/restricted/projectnb/agedisease/projects/pancancer_aging/TCGA-GDC/scna/GISTIC"
+SCRIPT_ROOT <- "/restricted/projectnb/agedisease/projects/pancancer_aging/scripts/scna_pn"
+```
+
+```{r params}
+selected_cancer_type <- params$cancer_type
+include_gender <- params$include_gender
+include_race <- params$include_race
+include_HPV_status <- params$include_HPV_status
+include_subtype <- params$include_subtype
+include_grade <- params$include_grade
+include_purity <- params$include_purity
+
+races_included <- params$races_included
+if (length(races_included) == 1 && !is.na(races_included) && grepl(",", races_included)) {
+  races_included <- trimws(strsplit(races_included, ",")[[1]])
+}
+
+grades_included <- params$grades_included
+if (length(grades_included) == 1 && !is.na(grades_included) && grepl(",", grades_included)) {
+  grades_included <- trimws(strsplit(grades_included, ",")[[1]])
+}
+```
+
+```{r projects to download}
+path_unfiltered_SE <- file.path(DATA_ROOT, "processed_data")
+path_filtered_SE <- file.path(DATA_ROOT, "processed_data", "filtered")
+
+dir.create(path_filtered_SE, recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r helpers}
+source(file.path(SCRIPT_ROOT, "utils.r"))
+```
+
+This script performs exploratory data analysis and filtering on GISTIC SCNA data for `r selected_cancer_type`. The filtering steps are dynamically applied based on the covariate parameters.
+
+Model covariates for this cancer type:
+
+Gender: `r include_gender`
+Race: `r include_race`
+Subtype: `r include_subtype`
+HPV Status: `r include_HPV_status`
+Grade: `r include_grade`
+Purity: `r include_purity`
+
+# Load SE (segment-level)
+
+Segment-level and gene-level colData are identical. We load both SummarizedExperiment objects and apply identical filtering to maintain consistency.
+
+```{r load_data}
+se <- readRDS(file.path(path_unfiltered_SE, paste0(selected_cancer_type, "_SCNA_GISTIC_segment.rds")))
+se_gene_level <- readRDS(file.path(path_unfiltered_SE, paste0(selected_cancer_type, "_SCNA_GISTIC_gene.rds")))
+
+testthat::expect_true(all(colnames(se_gene_level) == colnames(se)))
+
+cat("Initial number of samples:", ncol(se), "\n")
+cat("Initial number of segments:", nrow(se), "\n")
+cat("Initial number of genes:", nrow(se_gene_level), "\n")
+
+initial_num_of_samples <- ncol(se)
+
+if (ncol(se) == 0) {
+  stop(paste0("No samples remain for ", selected_cancer_type, " after loading. Check input data."))
+}
+```
+
+Gene-level frequency threshold used for `r selected_cancer_type` is `r cat("Frequency threshold used:", metadata(se_gene_level)$frequency_threshold, "%\n")`
+
+# Filtering Steps
+
+## Filter 1: Remove Missing Age
+
+This filter is applied for every cancer type.
+
+```{r remove_missing_age}
+cat("Samples with missing age:", sum(is.na(colData(se)$Age)), "\n")
+se <- se[, !is.na(colData(se)$Age)]
+se_gene_level <- se_gene_level[, !is.na(colData(se_gene_level)$Age)]
+cat("After filtering age:", ncol(se), "\n")
+```
+
+## Filter 2a: Keep Only HPV-Negative Samples (HNSC only)
+
+This filter is only applied when `cancer_type = TCGA-HNSC` and `include_HPV_status = TRUE`.
+
+```{r filter_hpv}
+if (selected_cancer_type == "TCGA-HNSC" && include_HPV_status == TRUE) {
+  cat("HPV status distribution BEFORE filtering:\n")
+  print(table(colData(se)$HPV.status, useNA = "always"))
+
+  se <- se[, !is.na(colData(se)$HPV.status) & colData(se)$HPV.status == "Negative"]
+  se_gene_level <- se_gene_level[, !is.na(colData(se_gene_level)$HPV.status) & colData(se_gene_level)$HPV.status == "Negative"]
+
+  cat("Samples remaining after filtering HPV-negative:", ncol(se), "\n")
+}
+```
+
+## Filter 2b: Remove Samples with Missing Subtype
+
+This filter is applied when `include_subtype = TRUE`.
+
+```{r filter_subtype}
+if (include_subtype == TRUE) {
+  cat("Samples with missing subtype:", sum(is.na(colData(se)$subtype_selected)), "\n")
+  se <- se[, !is.na(colData(se)$subtype_selected)]
+  se_gene_level <- se_gene_level[, !is.na(colData(se_gene_level)$subtype_selected)]
+  cat("Samples remaining after filtering missing subtype:", ncol(se), "\n")
+}
+```
+
+## Filter 3: If purity is a covariate type, remove tumors with missing purity
+
+Otherwise this step is skipped.
+
+```{r filter_purity}
+if (include_purity == TRUE) {
+  se <- se[, !is.na(colData(se)$purity)]
+  se_gene_level <- se_gene_level[, !is.na(colData(se_gene_level)$purity)]
+  cat("\nAfter purity filtering:", ncol(se), "\n")
+}
+```
+
+
+## Filter 4: Remove missing grade and keep only grade factor levels indicated in covariates rds
+
+```{r filter_grade}
+if (include_grade == TRUE) {
+  cat("\nRecoded grade distribution BEFORE removing NAs:\n")
+  print(table(colData(se)$grade, useNA = "always"))
+
+  se <- se[, !is.na(colData(se)$grade)]
+  se_gene_level <- se_gene_level[, !is.na(colData(se_gene_level)$grade)]
+
+  se <- se[, colData(se)$grade %in% grades_included]
+  se_gene_level <- se_gene_level[, colData(se_gene_level)$grade %in% grades_included]
+
+  cat("\nAfter grade filtering:", ncol(se), "\n")
+  print(table(colData(se)$grade, useNA = "always"))
+}
+```
+
+
+## Filter 5: Recode "Not Reported" to NA and Remove Race NAs and keep only race factor levels indicated in covariates rds
+
+```{r filter_race}
+if (include_race == TRUE) {
+  cat("Race distribution BEFORE filtering:\n")
+  print(table(colData(se)$race, useNA = "always"))
+
+  coldata <- colData(se) %>% as.data.frame()
+  coldata_gene <- colData(se_gene_level) %>% as.data.frame()
+
+  coldata$race <- if_else(coldata$race == "not reported", NA_character_, coldata$race)
+  coldata_gene$race <- if_else(coldata_gene$race == "not reported", NA_character_, coldata_gene$race)
+
+  se <- SummarizedExperiment(
+    assays = assays(se),
+    rowData = rowData(se),
+    colData = coldata
+  )
+  se_gene_level <- SummarizedExperiment(
+    assays = assays(se_gene_level),
+    rowData = rowData(se_gene_level),
+    colData = coldata_gene
+  )
+
+  cat("\nRace distribution AFTER recoding 'not reported' to NA:\n")
+  print(table(colData(se)$race, useNA = "always"))
+
+  se <- se[, !is.na(colData(se)$race)]
+  se_gene_level <- se_gene_level[, !is.na(colData(se_gene_level)$race)]
+
+  cat("\nRace distribution AFTER removing NAs:\n")
+  print(table(colData(se)$race, useNA = "always"))
+
+  se <- se[, colData(se)$race %in% races_included]
+  se_gene_level <- se_gene_level[, colData(se_gene_level)$race %in% races_included]
+
+  cat("\nRace distribution AFTER keeping only specified races:\n")
+  print(table(colData(se)$race, useNA = "always"))
+}
+
+cat("\nFinal samples after all filters:", ncol(se), "\n")
+
+if (ncol(se) == 0) {
+  stop(paste0("No samples remain for ", selected_cancer_type, " after filtering. Check covariate parameters."))
+}
+
+final_num_of_samples <- ncol(se)
+
+if ((final_num_of_samples / initial_num_of_samples) < 0.7) {
+  stop(paste0("More than 30% of initial samples were removed for ", selected_cancer_type, " after filtering. Please check metadata and covariate selection carefully before proceeding."))
+}
+
+testthat::expect_true(all(colnames(se) == colnames(se_gene_level)))
+```
+
+# Filter 6: Gender
+
+```{r}
+if (include_gender == TRUE) {
+  cat("Samples with missing gender:", sum(is.na(colData(se)$gender)), "\n")
+  se <- se[, !is.na(colData(se)$gender)]
+  se_gene_level <- se_gene_level[, !is.na(colData(se_gene_level)$gender)]
+  cat("After filtering gender:", ncol(se), "\n")
+}
+```
+
+# SE rowdata EDA {.tabset}
+
+## Display GISTIC value frequencies
+
+```{r view_GISTIC}
+cna_levels <- c("0", "1", "2")
+mat <- assay(se)
+rowdata <- as.data.frame(rowData(se))
+cna_counts <- t(apply(mat, 1, function(x) table(factor(x, levels = cna_levels))))
+cna_counts_by_sample <- rowSums(cna_counts[, c("1", "2")])
+data.frame(rowdata[, 1], cna_counts) %>%
+  remove_rownames() %>%
+  dplyr::rename(Segment = "rowdata...1.", `0` = "X0", `1` = "X1", `2` = "X2") %>%
+  reactable_pretty()
+```
+
+## Top 20 segments altered in the most samples
+
+```{r top_20}
+cna_counts_by_sample %>%
+  sort(decreasing = T) %>%
+  head(20)
+```
+
+## Top 20 segments altered in the fewest samples
+
+```{r bottom_20}
+cna_counts_by_sample %>%
+  sort(decreasing = T) %>%
+  tail(20)
+```
+
+# SE coldata EDA {.tabset}
+
+## Age distribution (all samples)
+
+```{r age_distribution}
+ggplot(colData(se), aes(x = Age)) +
+  geom_histogram(bins = 30, fill = "#4271AE", color = "#1F3552") +
+  ggtitle(paste("Histogram of Age at Index -", selected_cancer_type)) +
+  xlab("Age at index") +
+  ylab("Frequency") +
+  theme_minimal()
+```
+
+## Missing value counts per variable
+
+```{r missing_value_counts}
+covariates <- c()
+if (include_gender) covariates <- c(covariates, "gender")
+if (include_race) covariates <- c(covariates, "race")
+if (include_subtype) covariates <- c(covariates, "subtype_selected")
+if (include_HPV_status) covariates <- c(covariates, "HPV.status")
+if (include_grade) covariates <- c(covariates, "grade")
+if (include_purity) covariates <- c(covariates, "purity")
+
+available_covariates <- covariates[covariates %in% names(colData(se))]
+cov_data <- as.data.frame(colData(se)[, c("Age", available_covariates)])
+
+missing_summary <- cov_data %>%
+  dplyr::summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  tidyr::pivot_longer(everything(), names_to = "variable", values_to = "n_missing") %>%
+  dplyr::mutate(pct_missing = n_missing / nrow(cov_data) * 100)
+
+print(missing_summary)
+```
+
+## Age distribution over categorical covariate levels
+
+```{r age_vs_categorical_covariates}
+discrete_vars <- c()
+if (include_gender) discrete_vars <- c(discrete_vars, "gender")
+if (include_race) discrete_vars <- c(discrete_vars, "race")
+if (include_subtype) discrete_vars <- c(discrete_vars, "subtype_selected")
+if (include_HPV_status) discrete_vars <- c(discrete_vars, "HPV.status")
+if (include_grade) discrete_vars <- c(discrete_vars, "grade")
+
+if (length(discrete_vars) > 0) {
+  discrete_vars <- discrete_vars[discrete_vars %in% names(cov_data)]
+
+  if (length(discrete_vars) > 0) {
+    plot_data <- cov_data %>%
+      tidyr::pivot_longer(all_of(discrete_vars), names_to = "name", values_to = "value") %>%
+      dplyr::filter(!is.na(value), !is.na(Age))
+
+    if (nrow(plot_data) > 0 && length(unique(plot_data$name)) > 0) {
+      count_labels <- plot_data %>%
+        dplyr::group_by(name, value) %>%
+        dplyr::summarise(n = n(), .groups = "drop")
+
+      p <- plot_data %>%
+        ggplot(aes(x = value, y = Age)) +
+        geom_boxplot() +
+        geom_text(
+          data = count_labels, aes(label = paste0("n=", n), y = Inf),
+          vjust = 1.5, size = 3
+        ) +
+        ggplot2::facet_wrap(~name, scales = "free_x") +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+      print(p)
+    } else {
+      cat("No non-NA values in discrete covariates after filtering.\n")
+    }
+  } else {
+    cat("Selected discrete covariates not found in data.\n")
+  }
+} else {
+  cat("No discrete covariates selected.\n")
+}
+```
+
+## Age distribution vs continuous covariates
+
+```{r age_vs_continuous_covariates}
+if (include_purity == TRUE && "purity" %in% names(cov_data)) {
+  n_missing_purity <- sum(is.na(cov_data$purity))
+
+  p <- ggplot(cov_data, aes(x = purity, y = Age)) +
+    geom_point(alpha = 0.3) +
+    geom_smooth(method = "lm", se = TRUE, color = "blue") +
+    labs(caption = paste0("n_missing = ", n_missing_purity)) +
+    theme_bw()
+
+  print(p)
+} else {
+  cat("No continuous covariates selected (purity not included or not available).\n")
+}
+```
+
+```{r save_filtered_RDS}
+saveRDS(se, file.path(path_filtered_SE, paste0(selected_cancer_type, "_SCNA_GISTIC_segment.rds")))
+cat(
+  "\n Saved final filtered SE to:",
+  file.path(path_filtered_SE, paste0(selected_cancer_type, "_SCNA_GISTIC_segment.rds")), "\n"
+)
+
+saveRDS(se_gene_level, file.path(path_filtered_SE, paste0(selected_cancer_type, "_SCNA_GISTIC_gene.rds")))
+cat(
+  "\n Saved final filtered SE to:",
+  file.path(path_filtered_SE, paste0(selected_cancer_type, "_SCNA_GISTIC_gene.rds")), "\n"
+)
+```
