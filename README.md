@@ -38,7 +38,7 @@ Figure panels are written as individual PDFs and assembled in Adobe Illustrator.
 
 ## Data
 
-No data are included. Sources: GTEx and TCGA expression via recount3, GTEx donor ages via dbGaP under controlled access, TCGA molecular data from the NCI Genomic Data Commons, copy number from Broad Firehose GISTIC, clinical and survival data from the TCGA Pan-Cancer Clinical Data Resource, SCAN-B from the Gene Expression Omnibus, METABRIC from cBioPortal, Hallmark gene sets from MSigDB.
+No data are included. Sources: GTEx and TCGA expression via recount3, GTEx donor ages via dbGaP under controlled access, TCGA molecular data from the NCI Genomic Data Commons, copy number from Broad Firehose GISTIC, clinical and survival data from the TCGA Pan-Cancer Clinical Data Resource, SCAN-B from SCAN-B from Mendeley Data (Staaf et al. 2022), METABRIC from cBioPortal, Hallmark gene sets from MSigDB.
 
 This pipeline cannot be run from a clone. It requires controlled-access donor ages, several hundred gigabytes of expression data, and a compute cluster. Paths are set through `params` in each script.
 
