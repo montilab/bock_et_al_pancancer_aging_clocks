@@ -1,5 +1,5 @@
 ---
-title: "01 — Processing: GTEx + TCGA → logCPM + Hallmark ssGSEA"
+title: "Processing: GTEx + TCGA → logCPM + Hallmark ssGSEA"
 author: "Pan-can aging pipeline"
 date: "`r format(Sys.Date(), '%B %d, %Y')`"
 output:
