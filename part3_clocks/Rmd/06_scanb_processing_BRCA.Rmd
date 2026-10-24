@@ -1,5 +1,5 @@
 ---
-title: "Supplementary analyses — SCAN-B verification of the BRCA aging clock"
+title: "SCAN-B processing: Hallmark ssGSEA and inputs for the breast figure scripts"
 author: "Pan-cancer aging project"
 date: "`r format(Sys.Date(), '%B %d, %Y')`"
 output:
@@ -33,7 +33,8 @@ params:
   # Figure output directory (DO NOT WRITE unless save_figures = TRUE)
   # ---------------------------
   fig_dir: "/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/manuscript_analyses/results/figures/supplemental"
-  save_figures: true
+  save_figures: false
+  save_inputs: false    # write scanb_pathway_inputs.rds and the RFi results table; FALSE re-knits without overwriting
 
   # ---------------------------
   # Rmd behavior
@@ -43,20 +44,27 @@ params:
 ---
 
 <!--
-This Rmd is a *template* for SCAN-B verification of the BRCA GTEx-trained clock.
+SCAN-B processing for the breast clock analyses.
 
-Per your request:
-  - Everything runs by default (params$eval_default = TRUE).
-  - Figure saving is enabled by default (params$save_figures = TRUE).
-  - Each plot has its own dedicated chunk so you can promote/demote plots for the supplement
-    (set eval=TRUE or comment out).
+The output of this script that the manuscript depends on is
+scanb_pathway_inputs.rds, written in the final section: the SCAN-B Hallmark
+ssGSEA matrix and tidied sample data (age, PAM50, survival endpoints). The
+breast deviation and survival figure scripts read that file rather than
+re-running SCAN-B preprocessing.
 
-Focus is on reproducing Figure 3-style panels from fig3_BRCA_deep_dive:
-  - processing (SCAN-B -> ssGSEA Hallmark)
-  - applying the BRCA clock
-  - calibration / GTEx anchoring
-  - ClockSHAP explanations
-  - survival analyses (aligned to the “03” logic, adapted for SCAN-B endpoints)
+Sections:
+  - SCAN-B processing: best replicate per sample, invasive primary tumors,
+    counts -> logCPM -> Hallmark ssGSEA
+  - Application of the GTEx-trained breast clock and ClockSHAP to SCAN-B
+  - Exploratory panels: PCA, anchored age, deviation by PAM50, waterfall,
+    heatmap, coupling, and SCAN-B survival. These were used to verify the
+    replication while the analysis was developed. None of them appear in the
+    manuscript as produced here; the manuscript's SCAN-B panels come from the
+    figure scripts, which read the saved inputs.
+  - Save of scanb_pathway_inputs.rds
+
+Some panels may not appear in the published manuscript. Panels are assembled and
+typeset in Adobe Illustrator to produce the final figure.
 -->
 
 ```{r setup, include=FALSE}
@@ -120,7 +128,7 @@ FIG_DIR <- params$fig_dir
 stopifnot(file.exists(clock_rds), file.exists(metadata_rds), file.exists(scores_gtex_rds))
 ```
 
-## Load official BRCA (GTEx-trained) clock objects (Steps 02–04)
+## Load official BRCA (GTEx-trained) clock objects (clock and ClockSHAP steps)
 
 ```{r}
 clock_results <- readRDS(clock_rds)
@@ -130,7 +138,7 @@ scores_gtex   <- readRDS(scores_gtex_rds)
 scores_nt <- if (file.exists(scores_nt_rds)) readRDS(scores_nt_rds) else NULL
 scores_pt <- if (file.exists(scores_pt_rds)) readRDS(scores_pt_rds) else NULL
 
-# Prefer Step-04 ClockSHAP bundle if available (contains clock + reference)
+# Prefer the saved ClockSHAP bundle if available (contains clock + reference)
 clockshap_bundle <- if (file.exists(clockshap_rds)) readRDS(clockshap_rds) else NULL
 
 feat <- clock_results$feature_names
@@ -156,7 +164,7 @@ c(beta0 = beta0, beta1 = beta1, n_gtex = length(pred_gtex))
 
 ## SCAN-B processing (counts → logCPM → Hallmark ssGSEA)
 
-This block mirrors the SCAN-B processing logic used in your original validation script (05_SCANB_Validation_PC), but is kept minimal and scoped to what is needed for Fig 3-style plots.
+This block processes SCAN-B from the raw SummarizedExperiment, kept minimal and scoped to what the clock and ClockSHAP need.
 
 ```{r}
 # 0) Hallmark gene sets (same naming convention as pipeline steps)
@@ -240,7 +248,7 @@ scanb <- readRDS(params$scanb_se_rds)
 cd <- as.data.frame(SummarizedExperiment::colData(scanb))
 cd$run_id <- rownames(cd)
 
-# Best replicate: highest ALIGNED_PAIRS per Sample (same as 05 script)
+# Best replicate: highest ALIGNED_PAIRS per Sample
 best_replicates <- cd |>
   dplyr::group_by(Sample) |>
   dplyr::slice_max(order_by = ALIGNED_PAIRS, n = 1, with_ties = FALSE) |>
@@ -305,7 +313,7 @@ scanb_pred_df <- tibble::tibble(
 ) %>%
   dplyr::filter(is.finite(age_years), is.finite(predicted)) %>%
   dplyr::mutate(
-    # Anchored prediction (Fig 3A style)
+    # Anchored prediction (GTEx-anchored)
     pred_anchored = predicted - beta0 + (1 - beta1) * age_years,
     # GTEx-anchored residual / deviation
     dev_gtex = predicted - (beta0 + beta1 * age_years)
@@ -317,7 +325,7 @@ scanb_pred_df %>% dplyr::slice_head(n = 5)
 ## ClockSHAP for SCAN-B (GTEx reference)
 
 ```{r}
-# Prefer using Step-04 bundle (ensures identical reference + clock parameterization)
+# Prefer using the saved ClockSHAP bundle (ensures identical reference + clock parameterization)
 if (!is.null(clockshap_bundle)) {
   clock_cs <- clockshap_bundle$clock
   reference <- clockshap_bundle$reference
@@ -387,7 +395,7 @@ c(
 )
 ```
 
-# Supplemental panels (Fig 3-style)
+# Exploratory panels (not used in the manuscript)
 
 ## Platform diagnostic — PCA in Hallmark ssGSEA space
 
@@ -481,11 +489,11 @@ if (isTRUE(params$save_figures)) {
 }
 ```
 
-## Supp Fig 3A — Anchored predicted age vs chronological age (GTEx vs SCAN-B)
+## Anchored predicted age vs chronological age (GTEx vs SCAN-B)
 
 ```{r suppfig3A_anchored_pred_age}
 ## -------------------------------------------------------------
-## Supp Fig 3A: Age vs GTEx-anchored predicted age
+## Age vs GTEx-anchored predicted age
 ##   Anchoring uses GTEx-only fit: pred ~ age
 ## -------------------------------------------------------------
 
@@ -619,11 +627,11 @@ ggsave(
 message("Saved: ", file.path(out_dir, "supplementary_anchored_age_with_brca.pdf"))
 ```
 
-## Supp Fig 3B — ClockSHAP deviation by PAM50 subtype (SCAN-B)
+## ClockSHAP deviation by PAM50 subtype (SCAN-B)
 
 ```{r suppfig3B_dev_by_pam50}
 ## -------------------------------------------------------------
-## Supp Fig 3B: Deviation (predicted − expected) by PAM50 subtype
+## Deviation (predicted − expected) by PAM50 subtype
 ## -------------------------------------------------------------
 
 sid <- rownames(cs_scanb$phi)
@@ -721,11 +729,11 @@ if (isTRUE(params$save_figures)) {
 }
 ```
 
-## Supp Fig 3C — ClockSHAP waterfall for one representative SCAN-B tumor
+## ClockSHAP waterfall for one representative SCAN-B tumor
 
 ```{r suppfig3C_waterfall}
 ## -------------------------------------------------------------
-## Supp Fig 3C: ClockSHAP waterfall (choose a readable tumor)
+## ClockSHAP waterfall (choose a readable tumor)
 ## -------------------------------------------------------------
 
 pick_pretty_waterfall_sample <- function(cs, top_n = 10,
@@ -812,11 +820,11 @@ if (isTRUE(params$save_figures)) {
 }
 ```
 
-## Supp Fig 3D — Heatmap of ClockSHAP contributions across SCAN-B tumors
+## Heatmap of ClockSHAP contributions across SCAN-B tumors
 
 ```{r suppfig3D_heatmap}
 ## -------------------------------------------------------------
-## Supp Fig 3D: ClockSHAP heatmap (SCAN-B), ordered by deviation
+## ClockSHAP heatmap (SCAN-B), ordered by deviation
 ##   Rows = pathways (Hallmarks), Columns = tumors
 ## -------------------------------------------------------------
 
@@ -973,7 +981,7 @@ These optional blocks provide simple quantitative summaries of how closely SCAN-
 
 cs_pt <- NULL
 
-# Prefer Step-04 clockshap bundle if present (fast + faithful)
+# Prefer the saved ClockSHAP bundle if present (fast + faithful)
 if (!is.null(clockshap_bundle) && !is.null(clockshap_bundle$pt) && inherits(clockshap_bundle$pt, "clockshap")) {
   cs_pt <- clockshap_bundle$pt
 } else {
@@ -1011,13 +1019,13 @@ max_abs_err_pt
 ```
 
 
-## Supp Fig 3B2 — Deviation by PAM50 subtype (TCGA BRCA vs SCAN-B)
+## Deviation by PAM50 subtype (TCGA BRCA vs SCAN-B)
 
 This is a side-by-side visualization of the PAM50–deviation structure in **TCGA BRCA (PT)** versus **SCAN-B tumors**.
 
 ```{r suppfig3B2_dev_by_pam50_brca_vs_scanb}
 ## -------------------------------------------------------------
-## Supp Fig 3B2: Deviation by PAM50 (BRCA vs SCAN-B), side-by-side
+## Deviation by PAM50 (BRCA vs SCAN-B), side-by-side
 ## -------------------------------------------------------------
 
 stopifnot(inherits(cs_pt, "clockshap"), inherits(cs_scanb, "clockshap"))
@@ -1042,7 +1050,7 @@ df_scanb_pam <- tibble::tibble(
 sid_b <- rownames(cs_pt$phi)
 dev_b <- as.numeric(cs_pt$deviation)
 
-# Try to find the PAM50 column used in Fig3_BRCA_deep_dive
+# Try to find the PAM50 column
 pam_candidates <- c(
   "Subtype_Selected",
   "PAM50",
@@ -1131,15 +1139,15 @@ if (isTRUE(params$save_figures)) {
 }
 ```
 
-## Fig 3E-style coupling check (SCAN-B validation cohort)
+## Program-resolved coupling check (SCAN-B; coupling analysis not in the manuscript)
 
-This reproduces the **program-resolved coupling** visualization logic used for Fig 3E (contribution = *w × β_tumor*), using:
+This reproduces the **program-resolved coupling** visualization (contribution = *w × β_tumor*), using:
 - **GTEx** as the reference aging direction in feature space (via β_z in GTEx), and
 - **SCAN-B tumors** as the validation tumor cohort.
 
 ```{r suppfig3H_coupling_fig3E_style}
 ## -------------------------------------------------------------
-## Fig 3E-style coupling plot (SCAN-B vs GTEx)
+## Coupling plot (SCAN-B vs GTEx)
 ##   Contribution per pathway: w_k * beta_{SCANB,k} in Z-space
 ##   Bar color: GTEx aging direction in Z-space
 ## -------------------------------------------------------------
@@ -1233,7 +1241,7 @@ tibble::tibble(
   abs_diff = abs(gamma_scanb_raw - gamma_from_decomp)
 )
 
-# --- Fig 3E-style plot ---
+# --- Coupling plot ---
 top_n <- 25
 gtex_beta_eps <- 0.0
 neutral_band <- 0.002
@@ -1312,24 +1320,24 @@ if (isTRUE(params$save_figures)) {
   dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 
   ggsave(
-    filename = file.path(out_dir, "supplementary_scanb_coupling_fig3e_style.pdf"),
+    filename = file.path(out_dir, "supplementary_scanb_coupling.pdf"),
     plot   = p_supp3H_coupling,
     width  = 210 / 25.4,
     height = 180 / 25.4,
     units  = "in"
   )
 
-  message("Saved: ", file.path(out_dir, "supplementary_scanb_coupling_fig3e_style.pdf"))
+  message("Saved: ", file.path(out_dir, "supplementary_scanb_coupling.pdf"))
 } else {
-  message("save_figures=FALSE; skipping save: supplementary_scanb_coupling_fig3e_style.pdf")
+  message("save_figures=FALSE; skipping save: supplementary_scanb_coupling.pdf")
 }
 ```
 
 
 
-## Survival (SCAN-B) — replicate “03” style (Cox; per +1 year tumor-intra RAA)
+## Survival (SCAN-B): Cox per +1 year tumor-intra RAA
 
-This follows the spirit of `03_deltaAge_clean_template.Rmd` (Cox models of tumor-intra residuals), adapted to SCAN-B columns in `colData(scanb_tumor)`.
+This follows the survival template's logic (Cox models of tumor-intra residuals), adapted to SCAN-B columns in `colData(scanb_tumor)`.
 
 **Key choice:** for “tumor-intra RAA” in SCAN-B, we use residuals from `lm(predicted ~ age)` **within SCAN-B tumors**.
 
@@ -1444,7 +1452,7 @@ run_survival_scanb <- function(time_col, event_col, title_text,
 }
 ```
 
-### Supp Fig 3E — Overall survival (OS)
+### Overall survival (OS)
 
 ```{r suppfig3E_survival_os}
 os_out <- run_survival_scanb("OS_days", "OS_event", "Overall Survival (OS)")
@@ -1471,7 +1479,7 @@ if (isTRUE(params$save_figures)) {
 }
 ```
 
-### Supp Fig 3F — Recurrence-free interval (RFi)
+### Recurrence-free interval (RFi)
 
 ```{r suppfig3F_survival_rfi}
 rfi_out <- run_survival_scanb("RFi_days", "RFi_event", "Recurrence-Free Interval (RFi)")
@@ -1502,7 +1510,7 @@ if (isTRUE(params$save_figures)) {
 scanb_save_dir <- "/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/manuscript_analyses/results/derived/GTEx/BRCA__BREAST"
 dir.create(scanb_save_dir, recursive = TRUE, showWarnings = FALSE)
 
-if (!is.null(rfi_out)) {
+if (isTRUE(params$save_inputs) && !is.null(rfi_out)) {
   saveRDS(
     list(
       endpoint = "RFi",
@@ -1516,7 +1524,7 @@ if (!is.null(rfi_out)) {
 }
 ```
 
-### Supp Fig 3G — Distant recurrence-free interval (DRFi)
+### Distant recurrence-free interval (DRFi)
 
 ```{r suppfig3G_survival_drfi}
 drfi_out <- run_survival_scanb("DRFi_days", "DRFi_event", "Distant Recurrence-Free Interval (DRFi)")
@@ -1544,7 +1552,7 @@ if (isTRUE(params$save_figures)) {
 ```
 
 
-### Supp Fig 3I — Survival summary across endpoints (combined)
+### Survival summary across endpoints (combined)
 
 This combines **OS**, **RFi**, and **DRFi** into a single forest-style plot with:
 - **Rows:** global models (all tumors; PAM50-controlled) plus **within-PAM50** subtype models
@@ -1659,7 +1667,7 @@ Pulls the ssGSEA matrix and a tidied `coldata` (age, PAM50, all three survival
 endpoints) and writes them to a single `.rds` so the deviation/survival figure
 scripts don't need to re-run SCAN-B preprocessing.
 
-```{r save_scanb_pathway_inputs}
+```{r save_scanb_pathway_inputs, eval = isTRUE(params$save_inputs)}
 scanb_cd <- as.data.frame(SummarizedExperiment::colData(scanb_tumor))
 
 # Helper: pull a column if present, else fill NA. Lets the save succeed even

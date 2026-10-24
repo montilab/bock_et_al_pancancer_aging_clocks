@@ -1,5 +1,5 @@
 ---
-title: "03 — Prepare pan-cancer clustering for Fig. 1B"
+title: "03 — Prepare pan-cancer clustering"
 output: html_document
 ---
 
@@ -13,7 +13,7 @@ knitr::opts_chunk$set(
 
 ## Overview
 
-Fig. 1B clusters cancers from the cross-cancer similarity of their per-feature
+The clustering panel clusters cancers from the cross-cancer similarity of their per-feature
 age-effect profiles. The clustering is hierarchical (Ward.D2) with optimal
 leaf ordering, applied to a distance matrix derived from per-layer Pearson
 similarities averaged across molecular layers.
@@ -31,7 +31,7 @@ This script:
    the included set itself is specified explicitly so the rationale for each
    layer's inclusion or exclusion is visible at the point of decision.
    Excluded layers are not discarded from the manuscript — they remain in
-   Fig. 1A's per-cancer counts; they are excluded only from the cross-cancer
+   the per-cancer counts; they are excluded only from the cross-cancer
    similarity step.
 5. **Combines** retained layers via pairwise-available similarity averaging
    with a per-pair feature-overlap floor.
@@ -103,7 +103,7 @@ right arrangement among the equivalent orderings.
 ```{r}
 hcopt <- function(d, HC = NULL, method = "ward.D2", members = NULL) {
   if (!requireNamespace("cba", quietly = TRUE)) {
-    stop("Package 'cba' is required for optimal leaf ordering in Fig. 1B clustering.")
+    stop("Package 'cba' is required for optimal leaf ordering in the clustering.")
   }
 
   if (is.null(HC)) {
@@ -347,7 +347,7 @@ similarity. Two layers are excluded:
   feature space to anchor cross-cancer similarity, and the dynamic range is
   much smaller than the genomics layers. This is a structural/measurement
   decision rather than a data-driven one. RPPA's per-cancer counts still
-  appear in Fig. 1A.
+  appear in the count panel.
 
 - **Mutation**: the per-cancer mutation regression applies a `min_group_size
   = 10` filter (a gene is tested only if both ≥ 10 mutated and ≥ 10 wild-
@@ -355,7 +355,7 @@ similarity. Two layers are excluded:
   its recurrent driver genes, which are largely tissue-specific. The
   diagnostic above shows median pairwise feature overlap of ~1, far below
   what is needed for stable Pearson similarity. Mutation's per-cancer
-  counts still appear in Fig. 1A.
+  counts still appear in the count panel.
 
 The remaining four layers — Methylation, RNA-seq, miRNA, SCNA — are
 retained for clustering. SCNA passes the median-overlap criterion but has a

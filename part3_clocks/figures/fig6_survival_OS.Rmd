@@ -1,6 +1,6 @@
 ---
-title: "Figure (Survival) — BRCA + SCAN-B deviation → OS"
-subtitle: "Panels A (Cox forest), B (KM by deviation tertile), C (pathway × PAM50)"
+title: "BRCA + SCAN-B deviation → OS"
+subtitle: "Cox forest, KM by deviation tertile, and pathway × PAM50 mean φ"
 author: "Pan-cancer aging project"
 date: "`r format(Sys.Date(), '%B %d, %Y')`"
 output:
@@ -29,22 +29,25 @@ params:
 
 ## Purpose
 
-Three panels:
+Panels produced:
 
-- **Panel A:** BRCA + SCAN-B Cox forest of `Surv ~ age + Deviation`,
+- **Cox forest:** BRCA + SCAN-B Cox models of `Surv ~ age + Deviation`,
   including PAM50-adjusted aggregate and within-subtype rows. Stacked
   vertically (TCGA on top, SCAN-B on bottom), shared x-axis. HR colored
-  blue when HR<1 (youthward = worse) and red when HR>1 (aged-like = worse).
+  blue when HR<1 (more youth-like = worse) and red when HR>1 (less
+  youth-like = worse).
 
-- **Panel B:** KM by within-cohort deviation tertile, both cohorts.
+- **KM curves:** by within-cohort deviation tertile, both cohorts.
   Stacked vertically with shared x-axis (time in years). SCAN-B
   follow-up ends earlier; that asymmetry is honest representation.
 
-- **Panel C:** Per-pathway mean φ across PAM50 subtypes for both
-  cohorts. Six driver pathways. NAT anchored leftmost (TCGA only).
+- **Pathway × PAM50:** per-pathway mean φ across PAM50 subtypes for both
+  cohorts. Six pathways. NAT anchored leftmost (TCGA only).
 
-Endpoint: **Overall Survival (OS)** in both cohorts. PFI (TCGA) and
-RFi (SCAN-B) sensitivity analyses live in a supplementary script.
+Endpoint: **Overall Survival (OS)** in both cohorts.
+
+Some panels may not appear in the published manuscript. Panels are assembled
+and typeset in Adobe Illustrator to produce the final figure.
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
@@ -115,7 +118,7 @@ age_pt   <- cs_brca$age
 ids_brca <- rownames(phi_brca)
 feat     <- colnames(phi_brca)   # feature/pathway names, needed for SCAN-B alignment
 
-# Adjacent normal (TCGA-BRCA only), for Panel C's NAT anchor.
+# Adjacent normal (TCGA-BRCA only), the NAT anchor in the pathway × PAM50 panel.
 phi_nat <- clockshap_bundle$nat$phi
 dev_nat <- clockshap_bundle$nat$deviation
 age_nat <- clockshap_bundle$nat$age
@@ -159,7 +162,7 @@ stopifnot(max(abs(rowSums(phi_scanb) - dev_scanb)) < 1e-8)
 ## Assemble OS survival data frames
 
 ```{r assemble_surv}
-# Canonical PAM50 ordering with NAT anchor for Panel C
+# Canonical PAM50 ordering with NAT anchor for the pathway × PAM50 panel
 pam50_order <- c("Adjacent Normal", "Normal-Like", "LumA", "LumB", "Her2", "Basal")
 
 # ---- TCGA-BRCA OS ----
@@ -212,7 +215,7 @@ knitr::kable(cohort_summary, caption = "OS cohort sizes after filtering.")
 
 ---
 
-# Panel A — Cox forest (stacked, shared x-axis)
+# Cox forest (stacked, shared x-axis)
 
 Aggregate `age + Deviation`, PAM50-adjusted aggregate, and within-subtype
 rows for both cohorts. No event-count filter — Normal-Like in TCGA shows
@@ -268,7 +271,7 @@ panelA_tbl <- dplyr::bind_rows(
 )
 
 knitr::kable(panelA_tbl, digits = 4,
-             caption = "Panel A — OS Cox forest data, all subtypes shown.")
+             caption = "OS Cox forest data, all subtypes shown.")
 ```
 
 ```{r panelA_plot, fig.width=3.7, fig.height=4.0}
@@ -322,22 +325,22 @@ p_panelA
 ```{r panelA_save}
 if (isTRUE(params$save_figures)) {
   ggsave(
-    filename = file.path(out_dir, "PanelA_OS_forest.pdf"),
+    filename = file.path(out_dir, "OS_forest.pdf"),
     plot     = p_panelA,
     width    = 4,
     height   = 4.5,
     units    = "in"
   )
-  message("Saved: ", file.path(out_dir, "PanelA_OS_forest.pdf"))
+  message("Saved: ", file.path(out_dir, "OS_forest.pdf"))
 }
 ```
 
 ---
 
-# Panel B — KM by deviation tertile (stacked, shared x-axis)
+# KM by deviation tertile (stacked, shared x-axis)
 
-Within-cohort deviation tertiles. T1 = most aged-like (least negative
-deviation), T3 = most youthward (most negative deviation). Both cohorts
+Within-cohort deviation tertiles. T1 = most youth-like (most negative
+deviation), T3 = least youth-like (least negative deviation). Both cohorts
 share a time axis; SCAN-B follow-up ends earlier than TCGA's, which is
 visible as the SCAN-B curves stopping at a shorter x-value.
 
@@ -346,7 +349,7 @@ add_dev_tertile <- function(df) {
   qs <- stats::quantile(df$Deviation, probs = c(0, 1/3, 2/3, 1), na.rm = TRUE)
   # cut() assigns the lowest 1/3 of values to the FIRST label.
   # Since deviation is signed and predominantly negative in tumor cohorts,
-  # the most-negative third = most youthward = T1.
+  # the most-negative third = most youth-like = T1.
   df$dev_tertile <- cut(
     df$Deviation, breaks = qs,
     labels = c('T1: Most "youth-like"', "T2: Middle", 'T3: Least "youth-like"'),
@@ -398,7 +401,7 @@ km_curves <- km_data_view %>%
   dplyr::ungroup()
 
 # Per-cohort log-rank on truncated data (unadjusted — descriptive companion
-# to Panel A's age-adjusted Cox HR; see figure legend for division of labor).
+# to the forest panel's age-adjusted Cox HR; see figure legend for division of labor).
 lr_brca  <- survival::survdiff(
   survival::Surv(time, event) ~ dev_tertile,
   data = dplyr::filter(km_data_view, cohort == "TCGA-BRCA (OS)")
@@ -417,7 +420,7 @@ logrank_tbl <- tibble::tibble(
 knitr::kable(
   logrank_tbl, digits = 4,
   caption = sprintf(
-    "Panel B unadjusted log-rank test by deviation tertile, per cohort (administratively censored at %.2f years to match SCAN-B follow-up).",
+    "Unadjusted log-rank test by deviation tertile, per cohort (administratively censored at %.2f years to match SCAN-B follow-up).",
     x_max
   )
 )
@@ -478,19 +481,19 @@ p_panelB
 ```{r panelB_save}
 if (isTRUE(params$save_figures)) {
   ggsave(
-    filename = file.path(out_dir, "PanelB_OS_KM_tertile.pdf"),
+    filename = file.path(out_dir, "OS_KM_tertile.pdf"),
     plot     = p_panelB,
     width    = 3,
     height   = 4.5,
     units    = "in"
   )
-  message("Saved: ", file.path(out_dir, "PanelB_OS_KM_tertile.pdf"))
+  message("Saved: ", file.path(out_dir, "OS_KM_tertile.pdf"))
 }
 ```
 
 ---
 
-# Panel C — Pathway × PAM50 mean φ (both cohorts)
+# Pathway × PAM50 mean φ (both cohorts)
 
 Six pathways across PAM50 subtypes, both cohorts overlaid. Adjacent
 Normal anchored leftmost as grey square (TCGA only). Reference at
@@ -549,7 +552,7 @@ phi_subtype_means <- phi_long_c %>%
   dplyr::mutate(PAM50 = factor(as.character(PAM50), levels = pam50_order))
 
 knitr::kable(phi_subtype_means, digits = 3,
-             caption = "Panel C data — per-cohort, per-pathway, per-subtype mean φ.")
+             caption = "Per-cohort, per-pathway, per-subtype mean φ, as plotted.")
 ```
 
 ```{r panelC_plot, fig.width=7.5, fig.height=5.5}
@@ -598,13 +601,13 @@ p_panelC
 ```{r panelC_save}
 if (isTRUE(params$save_figures)) {
   ggsave(
-    filename = file.path(out_dir, "PanelC_pathway_phi_by_pam50.pdf"),
+    filename = file.path(out_dir, "pathway_phi_by_pam50.pdf"),
     plot     = p_panelC,
     width    = 7,
     height   = 5,
     units    = "in"
   )
-  message("Saved: ", file.path(out_dir, "PanelC_pathway_phi_by_pam50.pdf"))
+  message("Saved: ", file.path(out_dir, "pathway_phi_by_pam50.pdf"))
 }
 ```
 

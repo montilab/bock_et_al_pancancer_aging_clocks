@@ -1,5 +1,5 @@
 ---
-title: "Figure — Cross-cancer deviation"
+title: "Cross-cancer deviation"
 author: "Pan-cancer aging project"
 date: "`r format(Sys.Date(), '%B %d, %Y')`"
 output:
@@ -12,17 +12,17 @@ output:
 ---
 
 <!--
-This Rmd generates manuscript Figure 4 (cross-cancer deviation) from the
-pre-specified highlight set. The figure focuses on deviation as the
-centerpiece, with coupling components removed.
+Cross-cancer deviation panels for the pre-specified highlight set of six cancers.
 
-Panels:
-  - Fig 4A: Cross-cancer mean deviation ordering (most youthful at top)
-  - Fig 4B: Pan-cancer Cox forest for OS (age-adjusted, 6 cancers)
-  - Fig 4C: Per-cancer mean ClockSHAP deviation decomposition (waterfalls, all 6 cancers)
-  - Fig 4D: Recurrent pathway deviation across cancers (heatmap with categories)
-  - Fig 4D-alt: Exploratory heatmap clustered by Pearson on deviation values,
-                no pathway categorization (not saved, for visual exploration)
+Panels produced:
+  - Cross-cancer mean deviation ordering (most youthful at top)
+  - Pan-cancer Cox forest for OS (age-adjusted)
+  - Per-cancer mean ClockSHAP deviation decomposition (waterfalls)
+  - Recurrent pathway deviation across cancers (heatmap with categories)
+  - Full pathway deviation overview, all pathways clearing the cutoff in any cancer
+
+Some panels may not appear in the published manuscript. Panels are assembled and
+typeset in Adobe Illustrator to produce the final figure.
 -->
 
 ```{r setup, include=FALSE}
@@ -125,7 +125,7 @@ names(fig4_objs) <- highlight_tbl$tcga_project
 stopifnot(all(highlight_order %in% names(fig4_objs)))
 ```
 
-## Figure 4A — Cross-cancer mean deviation ordering
+## Cross-cancer mean deviation ordering
 
 ```{r}
 fig4_mean_shap_tbl <- purrr::imap_dfr(
@@ -155,6 +155,9 @@ fig4A_deviation_tbl <- fig4_mean_shap_tbl %>%
     cancertype = factor(cancertype, levels = cancertype),
     direction = if_else(mean_deviation >= 0, "Older", "Younger")
   )
+
+knitr::kable(fig4A_deviation_tbl, digits = 2,
+             caption = "Mean age-matched deviation per cancer (values labelled on the bars).")
 
 p_fig4A <- ggplot(
   fig4A_deviation_tbl,
@@ -196,7 +199,7 @@ p_fig4A
 out_dir <- here::here("results", "figures", "figure_crosscancer")
 dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 
-out_file <- file.path(out_dir, "Fig4A_CrossCancer_Mean_Deviation.pdf")
+out_file <- file.path(out_dir, "CrossCancer_Mean_Deviation.pdf")
 
 ggsave(
   filename = out_file,
@@ -209,7 +212,7 @@ ggsave(
 message("Saved: ", out_file)
 ```
 
-## Figure 4B — Pan-cancer Cox forest plot (OS, age-adjusted)
+## Pan-cancer Cox forest plot (OS, age-adjusted)
 
 This panel shows the OS Cox hazard ratio per +1 year of GTEx-anchored
 Deviation, age-adjusted, across all 6 emphasis cancers. Loads
@@ -247,7 +250,7 @@ knitr::kable(
   fig4B_tbl %>%
     transmute(cancertype, n, events, HR, CI_low, CI_high, p_value, sig),
   digits = 4,
-  caption = "Panel B - pan-cancer OS Cox HR per +1 year of Deviation, age-adjusted."
+  caption = "Pan-cancer OS Cox HR per +1 year of deviation, age-adjusted."
 )
 ```
 
@@ -299,7 +302,7 @@ p_fig4B_nolegend <- p_fig4B +
 
 ```{r}
 ggsave(
-  filename = file.path(out_dir, "Fig4B_PanCancer_Survival_OS.pdf"),
+  filename = file.path(out_dir, "PanCancer_Survival_OS.pdf"),
   plot = p_fig4B_nolegend,
   width = 3.75,
   height = 2.5,
@@ -307,7 +310,7 @@ ggsave(
 )
 
 ggsave(
-  filename = file.path(out_dir, "Fig4B_PanCancer_Survival_OS_legend.pdf"),
+  filename = file.path(out_dir, "PanCancer_Survival_OS_legend.pdf"),
   plot = fig4B_legend,
   width = 4,
   height = 0.7,
@@ -315,7 +318,7 @@ ggsave(
 )
 ```
 
-## Figure 4C — Cross-cancer deviation decomposition (waterfalls, all 6 cancers)
+## Cross-cancer deviation decomposition (waterfalls, all 6 cancers)
 
 This panel summarizes the mean tumor ClockSHAP contributions in each of
 the 6 emphasis cancers. Bars show the top-N pathway-level contributors
@@ -337,6 +340,9 @@ fig4C_rank_tbl <- fig4_mean_shap_tbl %>%
   ) %>%
   group_by(cancertype, pathway_group) %>%
   summarise(contrib = sum(mean_phi, na.rm = TRUE), .groups = "drop")
+
+knitr::kable(fig4C_rank_tbl, digits = 2,
+             caption = "Top pathway contributions and remainder per cancer, as drawn in the waterfalls.")
 
 fig4C_segment_tbl <- fig4C_rank_tbl %>%
   group_by(cancertype) %>%
@@ -464,7 +470,7 @@ p_fig4C
 ```
 
 ```{r}
-out_file <- file.path(out_dir, "Fig4C_CrossCancer_Deviation_Decomposition.pdf")
+out_file <- file.path(out_dir, "CrossCancer_Deviation_Decomposition.pdf")
 
 ggsave(
   filename = out_file,
@@ -478,13 +484,13 @@ message("Saved: ", out_file)
 ```
 
 
-## Figure 4D — Stable deviation pathways across cancers
+## Recurrent deviation pathways across cancers
 
 This panel summarizes recurrent pathways that show sufficiently large and stable
 deviation signals across the highlight cancers. Tiles show signed pathway-level
 mean deviation contributions, grouped into biologically interpretable pathway
-categories. Pathways must pass within-cancer bootstrap stability criteria and
-reach the deviation cutoff in at least two cancers to be displayed.
+categories. Pathways must reach the deviation cutoff in at least two cancers to
+be displayed.
 
 ```{r}
 # Manual, exact-match category map for all 50 Hallmark pathways.
@@ -596,7 +602,7 @@ fig4D_scale_cap <- 5
 # ---- load clock retention info for each highlight cancer ----
 # A pathway is "retained" if its elastic-net coefficient is non-zero in the
 # tissue-of-origin clock. Non-retained pathways will be marked with a grey X
-# in Panel D to distinguish "not selected by the clock" from "selected but
+# in the heatmap to distinguish "not selected by the clock" from "selected but
 # small deviation contribution".
 fig4D_retention_tbl <- purrr::pmap_dfr(
   highlight_tbl,
@@ -884,7 +890,7 @@ p_fig4D
 ```
 
 ```{r}
-out_file <- file.path(out_dir, "Fig4D_CrossCancer_Stable_Pathway_Overview.pdf")
+out_file <- file.path(out_dir, "CrossCancer_Recurrent_Pathway_Overview.pdf")
 
 ggsave(
   filename = out_file,
@@ -897,16 +903,15 @@ ggsave(
 message("Saved: ", out_file)
 ```
 
-## Figure 4D Supplement — Full pathway deviation overview
+## Full pathway deviation overview
 
-This supplementary version drops the cross-cancer recurrence requirement
-and shows all pathways whose mean ClockSHAP deviation contribution exceeds
-1 year in magnitude in at least one cancer. Visualization choices match
-Figure 4D (category facets, tissue grouping at bottom, grey X for non-
-retained pathways, ±5 year color cap, within-category ordering by
-direction prevalence and recurrence). Readers can use this panel to
-inspect single-cancer pathway signals that were excluded from the main
-Figure 4D for parsimony.
+This version drops the cross-cancer recurrence requirement and shows all
+pathways whose mean ClockSHAP deviation contribution exceeds 1 year in
+magnitude in at least one cancer. Visualization choices match the recurrent
+pathway heatmap above (category facets, tissue grouping at bottom, grey X for
+non-retained pathways, ±5 year color cap, within-category ordering by
+direction prevalence and recurrence). Readers can use this panel to inspect
+single-cancer pathway signals that the recurrence filter excludes.
 
 ```{r}
 # ---- supplement-specific tuning knobs ----
@@ -1161,7 +1166,7 @@ p_fig4DSupp
 ```
 
 ```{r}
-out_file <- file.path(out_dir, "FigSupplement-PathwayDeviation-Full.pdf")
+out_file <- file.path(out_dir, "CrossCancer_Pathway_Deviation_Full.pdf")
 
 # Two-column layout: roughly twice as wide, roughly half as tall as the
 # single-column version.

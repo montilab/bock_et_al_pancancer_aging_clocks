@@ -17,7 +17,7 @@ This script loads the finalized legacy pan-cancer age-analysis outputs needed fo
 
 It prepares:
 
-- Fig. 1A input tables,
+- age-association count tables,
 - a simple layer manifest for downstream extension,
 - file manifests for RNA-seq GSEA and multi-omic clustering, and
 - organ-system annotations used in figure panels.
@@ -448,7 +448,7 @@ result_file_manifest <- bind_rows(
 )
 ```
 
-## Standardize Fig. 1A counts
+## Standardize age-association counts
 
 ```{r}
 all_projects <- sort(Reduce(

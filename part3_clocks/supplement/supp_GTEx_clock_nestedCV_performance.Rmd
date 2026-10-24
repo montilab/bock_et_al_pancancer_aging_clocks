@@ -1,6 +1,6 @@
 ---
 title: "Supplementary table — GTEx clock nested cross-validation performance"
-subtitle: "GTEx-only, nested-CV performance for the BREAST, BRAIN, LUNG, and COLON clocks"
+subtitle: "GTEx-only, in-sample and nested-CV performance for the BREAST, BRAIN, LUNG, and COLON clocks"
 author: "Pan-cancer aging project"
 date: "`r format(Sys.Date(), '%B %d, %Y')`"
 output:
@@ -20,7 +20,7 @@ params:
   outer_k: 5                      # outer folds (generalization estimate)
   inner_k: 10                     # inner folds (alpha/lambda tuning), matches Step 02
   seed: 2026                      # any fixed seed; controls fold partitions
-  out_csv: "/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/manuscript_analyses/results/figures/supplemental/gtex_clock_nestedCV_performance.csv"
+  out_csv: "/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/manuscript_analyses/results/tables/supplemental/gtex_clock_nestedCV_performance.csv"
   save_outputs: true             # TRUE writes the table to out_csv; never writes clock objects
 ---
 
@@ -34,11 +34,27 @@ suppressPackageStartupMessages({
 
 ## What this does
 
-Nested cross-validation of the GTEx tissue clocks. The full alpha/lambda tuning
-(Step 02's search) is re-run inside each outer fold, so the reported R2/RMSE/MAE
-account for hyperparameter selection, not just fitting. This validates the
-*procedure*; the deployed clock is still the full-data model from Step 02. Its
-alpha and lambda are shown for reference. Read-only: nothing downstream changes.
+Performance of the GTEx tissue clocks, reported two ways.
+
+In-sample metrics come from the deployed clock evaluated on the GTEx samples it
+was fit on. These are read directly from the saved Step 02 predictions and
+nothing is refit, so they describe how well the deployed model fits its own
+training data. They are optimistic by construction and are reported for
+comparability with clock studies that publish training fit.
+
+Nested cross-validation re-runs the full alpha/lambda tuning (Step 02's search)
+inside each outer fold, so the reported R2/RMSE/MAE account for hyperparameter
+selection, not just fitting. This is the honest generalization estimate and the
+one quoted in the main text. It validates the *procedure*; the deployed clock is
+still the full-data model from Step 02. Its alpha and lambda are shown for
+reference.
+
+Both R2 values are the squared Pearson correlation between predicted and
+chronological age, so the two columns are directly comparable. Read-only:
+nothing downstream changes.
+
+Two versions of the table are written: the full numeric table at `out_csv`, and
+a condensed version alongside it with `_condensed` appended to the file name.
 
 ```{r helpers}
 # Age-decile-stratified k folds (matches Step 02's stratification).
@@ -99,6 +115,22 @@ process_one <- function(analysis_id) {
   keep <- is.finite(y)
   x <- x[keep, , drop = FALSE]; y <- as.numeric(y[keep])
 
+  # In-sample: deployed clock on its own training samples, straight from Step 02.
+  pred_in <- clock$pred$GTEx
+  age_in  <- clock$age$GTEx[names(pred_in)]
+  ok_in   <- is.finite(pred_in) & is.finite(age_in)
+
+  # The two R2 columns are only comparable if both are computed over the same
+  # GTEx samples; warn rather than stop, since a small difference may be benign.
+  if (sum(ok_in) != length(y)) {
+    warning(analysis_id, ": in-sample n (", sum(ok_in),
+            ") differs from rebuilt training n (", length(y), ").")
+  }
+
+  fit_r2   <- cor(pred_in[ok_in], age_in[ok_in])^2                   # squared Pearson r
+  fit_rmse <- sqrt(mean((pred_in[ok_in] - age_in[ok_in])^2))
+  fit_mae  <- mean(abs(pred_in[ok_in] - age_in[ok_in]))
+
   oof <- nested_oof(x, y, alpha_grid, lambda_grid,
                     params$outer_k, params$inner_k, params$seed)
   ok  <- is.finite(oof) & is.finite(y)
@@ -120,6 +152,9 @@ process_one <- function(analysis_id) {
     `Age max`                = max(y),
     `Input pathways`         = length(feat),
     `Nonzero-coef pathways`  = n_nonzero,
+    `In-sample R2`           = round(fit_r2, 3),
+    `In-sample RMSE`         = round(fit_rmse, 2),
+    `In-sample MAE`          = round(fit_mae, 2),
     `Nested-CV R2`           = round(cv_r2, 3),
     `Nested-CV RMSE`         = round(cv_rmse, 2),
     `Nested-CV MAE`          = round(cv_mae, 2),
@@ -134,7 +169,7 @@ perf_tbl <- purrr::map_dfr(params$analyses, process_one)
 ## Table
 
 ```{r table}
-knitr::kable(perf_tbl, caption = "GTEx tissue clocks: descriptors and nested-CV performance.")
+knitr::kable(perf_tbl, caption = "GTEx tissue clocks: descriptors, in-sample fit, and nested-CV performance.")
 reactable::reactable(perf_tbl, striped = TRUE, highlight = TRUE, defaultPageSize = 8)
 ```
 
@@ -142,4 +177,44 @@ reactable::reactable(perf_tbl, striped = TRUE, highlight = TRUE, defaultPageSize
 dir.create(dirname(params$out_csv), recursive = TRUE, showWarnings = FALSE)
 readr::write_csv(perf_tbl, params$out_csv)
 message("Wrote: ", params$out_csv)
+```
+
+## Condensed table for the supplement
+
+The same values with the paired statistics folded into single cells, which
+brings the table to eight columns so that it fits a portrait page. Age SD and
+both MAE columns are dropped here and remain in the full table above and in the
+saved CSV.
+
+```{r table_condensed}
+perf_condensed <- perf_tbl %>%
+  dplyr::transmute(
+    Tissue                = `GTEx tissue`,
+    n                     = `n GTEx`,
+    `Age, median (range)` = sprintf("%.0f (%.0f-%.0f)", `Age median`, `Age min`, `Age max`),
+    Pathways              = sprintf("%d of %d", as.integer(`Nonzero-coef pathways`),
+                                                as.integer(`Input pathways`)),
+    `In-sample R2 (RMSE)` = sprintf("%.3f (%.1f)", `In-sample R2`, `In-sample RMSE`),
+    `Nested-CV R2 (RMSE)` = sprintf("%.3f (%.1f)", `Nested-CV R2`, `Nested-CV RMSE`),
+    alpha                 = `Deployed alpha`,
+    lambda                = `Deployed lambda`
+  )
+
+knitr::kable(
+  perf_condensed,
+  caption = paste0(
+    "GTEx tissue clocks, condensed for typesetting. R2 is the squared Pearson ",
+    "correlation between predicted and chronological age; RMSE is in years. ",
+    "In-sample values come from the deployed clock evaluated on its own ",
+    "training samples and are optimistic by construction."
+  )
+)
+```
+
+```{r save_condensed, eval=isTRUE(params$save_outputs)}
+out_csv_condensed <- sub("\\.csv$", "_condensed.csv", params$out_csv)
+
+dir.create(dirname(out_csv_condensed), recursive = TRUE, showWarnings = FALSE)
+readr::write_csv(perf_condensed, out_csv_condensed)
+message("Wrote: ", out_csv_condensed)
 ```

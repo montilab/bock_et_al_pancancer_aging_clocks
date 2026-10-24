@@ -355,7 +355,8 @@ display: none;
 
 <div id="overview" class="section level2">
 <h2>Overview</h2>
-<p>This script reruns the RNA-seq Hallmark GSEA used for Fig. 1C.</p>
+<p>This script reruns the RNA-seq Hallmark GSEA used for the pan-cancer
+Hallmark heatmap.</p>
 <p>It does not load legacy GSEA result files. Instead, it reads the
 official RNA-seq DESeq2 age results imported in step 01 and performs
 Hallmark KS-test enrichment with <code>hypeR</code> for each TCGA cancer
@@ -493,8 +494,8 @@ if (nrow(rnaseq_manifest) == 0) {
     )
   )</code></pre>
 </div>
-<div id="combined-table-matrices-for-fig.-1c" class="section level2">
-<h2>Combined-table matrices for Fig. 1C</h2>
+<div id="combined-table-matrices-for-the-hallmark-heatmap" class="section level2">
+<h2>Combined-table matrices for the Hallmark heatmap</h2>
 <pre class="r"><code>pathway_order &lt;- unique(gsea_best$label)
 cancer_order &lt;- sort(unique(gsea_best$cancertype))
 

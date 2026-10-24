@@ -13,7 +13,7 @@ knitr::opts_chunk$set(
 
 ## Overview
 
-This script reruns the RNA-seq Hallmark GSEA used for Fig. 1C.
+This script reruns the RNA-seq Hallmark GSEA used for the pan-cancer Hallmark heatmap.
 
 It does not load legacy GSEA result files. Instead, it reads the official RNA-seq DESeq2 age results imported in step 01 and performs Hallmark KS-test enrichment with `hypeR` for each TCGA cancer type.
 
@@ -161,7 +161,7 @@ gsea_best <- gsea_long %>%
   )
 ```
 
-## Combined-table matrices for Fig. 1C
+## Combined-table matrices for the Hallmark heatmap
 
 ```{r}
 pathway_order <- unique(gsea_best$label)

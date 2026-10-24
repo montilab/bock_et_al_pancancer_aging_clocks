@@ -1,0 +1,1132 @@
+---
+title: "Tumor purity and age-matched deviation"
+subtitle: "Does tumor purity account for the deviations, pathway contributions, and clinical associations reported in the main figures?"
+author: "Pan-cancer aging project"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: united
+    code_folding: hide
+    toc: true
+    toc_float: true
+params:
+  out_root: "results/derived/GTEx"
+  feature_set: "PC"
+  purity_rds: "/restricted/projectnb/agedisease/CBMrepositoryData/TCGA-GDC/metadata/data/harmonized_metadata.rds"
+  clinical_csv: "/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/manuscript_analyses/data/survival/2018_TCGA-IntegratedClinical.csv"
+  tp53_tsv: "/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/manuscript_analyses/data/metadata/cBioPortal_TP53-BRCA_table.tsv"
+  poi_pathways:
+    - "G2m Checkpoint"
+    - "Glycolysis"
+    - "Myogenesis"
+    - "P53 Pathway"
+    - "Wnt Beta Catenin Signaling"
+    - "Unfolded Protein Response"
+    - "Tnfa Signaling Via Nfkb"
+    - "Il2 Stat5 Signaling"
+    - "Complement"
+  tables_root: "results/tables/supplemental"
+  fig_dir: "results/figures/supplemental"
+  save_outputs: true
+  verbose: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Goal
+
+The clocks are applied to bulk tumor RNA-seq, and a bulk tumor sample mixes
+malignant cells with the patient's own stroma and immune cells. A reader will
+ask whether the age-matched deviations, the pathway contributions, and the
+clinical associations in the main figures are driven by how much tumor is in
+each sample rather than by tumor biology. This script answers that with the
+TCGA ABSOLUTE purity estimates.
+
+Everything here reads from objects the main pipeline already saved. Nothing
+is recomputed and no clock is refit. Where a main-figure analysis is
+repeated with purity added, the model form, data filters, and contrasts
+follow the figure script.
+
+**What is asked, and why**
+
+1. *Does deviation track purity, in each of the six cancers?* If the
+   youth-like state lives in malignant cells, deviation should become more
+   youth-like as purity rises, because non-malignant tissue at the patient's
+   age sits near the age expectation and dilutes the signal. The size of the
+   effect also says how much of the tumor-to-tumor spread purity explains.
+2. *Does purity confound the deviation-survival associations?* The
+   cross-cancer survival panel reports deviation against overall survival in
+   each cancer. Purity could be prognostic itself, so each model is refit
+   with purity added.
+3. *In BRCA, which pathway contributions track purity?* The BRCA figures
+   describe the pathway structure of the deviation. Purity could act through
+   particular pathways (for example immune programs) rather than scaling
+   everything equally.
+4. *In BRCA, do the subtype, survival, and TP53 results hold with purity in
+   the model?* These are the main-text claims that could be confounded:
+   subtype ordering, the deviation-survival association (the forest in the
+   survival figure), and the truncating-TP53 effect on the P53-pathway
+   contribution, which is a purity-correlated outcome.
+
+**What this script produces**
+
+Four panels, each drawn in the style of the corresponding main panel so the
+two can be compared directly: deviation against purity in six cancers; BRCA
+deviation by PAM50 subtype after purity adjustment; the BRCA TP53 panel with
+purity in the model; and the BRCA overall-survival forest with purity in the
+model. One table: the cross-cancer survival models without and with purity,
+on the tumors with a purity value. Some panels may not appear in the
+published manuscript. Panels are assembled and typeset in Adobe Illustrator.
+The remaining tables and the pathway analysis stay in this report as the
+record.
+
+**Data**
+
+Deviations and contributions come from the saved ClockSHAP objects
+(`clockshap_objects-<feature_set>.rds`), exactly as used in the figures.
+Purity is the PanCancerAtlas ABSOLUTE estimate from the harmonized TCGA
+metadata, one value per patient, joined on the 12-character patient barcode.
+Patients with more than one tumor profile keep all profiles, each carrying the
+patient's purity, so the tumor set matches the main figures. Overall survival
+and TP53 mutation calls come from the same files the figure scripts use.
+Tumors without a purity value are dropped only where purity enters a model.
+SCAN-B has no purity estimate, so the BRCA analyses are TCGA only.
+
+```{r}
+suppressPackageStartupMessages({
+  library(here)
+  library(dplyr)
+  library(tibble)
+  library(tidyr)
+  library(ggplot2)
+  library(survival)
+  library(emmeans)
+  library(ggpubr)        # stat_pvalue_manual, as in the main figure
+  library(knitr)
+  library(reactable)
+})
+
+msg <- function(...) if (isTRUE(params$verbose)) message(...)
+```
+
+## Cancers of interest
+
+The six emphasis cancers, each paired with its GTEx tissue of origin.
+
+```{r}
+map <- list(
+  BRCA = "BREAST",
+  LUSC = "LUNG",
+  LUAD = "LUNG",
+  GBM  = "BRAIN",
+  LGG  = "BRAIN",
+  COAD = "COLON"
+)
+```
+
+## Load purity
+
+One row per patient; the join below relies on that.
+
+```{r}
+harmonized <- readRDS(params$purity_rds)
+
+stopifnot(!anyDuplicated(harmonized$submitter_id))
+stopifnot(all(nchar(harmonized$submitter_id) == 12))
+
+purity_by_patient <- setNames(as.numeric(harmonized$purity), harmonized$submitter_id)
+
+msg("Harmonized metadata: ", length(purity_by_patient), " patients, ",
+    sum(!is.na(purity_by_patient)), " with a purity value.")
+```
+
+## Assemble the tumor table
+
+For each cancer: read the saved ClockSHAP object and sample metadata, check
+that the decomposition still closes and that every tumor has metadata, bridge
+to the patient barcode, and attach purity. PAM50 is carried for BRCA only,
+and the BRCA contribution matrix is kept for the pathway analyses.
+
+```{r}
+suffix       <- paste0("-", params$feature_set)
+out_root_abs <- here::here(params$out_root)
+
+sample_list <- list()
+phi_brca    <- NULL
+
+for (tcga in names(map)) {
+  gtex        <- map[[tcga]]
+  analysis_id <- paste0(tcga, "__", gtex)
+  adir        <- file.path(out_root_abs, analysis_id)
+
+  cs   <- readRDS(file.path(adir, paste0("clockshap_objects", suffix, ".rds")))
+  meta <- readRDS(file.path(adir, "sample_metadata.rds"))
+
+  phi <- as.matrix(cs$pt$phi)
+  ids <- rownames(phi)
+  dev <- as.numeric(cs$pt$deviation)
+
+  # the contributions must still sum to the deviation, and every tumor must have metadata
+  stopifnot(length(dev) == nrow(phi))
+  stopifnot(max(abs(rowSums(phi) - dev)) < 1e-8)
+  stopifnot(all(ids %in% rownames(meta)))
+
+  barcode <- as.character(meta[ids, "tcga.tcga_barcode"])
+  patient <- substr(barcode, 1, 12)
+
+  sample_list[[tcga]] <- tibble(
+    sample_id = ids,
+    cancer    = tcga,
+    tissue    = gtex,
+    patient   = patient,
+    barcode   = barcode,
+    age_years = as.numeric(meta[ids, "age_years"]),
+    deviation = dev,
+    purity    = unname(purity_by_patient[patient]),
+    pam50     = if (tcga == "BRCA") as.character(meta[ids, "Subtype_Selected"]) else NA_character_
+  )
+
+  if (tcga == "BRCA") phi_brca <- phi
+
+  msg(analysis_id, ": ", length(ids), " tumors, ",
+      sum(!is.na(sample_list[[tcga]]$purity)), " with purity.")
+}
+
+samples <- dplyr::bind_rows(sample_list) %>%
+  dplyr::mutate(cancer = factor(cancer, levels = names(map)))
+
+# purity is a fraction; anything outside [0, 1] would mean a wrong column or join
+stopifnot(all(is.na(samples$purity) | (samples$purity >= 0 & samples$purity <= 1)))
+stopifnot(identical(rownames(phi_brca), samples$sample_id[samples$cancer == "BRCA"]))
+```
+
+## Load overall survival
+
+The same clinical resource and join as the survival figures: one clinical
+row per patient, attached to every tumor profile of that patient. Tumors are
+kept where time, event, and age are available.
+
+```{r}
+clinical <- utils::read.csv(
+  params$clinical_csv,
+  na.strings       = c("NA", "", "#N/A"),
+  stringsAsFactors = FALSE,
+  check.names      = TRUE
+)
+
+clin2 <- clinical %>%
+  dplyr::mutate(patient = substr(as.character(bcr_patient_barcode), 1, 12)) %>%
+  dplyr::distinct(patient, .keep_all = TRUE) %>%
+  dplyr::select(patient, OS.time, OS)
+
+samples <- samples %>%
+  dplyr::left_join(clin2, by = "patient") %>%
+  dplyr::mutate(
+    os_time  = suppressWarnings(as.numeric(OS.time)),
+    os_event = suppressWarnings(as.numeric(OS)) == 1
+  ) %>%
+  dplyr::select(-OS.time, -OS)
+
+os_eligible <- is.finite(samples$os_time) & !is.na(samples$os_event) & is.finite(samples$age_years)
+msg("OS-eligible tumors: ", sum(os_eligible), " of ", nrow(samples))
+```
+
+## What was assembled
+
+```{r}
+assembly_summary <- samples %>%
+  dplyr::group_by(cancer, tissue) %>%
+  dplyr::summarise(
+    tumors         = dplyr::n(),
+    patients       = dplyr::n_distinct(patient),
+    with_purity    = sum(!is.na(purity)),
+    purity_median  = median(purity, na.rm = TRUE),
+    mean_deviation = mean(deviation),
+    os_eligible    = sum(is.finite(os_time) & !is.na(os_event)),
+    os_events      = sum(os_event[is.finite(os_time)], na.rm = TRUE),
+    .groups = "drop"
+  )
+
+knitr::kable(
+  assembly_summary, digits = 2,
+  caption = "Tumors assembled per cancer, with purity coverage, mean deviation, and overall-survival coverage."
+)
+```
+
+PAM50 coverage in BRCA, as stored in the clock metadata.
+
+```{r}
+knitr::kable(
+  as.data.frame(table(PAM50 = samples$pam50[samples$cancer == "BRCA"], useNA = "ifany")),
+  caption = "BRCA tumors by PAM50 subtype."
+)
+```
+
+```{r}
+reactable::reactable(
+  head(samples, 20) %>% dplyr::mutate(dplyr::across(where(is.numeric), ~ signif(., 4))),
+  searchable = FALSE, resizable = TRUE, striped = TRUE, highlight = TRUE, defaultPageSize = 10
+)
+```
+
+## The assembled object
+
+Everything downstream reads from this one object.
+
+```{r}
+purity_data <- list(
+  samples  = samples,     # one row per tumor across the six cancers
+  phi_brca = phi_brca     # BRCA tumors x pathways, same order as samples[cancer == "BRCA", ]
+)
+
+str(purity_data, max.level = 1)
+```
+
+## Shared helpers
+
+```{r}
+# Cox hazard ratio for one term; `scale` rescales the coefficient (0.1 gives HR per 10 percentage points)
+cox_term <- function(df, formula_str, term_name, scale = 1) {
+  fit <- survival::coxph(stats::as.formula(formula_str), data = df)
+  co  <- summary(fit)$coefficients
+  stopifnot(term_name %in% rownames(co))
+  tibble(
+    HR      = exp(scale * co[term_name, "coef"]),
+    CI_low  = exp(scale * (co[term_name, "coef"] - 1.96 * co[term_name, "se(coef)"])),
+    CI_high = exp(scale * (co[term_name, "coef"] + 1.96 * co[term_name, "se(coef)"])),
+    p_value = co[term_name, "Pr(>|z|)"]
+  )
+}
+
+# Linear-model coefficient for one term, with CI; `scale` as above
+lm_term <- function(fit, term_name, scale = 1) {
+  co <- summary(fit)$coefficients
+  ci <- stats::confint(fit)
+  stopifnot(term_name %in% rownames(co))
+  tibble(
+    estimate = scale * co[term_name, "Estimate"],
+    CI_low   = scale * ci[term_name, 1],
+    CI_high  = scale * ci[term_name, 2],
+    p_value  = co[term_name, "Pr(>|t|)"]
+  )
+}
+
+pam50_levels <- c("Normal-Like", "LumA", "LumB", "Her2", "Basal")
+harmonize_pam50 <- function(x) {
+  factor(dplyr::recode(as.character(x), "Normal" = "Normal-Like"), levels = pam50_levels)
+}
+
+# palettes shared with the main figures
+pam50_pal <- c(
+  "Normal-Like" = "#cccccc",
+  "LumA"        = "#4575b4",
+  "LumB"        = "#91bfdb",
+  "Her2"        = "#fc8d59",
+  "Basal"       = "#d73027"
+)
+hr_pal <- c(
+  '"youth-like" deviation, increased risk'      = "#2c7bb6",
+  'less "youth-like" deviation, increased risk' = "#d7191c"
+)
+
+theme_supp <- function(base_size = 10) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      strip.text       = element_text(face = "bold"),
+      strip.background = element_rect(fill = "grey95", colour = NA)
+    )
+}
+```
+
+---
+
+# Analysis 1 — Deviation against purity, six cancers
+
+**Question.** Does age-matched deviation change with tumor purity, and how
+much of the spread among tumors does purity explain?
+
+**Why.** If the youth-like state is carried by malignant cells, the measured
+deviation should scale with the malignant fraction, because non-malignant
+tissue at the patient's age sits near the age expectation. A negative slope
+is the expected signature of that dilution. The R-squared gain says how much
+tumor-to-tumor variance purity accounts for beyond chronological age, which
+is separate from whether it explains the mean shift.
+
+**How.** Per cancer: Spearman correlation between deviation and purity, and
+`deviation ~ age + purity`. The slope is reported per 10 percentage points of
+purity so it reads in years. `r2_purity_given_age` is the R-squared of the
+full model minus that of `deviation ~ age`.
+
+```{r}
+dev_purity <- purity_data$samples %>%
+  dplyr::filter(!is.na(purity))
+
+dev_rows <- list()
+
+for (tcga in levels(dev_purity$cancer)) {
+  d <- dplyr::filter(dev_purity, cancer == tcga)
+
+  ct       <- suppressWarnings(stats::cor.test(d$deviation, d$purity, method = "spearman"))
+  fit_age  <- stats::lm(deviation ~ age_years,          data = d)
+  fit_full <- stats::lm(deviation ~ age_years + purity, data = d)
+  slope    <- lm_term(fit_full, "purity", scale = 0.1)
+
+  dev_rows[[tcga]] <- tibble(
+    cancer              = tcga,
+    n                   = nrow(d),
+    purity_range        = sprintf("%.2f to %.2f", min(d$purity), max(d$purity)),
+    spearman_rho        = unname(ct$estimate),
+    spearman_p          = ct$p.value,
+    slope_per_10pct     = slope$estimate,
+    ci_low              = slope$CI_low,
+    ci_high             = slope$CI_high,
+    lm_p                = slope$p_value,
+    r2_purity_given_age = summary(fit_full)$r.squared - summary(fit_age)$r.squared
+  )
+}
+
+dev_purity_tbl <- dplyr::bind_rows(dev_rows) %>%
+  dplyr::mutate(cancer = factor(cancer, levels = names(map)))
+
+knitr::kable(
+  dev_purity_tbl, digits = 3,
+  caption = "Deviation against ABSOLUTE purity per cancer. Spearman is unadjusted; the slope and CI are from deviation ~ age + purity, per 10 percentage points of purity."
+)
+```
+
+Scatter per cancer with an unadjusted linear fit and the Spearman
+correlation in each panel. The slope and R-squared gain stay in the table
+above as the record.
+Dashed line: the GTEx age expectation (deviation of zero).
+
+```{r, fig.width=7.5, fig.height=5}
+dev_labels <- dev_purity_tbl %>%
+  dplyr::mutate(label = sprintf("rho = %.2f, %s", spearman_rho,
+                                ifelse(spearman_p < 0.001, "p < 0.001", sprintf("p = %.3f", spearman_p))))
+
+p_dev_purity <- ggplot(dev_purity, aes(x = purity, y = deviation)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey55") +
+  geom_point(alpha = 0.35, size = 0.9, colour = "grey30") +
+  geom_smooth(method = "lm", formula = y ~ x, se = TRUE, colour = "#d7191c", linewidth = 0.8) +
+  geom_text(data = dev_labels, aes(x = Inf, y = Inf, label = label),
+            hjust = 1.05, vjust = 1.3, size = 3, colour = "grey20", inherit.aes = FALSE) +
+  facet_wrap(~ cancer, ncol = 3, scales = "free_y") +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.25))) +   # headroom for the annotation
+  labs(x = "Tumor purity (ABSOLUTE)", y = "Age-matched deviation (years)") +
+  theme_supp()
+
+p_dev_purity
+```
+
+---
+
+# Analysis 2 — Deviation and overall survival with purity, six cancers
+
+**Question.** Do the cross-cancer deviation-survival associations change
+when purity is in the model, and is purity itself prognostic?
+
+**Why.** The cross-cancer survival panel fits `Surv ~ age + deviation` per
+cancer. If purity predicts survival and also predicts deviation, the
+deviation effect could be carried by purity. Refitting with purity added, on
+the same tumors, tests that directly.
+
+**How.** Three rows per cancer. The first reproduces the figure's model on
+all OS-eligible tumors. The second and third use only tumors with a purity
+value, without and with purity, so those two are compared on identical
+tumors. HR is per one year of deviation. Purity's own HR is per 10
+percentage points. When comparing the first row with the other two, the
+estimate is the comparison; the p-value also moves with the sample size.
+
+```{r}
+surv_all <- purity_data$samples %>%
+  dplyr::filter(is.finite(os_time), !is.na(os_event), is.finite(age_years))
+
+surv_rows <- list()
+pur_rows  <- list()
+
+for (tcga in levels(surv_all$cancer)) {
+  d_all <- dplyr::filter(surv_all, cancer == tcga)
+  d_pur <- dplyr::filter(d_all, !is.na(purity))
+
+  specs <- list(
+    list(label = "age + deviation (all OS-eligible tumors)", data = d_all, f = "Surv(os_time, os_event) ~ age_years + deviation"),
+    list(label = "age + deviation (tumors with purity)",     data = d_pur, f = "Surv(os_time, os_event) ~ age_years + deviation"),
+    list(label = "age + deviation + purity",                 data = d_pur, f = "Surv(os_time, os_event) ~ age_years + deviation + purity")
+  )
+
+  for (s in specs) {
+    surv_rows[[paste(tcga, s$label)]] <- cox_term(s$data, s$f, "deviation") %>%
+      dplyr::mutate(cancer = tcga, model = s$label, n = nrow(s$data), events = sum(s$data$os_event)) %>%
+      dplyr::select(cancer, model, n, events, HR, CI_low, CI_high, p_value)
+  }
+
+  pur_rows[[tcga]] <- cox_term(d_pur, "Surv(os_time, os_event) ~ age_years + deviation + purity", "purity", scale = 0.1) %>%
+    dplyr::mutate(cancer = tcga, n = nrow(d_pur), events = sum(d_pur$os_event)) %>%
+    dplyr::select(cancer, n, events, HR, CI_low, CI_high, p_value)
+}
+
+surv_purity_tbl <- dplyr::bind_rows(surv_rows) %>%
+  dplyr::mutate(cancer = factor(cancer, levels = names(map)))
+
+knitr::kable(
+  surv_purity_tbl, digits = 4,
+  caption = "Overall-survival hazard ratio per +1 year of deviation, by cancer, without and with purity in the model. Rows 2 and 3 of each cancer are fit on the same tumors."
+)
+```
+
+The supplementary table: one row per cancer, the deviation hazard ratio
+without and with purity on the tumors that have a purity value. The
+figure's estimate on all OS-eligible tumors is already in the main survival
+table and is not repeated; it stays in the record table above.
+
+```{r}
+fmt_hr <- function(hr, lo, hi) sprintf("%.3f (%.3f-%.3f)", hr, lo, hi)
+fmt_pv <- function(p) ifelse(p < 0.001, "<0.001", sprintf("%.3f", p))
+
+surv_purity_si_tbl <- surv_purity_tbl %>%
+  dplyr::mutate(
+    column = dplyr::case_when(
+      model == "age + deviation (all OS-eligible tumors)" ~ "figure",
+      model == "age + deviation (tumors with purity)"     ~ "age",
+      model == "age + deviation + purity"                 ~ "age_purity"
+    ),
+    hr_ci = fmt_hr(HR, CI_low, CI_high),
+    p     = fmt_pv(p_value)
+  ) %>%
+  dplyr::select(cancer, column, n, events, hr_ci, p) %>%
+  tidyr::pivot_wider(names_from = column, values_from = c(n, events, hr_ci, p)) %>%
+  dplyr::transmute(
+    Cancer                                        = cancer,
+    `Tumors (events)`                             = sprintf("%d (%d)", n_age, events_age),
+    `HR per year, age-adjusted (95% CI)`          = hr_ci_age,
+    `p`                                           = p_age,
+    `HR per year, age + purity adjusted (95% CI)` = hr_ci_age_purity,
+    `p `                                          = p_age_purity
+  )
+
+knitr::kable(
+  surv_purity_si_tbl,
+  caption = "Supplementary table: overall-survival hazard ratio per +1 year of age-matched deviation, by cancer, on the tumors with a purity value, from the age-adjusted model and from the same model with tumor purity added."
+)
+```
+
+---
+
+# BRCA — tumor table for the breast analyses
+
+BRCA tumors with PAM50 relabelled as in the figures ("Normal" to
+"Normal-Like"). Purity may be missing; each analysis below filters as it
+needs.
+
+```{r}
+brca <- purity_data$samples %>%
+  dplyr::filter(cancer == "BRCA") %>%
+  dplyr::mutate(pam50 = harmonize_pam50(pam50))
+
+stopifnot(!anyNA(brca$pam50))
+stopifnot(identical(rownames(purity_data$phi_brca), brca$sample_id))
+
+brca_pur <- dplyr::filter(brca, !is.na(purity))
+phi_b    <- purity_data$phi_brca[brca_pur$sample_id, , drop = FALSE]
+retained <- colnames(phi_b)[colSums(abs(phi_b)) > 0]
+
+msg("BRCA tumors: ", nrow(brca), "; with purity: ", nrow(brca_pur),
+    "; retained pathways: ", length(retained))
+```
+
+---
+
+# Analysis 3 — BRCA pathway contributions against purity
+
+Kept in this report as the record (not used in the manuscript).
+
+**Question.** Which pathway contributions track purity in BRCA, and are
+they the same pathways that carry the mean youth-like shift?
+
+**Why.** Purity could scale every contribution equally, or it could act
+through particular programs. Immune and stromal Hallmark sets are expected
+to depend on how much non-malignant tissue is in the sample; proliferative
+programs are not. Comparing each pathway's cohort-mean contribution with its
+purity dependence separates the two roles. PAM50 is the dominant source of
+variation in BRCA, so each correlation is also computed within subtype.
+
+**How.** BRCA tumors with purity, and the pathways the breast clock retained
+(non-zero column). For each pathway: Spearman correlation between its
+contribution and purity, raw, and the partial Spearman correlation after
+regressing both the contribution and purity on PAM50. Total deviation is
+included as a reference row. Benjamini-Hochberg adjustment is over the
+pathways only.
+
+```{r}
+partial_spearman <- function(x, y, z) {
+  rx <- stats::residuals(stats::lm(x ~ z))
+  ry <- stats::residuals(stats::lm(y ~ z))
+  ct <- suppressWarnings(stats::cor.test(rx, ry, method = "spearman"))
+  c(rho = unname(ct$estimate), p = ct$p.value)
+}
+
+path_rows <- list()
+
+for (pw in c("Total deviation", retained)) {
+  v   <- if (pw == "Total deviation") brca_pur$deviation else phi_b[, pw]
+  raw <- suppressWarnings(stats::cor.test(v, brca_pur$purity, method = "spearman"))
+  adj <- partial_spearman(v, brca_pur$purity, brca_pur$pam50)
+
+  path_rows[[pw]] <- tibble(
+    pathway       = pw,
+    mean_phi      = mean(v),
+    rho_raw       = unname(raw$estimate),
+    p_raw         = raw$p.value,
+    rho_pam50_adj = adj[["rho"]],
+    p_pam50_adj   = adj[["p"]]
+  )
+}
+
+phi_purity_tbl <- dplyr::bind_rows(path_rows)
+
+is_pw <- phi_purity_tbl$pathway != "Total deviation"
+phi_purity_tbl$p_raw_bh       <- NA_real_
+phi_purity_tbl$p_pam50_adj_bh <- NA_real_
+phi_purity_tbl$p_raw_bh[is_pw]       <- stats::p.adjust(phi_purity_tbl$p_raw[is_pw],       method = "BH")
+phi_purity_tbl$p_pam50_adj_bh[is_pw] <- stats::p.adjust(phi_purity_tbl$p_pam50_adj[is_pw], method = "BH")
+
+phi_purity_tbl <- phi_purity_tbl %>%
+  dplyr::arrange(pathway != "Total deviation", dplyr::desc(abs(rho_raw)))
+
+knitr::kable(
+  phi_purity_tbl, digits = 3,
+  caption = "BRCA pathway contributions against purity. rho_raw is the Spearman correlation; rho_pam50_adj is the partial Spearman correlation after regressing both variables on PAM50. BH adjustment is over the retained pathways."
+)
+```
+
+## Overview: mean contribution beside purity correlation
+
+Each retained pathway's mean contribution beside its purity correlation, in
+the same order. A pathway with a large mean and near-zero correlation
+carries the cohort shift regardless of purity; a pathway with a near-zero
+mean and a large correlation moves individual tumors with purity but
+averages out.
+
+```{r, fig.width=8, fig.height=5.5}
+phi_plot_df <- phi_purity_tbl %>%
+  dplyr::filter(pathway != "Total deviation") %>%
+  dplyr::mutate(pathway = factor(pathway, levels = pathway[order(mean_phi)])) %>%
+  dplyr::select(pathway, `Mean contribution (years)` = mean_phi, `Spearman correlation with purity` = rho_raw) %>%
+  tidyr::pivot_longer(-pathway, names_to = "metric", values_to = "value") %>%
+  dplyr::mutate(metric = factor(metric, levels = c("Mean contribution (years)", "Spearman correlation with purity")))
+
+p_phi_purity <- ggplot(phi_plot_df, aes(x = value, y = pathway)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey55") +
+  geom_segment(aes(x = 0, xend = value, yend = pathway), colour = "grey70", linewidth = 0.6) +
+  geom_point(aes(colour = value < 0), size = 2.6) +
+  scale_colour_manual(values = c("TRUE" = "#2c7bb6", "FALSE" = "#d7191c"), guide = "none") +
+  facet_wrap(~ metric, scales = "free_x") +
+  labs(x = NULL, y = NULL) +
+  theme_supp() +
+  theme(panel.grid.major.y = element_blank())
+
+p_phi_purity
+```
+
+## Pathways of interest: contribution against purity, per tumor
+
+The six pathways the BRCA figures discuss (G2M checkpoint, glycolysis,
+myogenesis, P53 pathway, Wnt/β-catenin, unfolded protein response) and
+three immune or stromal pathways with the strongest purity dependence.
+One point per tumor, coloured by PAM50, with an unadjusted linear fit and
+the Spearman correlation in each panel title. Dashed line: the age
+expectation (contribution of zero).
+
+```{r, fig.width=9, fig.height=8}
+poi <- intersect(params$poi_pathways, colnames(phi_b))
+if (length(poi) < length(params$poi_pathways)) {
+  msg("Pathways of interest not found in the contribution matrix: ",
+      paste(setdiff(params$poi_pathways, colnames(phi_b)), collapse = ", "))
+}
+
+poi_long <- as.data.frame(phi_b[, poi, drop = FALSE]) %>%
+  tibble::rownames_to_column("sample_id") %>%
+  tidyr::pivot_longer(-sample_id, names_to = "pathway", values_to = "phi") %>%
+  dplyr::left_join(brca_pur %>% dplyr::select(sample_id, purity, pam50), by = "sample_id")
+
+poi_labels <- phi_purity_tbl %>%
+  dplyr::filter(pathway %in% poi) %>%
+  dplyr::mutate(label = sprintf("%s\nrho = %.2f, mean = %.1f yr", pathway, rho_raw, mean_phi)) %>%
+  dplyr::select(pathway, label)
+
+poi_long <- poi_long %>%
+  dplyr::left_join(poi_labels, by = "pathway") %>%
+  dplyr::mutate(label = factor(label, levels = poi_labels$label[match(poi, poi_labels$pathway)]))
+
+p_poi_purity <- ggplot(poi_long, aes(x = purity, y = phi)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey55") +
+  geom_point(aes(colour = pam50), alpha = 0.45, size = 0.9) +
+  geom_smooth(method = "lm", formula = y ~ x, se = TRUE, colour = "black", linewidth = 0.7) +
+  scale_colour_manual(values = pam50_pal, name = "PAM50") +
+  facet_wrap(~ label, ncol = 3, scales = "free_y") +
+  labs(x = "Tumor purity (ABSOLUTE)", y = "Pathway contribution (ClockSHAP, years)") +
+  theme_supp() +
+  theme(legend.position = "bottom") +
+  guides(colour = guide_legend(override.aes = list(alpha = 1, size = 2.5)))
+
+p_poi_purity
+```
+
+---
+
+# Analysis 4 — BRCA main-text claims with purity in the model
+
+## 4a. Subtype ordering
+
+**Question.** Does the PAM50 ordering of deviation hold once purity is
+accounted for?
+
+**Why.** Subtypes differ in purity (Normal-Like lowest), so part of the
+subtype spread in deviation could be composition. If purity were behind the
+subtype effect, adding it would absorb that effect.
+
+**How.** `deviation ~ PAM50 + age` and `deviation ~ PAM50 + age + purity`
+on tumors with purity. Adjusted means are predictions per subtype at the
+cohort mean age and, in the second model, the cohort mean purity. The
+PAM50 partial F in each model shows whether the subtype effect shrinks or
+grows when purity is added.
+
+```{r}
+fit_sub   <- stats::lm(deviation ~ pam50 + age_years,          data = brca_pur)
+fit_sub_p <- stats::lm(deviation ~ pam50 + age_years + purity, data = brca_pur)
+
+newdat <- tibble(
+  pam50     = factor(pam50_levels, levels = pam50_levels),
+  age_years = mean(brca_pur$age_years),
+  purity    = mean(brca_pur$purity)
+)
+adj_mean <- function(fit) as.numeric(stats::predict(fit, newdata = newdat))
+
+subtype_tbl <- tibble(
+  pam50                = pam50_levels,
+  n                    = as.integer(table(brca_pur$pam50)[pam50_levels]),
+  mean_purity          = as.numeric(tapply(brca_pur$purity,    brca_pur$pam50, mean)[pam50_levels]),
+  raw_mean_deviation   = as.numeric(tapply(brca_pur$deviation, brca_pur$pam50, mean)[pam50_levels]),
+  age_adjusted         = adj_mean(fit_sub),
+  age_purity_adjusted  = adj_mean(fit_sub_p)
+)
+
+knitr::kable(
+  subtype_tbl, digits = 2,
+  caption = "Mean deviation by PAM50 subtype: raw, adjusted for age, and adjusted for age and purity."
+)
+```
+
+```{r}
+pur_slope <- lm_term(fit_sub_p, "purity", scale = 0.1)
+an_s  <- stats::anova(fit_sub)
+an_sp <- stats::anova(fit_sub_p)
+
+subtype_model_tbl <- tibble(
+  quantity = c(
+    "Purity slope per 10 pct (years), age + PAM50 adjusted",
+    "Purity p-value",
+    "PAM50 partial F, without purity",
+    "PAM50 partial F, with purity",
+    "R-squared, age + PAM50",
+    "R-squared, age + PAM50 + purity"
+  ),
+  value = c(
+    pur_slope$estimate,
+    pur_slope$p_value,
+    an_s["pam50", "F value"],
+    an_sp["pam50", "F value"],
+    summary(fit_sub)$r.squared,
+    summary(fit_sub_p)$r.squared
+  )
+)
+
+knitr::kable(subtype_model_tbl, digits = 4, caption = "Model terms for the two subtype models.")
+```
+
+Age-matched deviation by PAM50 subtype after purity adjustment, drawn as
+in the main subtype panel. Each tumor's
+deviation is adjusted to the cohort mean purity using the purity slope from
+`deviation ~ PAM50 + age + purity`, which leaves the subtype and age
+structure untouched and removes only the purity component. Adjacent normal
+has no purity estimate and is not shown. Subtypes compared by
+Kruskal-Wallis on the adjusted values, as in the main panel.
+
+```{r, fig.width=4, fig.height=3.75}
+purity_beta <- stats::coef(fit_sub_p)[["purity"]]
+
+brca_adj <- brca_pur %>%
+  dplyr::mutate(deviation_adj = deviation - purity_beta * (purity - mean(purity)))
+
+kw_adj <- suppressWarnings(stats::kruskal.test(deviation_adj ~ pam50, data = brca_adj))
+fmt_p  <- function(p) if (p < 2.2e-16) "p < 2.2e-16" else paste0("p = ", formatC(p, format = "e", digits = 2))
+
+y_lab_pos <- max(brca_adj$deviation_adj) + 0.05 * diff(range(brca_adj$deviation_adj))
+
+p_subtype_adj <- ggplot(brca_adj, aes(x = pam50, y = deviation_adj, fill = pam50)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_jitter(width = 0.18, alpha = 0.18, size = 0.7, colour = "grey25") +
+  geom_boxplot(width = 0.6, outlier.shape = NA, alpha = 0.85) +
+  scale_fill_manual(values = pam50_pal, guide = "none") +
+  coord_cartesian(ylim = c(-60, NA)) +
+  annotate("text", x = -Inf, y = y_lab_pos, label = paste("Kruskal-Wallis", fmt_p(kw_adj$p.value)),
+           hjust = -0.05, vjust = 1, size = 4) +
+  labs(x = NULL, y = "Age-matched deviation, purity-adjusted (years)") +
+  theme_minimal(base_size = 10) +
+  theme(
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.x = element_blank(),
+    axis.title.y       = element_text(size = 10),
+    axis.text.x        = element_text(size = 9),
+    axis.text.y        = element_text(size = 8),
+    plot.margin        = margin(10, 10, 10, 10)
+  )
+
+p_subtype_adj
+```
+
+## 4b. Overall survival: the figure's Cox forest with purity added
+
+**Question.** Does any row of the BRCA survival forest change when purity
+is added?
+
+**Why.** The survival figure reports the aggregate deviation-survival
+association, its attenuation under PAM50 adjustment, and the within-subtype
+estimates. Each is a claim that purity could confound.
+
+**How.** The figure's row set and models, TCGA only: `Surv ~ age +
+deviation` on all tumors, the same with PAM50, and the same within each
+subtype (a subtype is fit when it has at least 5 tumors and 2 events, as in
+the figure). Every row is fit twice on the tumors with purity: as in the
+figure, and with purity added. The forest uses the figure's colour (HR
+direction) and shape (p below 0.05) conventions. The all-tumor row on the
+full cohort, without the purity filter, is the first BRCA row of
+Analysis 2.
+
+```{r}
+surv_brca_pur <- dplyr::filter(brca_pur, is.finite(os_time), !is.na(os_event), is.finite(age_years))
+
+msg("OS-eligible BRCA tumors with purity: ", nrow(surv_brca_pur), " (", sum(surv_brca_pur$os_event), " events).")
+
+run_forest_rows <- function(df, with_purity) {
+  add <- if (with_purity) " + purity" else ""
+  rows <- list()
+
+  rows[["all"]] <- cox_term(df, paste0("Surv(os_time, os_event) ~ age_years + deviation", add), "deviation") %>%
+    dplyr::mutate(model = "All tumors", n = nrow(df), events = sum(df$os_event))
+
+  rows[["pam50"]] <- cox_term(df, paste0("Surv(os_time, os_event) ~ age_years + deviation + pam50", add), "deviation") %>%
+    dplyr::mutate(model = "All tumors (PAM50-adjusted)", n = nrow(df), events = sum(df$os_event))
+
+  for (s in pam50_levels) {
+    d <- dplyr::filter(df, pam50 == s)
+    if (nrow(d) < 5 || sum(d$os_event) < 2) next
+    rows[[s]] <- cox_term(d, paste0("Surv(os_time, os_event) ~ age_years + deviation", add), "deviation") %>%
+      dplyr::mutate(model = paste("Subtype:", s), n = nrow(d), events = sum(d$os_event))
+  }
+
+  dplyr::bind_rows(rows) %>%
+    dplyr::mutate(adjustment = if (with_purity) "Age + purity adjusted" else "Age adjusted (as in figure)") %>%
+    dplyr::select(adjustment, model, n, events, HR, CI_low, CI_high, p_value)
+}
+
+brca_forest_tbl <- dplyr::bind_rows(
+  run_forest_rows(surv_brca_pur, with_purity = FALSE),
+  run_forest_rows(surv_brca_pur, with_purity = TRUE)
+)
+
+knitr::kable(
+  brca_forest_tbl, digits = 4,
+  caption = "BRCA overall-survival forest rows (TCGA, tumors with purity): hazard ratio per +1 year of deviation, as in the figure and with purity added."
+)
+```
+
+The comparison table above is the record. The panel below shows the
+purity-adjusted rows alone, drawn as the TCGA-BRCA half of the main
+survival forest; the unadjusted rows are the main panel.
+
+```{r, fig.width=3.7, fig.height=2.6}
+forest_df <- brca_forest_tbl %>%
+  dplyr::filter(adjustment == "Age + purity adjusted") %>%
+  dplyr::mutate(
+    model  = factor(model, levels = rev(unique(model))),
+    sig    = ifelse(p_value < 0.05, "p < 0.05", "p ≥ 0.05"),
+    hr_dir = factor(
+      ifelse(HR < 1, '"youth-like" deviation, increased risk', 'less "youth-like" deviation, increased risk'),
+      levels = names(hr_pal)
+    ),
+    cohort = "TCGA-BRCA (OS), age + purity adjusted"
+  )
+
+p_brca_forest <- ggplot(forest_df, aes(x = HR, y = model, colour = hr_dir)) +
+  geom_errorbarh(aes(xmin = CI_low, xmax = CI_high), height = 0.2, linewidth = 0.55) +
+  geom_point(aes(shape = sig), size = 2.6) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey55") +
+  scale_x_log10() +
+  scale_shape_manual(values = c("p < 0.05" = 19, "p ≥ 0.05" = 1), name = NULL, drop = FALSE) +
+  scale_colour_manual(values = hr_pal, name = NULL, drop = FALSE) +
+  facet_wrap(~ cohort, ncol = 1) +
+  labs(x = "HR per +1 yr of Deviation, age + purity adjusted (log scale)", y = NULL) +
+  theme_minimal(base_size = 9) +
+  theme(
+    strip.text         = element_text(face = "bold", size = 9),
+    strip.background   = element_rect(fill = "grey95", colour = NA),
+    panel.grid.major.y = element_blank(),
+    legend.position    = "bottom",
+    legend.box         = "vertical",
+    legend.spacing.y   = unit(1, "pt"),
+    legend.margin      = margin(0, 0, 0, 0),
+    legend.text        = element_text(size = 8),
+    axis.text          = element_text(size = 8),
+    axis.title         = element_text(size = 9),
+    plot.margin        = margin(4, 4, 4, 4)
+  )
+
+p_brca_forest
+```
+
+Purity's own hazard ratio in the two aggregate models that include it.
+
+```{r}
+brca_cox_pur_tbl <- dplyr::bind_rows(
+  cox_term(surv_brca_pur, "Surv(os_time, os_event) ~ age_years + deviation + purity",         "purity", scale = 0.1) %>%
+    dplyr::mutate(model = "All tumors"),
+  cox_term(surv_brca_pur, "Surv(os_time, os_event) ~ age_years + deviation + pam50 + purity", "purity", scale = 0.1) %>%
+    dplyr::mutate(model = "All tumors (PAM50-adjusted)")
+) %>%
+  dplyr::select(model, HR, CI_low, CI_high, p_value)
+
+knitr::kable(
+  brca_cox_pur_tbl, digits = 4,
+  caption = "Purity's own BRCA overall-survival hazard ratio per +10 percentage points."
+)
+```
+
+## 4c. Truncating TP53 and the P53-pathway contribution
+
+**Question.** Does the association between truncating TP53 mutations and a
+more youth-like P53-pathway contribution hold with purity in the model?
+
+**Why.** This is the main-text claim most exposed to purity. The
+P53-pathway contribution correlates with purity (Analysis 3), and TP53
+mutation class is not independent of purity in breast cancer, so part of
+the contrast between classes could be composition, in either direction.
+
+**How.** TP53 classes follow the figure script: cBioPortal mutation table;
+truncating (nonsense, frameshift, splice site), missense, other (dropped);
+tumors without a TP53 entry are wild type; when a patient has several
+mutations the highest-impact class wins, and every tumor profile of a
+patient carries that patient's class. The unit of analysis is the patient:
+a patient with more than one tumor profile is represented once, by the mean
+of their P53-pathway contributions (PAM50, purity, and TP53 class are
+patient-level and identical across a patient's profiles). This matters here
+because several replicated patients fall into the small mutation classes.
+As in the figure, all five tumor PAM50 subtypes are kept and the model
+adjusts for PAM50. Estimated marginal means per class and each class
+against wild type with Dunnett adjustment, as in the figure. Three fits:
+all TCGA patients (TCGA-only model), patients with purity, and patients
+with purity plus the purity term, with the marginal means taken at the
+cohort mean purity.
+
+```{r}
+tp53_raw <- utils::read.delim(
+  params$tp53_tsv, sep = "\t", quote = "", check.names = FALSE, stringsAsFactors = FALSE
+)
+
+# cBioPortal exports can carry duplicate column names; keep only the three columns used
+tp53_cols <- c("Gene", "Sample ID", "Mutation Type")
+stopifnot(all(tp53_cols %in% colnames(tp53_raw)))
+tp53_raw <- tp53_raw[, match(tp53_cols, colnames(tp53_raw)), drop = FALSE]
+
+trunc_classes <- c("Nonsense_Mutation", "Frame_Shift_Del", "Frame_Shift_Ins", "Splice_Site")
+miss_classes  <- c("Missense_Mutation")
+
+tp53_by_patient <- tp53_raw %>%
+  dplyr::filter(Gene == "TP53") %>%
+  dplyr::transmute(
+    patient = substr(`Sample ID`, 1, 12),
+    class   = dplyr::case_when(
+      `Mutation Type` %in% trunc_classes ~ "Truncating",
+      `Mutation Type` %in% miss_classes  ~ "Missense",
+      TRUE                               ~ "Other_Mut"
+    )
+  ) %>%
+  dplyr::group_by(patient) %>%
+  dplyr::summarise(
+    tp53 = dplyr::case_when(
+      any(class == "Truncating") ~ "Truncating",
+      any(class == "Missense")   ~ "Missense",
+      TRUE                       ~ "Other_Mut"
+    ),
+    .groups = "drop"
+  )
+
+p53_col <- grep("^p53", colnames(purity_data$phi_brca), ignore.case = TRUE, value = TRUE)
+stopifnot(length(p53_col) == 1)
+
+# one row per tumor profile, every profile carrying its patient's TP53 class
+tp53_profiles <- brca %>%
+  dplyr::mutate(p53_phi = as.numeric(purity_data$phi_brca[sample_id, p53_col])) %>%
+  dplyr::left_join(tp53_by_patient, by = "patient") %>%
+  dplyr::mutate(tp53 = ifelse(is.na(tp53), "WT", tp53)) %>%
+  dplyr::filter(tp53 != "Other_Mut")
+
+# PAM50, purity, and TP53 class must not vary within a patient
+stopifnot(all(tp53_profiles %>% dplyr::count(patient, pam50, tp53) %>% dplyr::count(patient) %>% dplyr::pull(n) == 1))
+stopifnot(all(tp53_profiles %>% dplyr::group_by(patient) %>% dplyr::summarise(k = dplyr::n_distinct(purity)) %>% dplyr::pull(k) == 1))
+
+# one row per patient: mean P53 contribution across that patient's profiles
+tp53_df <- tp53_profiles %>%
+  dplyr::group_by(patient, pam50, tp53, purity) %>%
+  dplyr::summarise(p53_phi = mean(p53_phi), n_profiles = dplyr::n(), .groups = "drop") %>%
+  dplyr::mutate(tp53 = factor(tp53, levels = c("WT", "Missense", "Truncating")))
+
+tp53_df_pur <- dplyr::filter(tp53_df, !is.na(purity))
+
+msg("TP53 analysis: ", nrow(tp53_profiles), " tumor profiles from ", nrow(tp53_df), " patients; ",
+    sum(tp53_df$n_profiles > 1), " patients with more than one profile.")
+
+knitr::kable(
+  tp53_df %>%
+    dplyr::group_by(tp53) %>%
+    dplyr::summarise(
+      patients            = dplyr::n(),
+      profiles            = sum(n_profiles),
+      with_purity         = sum(!is.na(purity)),
+      mean_purity         = mean(purity, na.rm = TRUE),
+      mean_p53_phi        = mean(p53_phi),
+      .groups = "drop"
+    ),
+  digits = 3,
+  caption = "BRCA patients by TP53 class (other mutation classes excluded), with the number of tumor profiles they contribute, mean purity, and mean P53-pathway contribution."
+)
+```
+
+```{r}
+tp53_specs <- list(
+  list(label = "All patients (TCGA-only model)",         data = tp53_df,     f = p53_phi ~ tp53 + pam50),
+  list(label = "Patients with purity",                   data = tp53_df_pur, f = p53_phi ~ tp53 + pam50),
+  list(label = "Patients with purity, purity-adjusted",  data = tp53_df_pur, f = p53_phi ~ tp53 + pam50 + purity)
+)
+
+emm_rows <- list()
+con_rows <- list()
+
+for (s in tp53_specs) {
+  fit <- stats::lm(s$f, data = s$data)
+  emm <- emmeans::emmeans(fit, ~ tp53)
+  con <- emmeans::contrast(emm, method = "trt.vs.ctrl", ref = "WT", adjust = "dunnettx")
+
+  emm_rows[[s$label]] <- as.data.frame(confint(emm)) %>%
+    tibble::as_tibble() %>%
+    dplyr::transmute(panel = s$label, tp53, emmean, lower.CL, upper.CL, n = nrow(s$data))
+
+  con_rows[[s$label]] <- as.data.frame(summary(con, infer = TRUE)) %>%
+    tibble::as_tibble() %>%
+    dplyr::transmute(panel = s$label, contrast, estimate, lower.CL, upper.CL, p_value = p.value, n = nrow(s$data))
+}
+
+tp53_emm_tbl <- dplyr::bind_rows(emm_rows)
+tp53_tbl     <- dplyr::bind_rows(con_rows)
+
+knitr::kable(
+  tp53_tbl, digits = 4,
+  caption = "Shift in P53-pathway contribution (years) for each TP53 class against wild type, PAM50-adjusted estimated marginal means with Dunnett adjustment, without and with purity. Negative values are more youth-like."
+)
+
+tp53_pur_tbl <- lm_term(stats::lm(p53_phi ~ tp53 + pam50 + purity, data = tp53_df_pur), "purity", scale = 0.1)
+
+knitr::kable(
+  tp53_pur_tbl, digits = 4,
+  caption = "Purity's own effect on the P53-pathway contribution (years per +10 percentage points), with TP53 class and PAM50 in the model."
+)
+```
+
+The TP53 panel with purity in the model, drawn as the TCGA-BRCA facet of
+the main panel. The three-fit table above is the
+record; the unadjusted estimate is the main panel.
+
+```{r, fig.width=3.25, fig.height=3.75}
+tp53_levels <- c("WT", "Missense", "Truncating")
+adj_label   <- "Patients with purity, purity-adjusted"
+
+emm_plot_df <- tp53_emm_tbl %>%
+  dplyr::filter(panel == adj_label) %>%
+  dplyr::mutate(tp53 = factor(as.character(tp53), levels = tp53_levels),
+                panel = "TCGA-BRCA, PAM50 + purity adjusted")
+
+# significance brackets positioned above the CI tops, staggered, as in the main figure
+ci_top  <- max(emm_plot_df$upper.CL)
+ci_span <- max(emm_plot_df$upper.CL) - min(emm_plot_df$lower.CL)
+
+annot_df <- tp53_tbl %>%
+  dplyr::filter(panel == adj_label) %>%
+  dplyr::mutate(
+    tp53       = sub(" - WT$", "", contrast),
+    p_label    = ifelse(p_value < 0.001, "p < 0.001", sprintf("p = %.3f", p_value)),
+    y.position = ci_top + ci_span * (0.10 + 0.18 * (dplyr::row_number() - 1)),
+    group1     = "WT",
+    group2     = tp53,
+    panel      = "TCGA-BRCA, PAM50 + purity adjusted"
+  )
+
+p_tp53 <- ggplot(emm_plot_df, aes(x = tp53, y = emmean)) +
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL), width = 0.15, linewidth = 0.8, colour = "#7b3294") +
+  geom_point(size = 3.5, colour = "#7b3294") +
+  ggpubr::stat_pvalue_manual(
+    annot_df,
+    label       = "p_label",
+    xmin        = "group1",
+    xmax        = "group2",
+    y.position  = "y.position",
+    tip.length  = 0.01,
+    inherit.aes = FALSE
+  ) +
+  facet_wrap(~ panel, nrow = 1) +
+  labs(x = "TP53 mutation class", y = "Emmean P53 Pathway Dev. (years, adj.)") +
+  theme_minimal(base_size = 10) +
+  theme(
+    strip.text         = element_text(size = 10, face = "bold"),
+    strip.background   = element_rect(fill = "grey95", colour = NA),
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.x = element_blank(),
+    axis.text.x        = element_text(size = 8, angle = 45, hjust = 1, vjust = 1),
+    axis.text.y        = element_text(size = 8)
+  )
+
+p_tp53
+```
+
+---
+
+# Save outputs
+
+When `save_outputs` is true (the default): the four panels as PDF, at the
+sizes of the corresponding main panels, and the survival table as CSV.
+
+```{r}
+if (isTRUE(params$save_outputs)) {
+  tables_root_abs <- here::here(params$tables_root)
+  fig_dir_abs     <- here::here(params$fig_dir)
+  dir.create(tables_root_abs, recursive = TRUE, showWarnings = FALSE)
+  dir.create(fig_dir_abs,     recursive = TRUE, showWarnings = FALSE)
+
+  out_tbl <- file.path(tables_root_abs, "Supplement_purity_survival_by_cancer.csv")
+  utils::write.csv(surv_purity_si_tbl, file = out_tbl, row.names = FALSE)
+  msg("Saved: ", out_tbl)
+
+  ggsave(file.path(fig_dir_abs, "Supplement_purity_deviation_vs_purity.pdf"),   p_dev_purity,  width = 8,    height = 5,    units = "in")
+  ggsave(file.path(fig_dir_abs, "Supplement_purity_PAM50_deviation.pdf"),       p_subtype_adj, width = 3.5,    height = 3.5, units = "in")
+  ggsave(file.path(fig_dir_abs, "Supplement_purity_OS_forest.pdf"),             p_brca_forest, width = 5,    height = 3,  units = "in")
+  ggsave(file.path(fig_dir_abs, "Supplement_purity_TP53_P53phi.pdf"),           p_tp53,        width = 3.5, height = 3.5, units = "in")
+  msg("Saved figures to: ", fig_dir_abs)
+}
+```
+
+## Session info
+
+```{r}
+sessionInfo()
+```

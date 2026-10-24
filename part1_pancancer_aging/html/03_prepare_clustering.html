@@ -11,7 +11,7 @@
 
 
 
-<title>03 — Prepare pan-cancer clustering for Fig. 1B</title>
+<title>03 — Prepare pan-cancer clustering</title>
 
 <script>// Pandoc 2.9 adds attributes on both header and div. We remove the former (to
 // be compatible with the behavior of Pandoc < 2.8).
@@ -348,19 +348,18 @@ display: none;
 
 
 
-<h1 class="title toc-ignore">03 — Prepare pan-cancer clustering for Fig.
-1B</h1>
+<h1 class="title toc-ignore">03 — Prepare pan-cancer clustering</h1>
 
 </div>
 
 
 <div id="overview" class="section level2">
 <h2>Overview</h2>
-<p>Fig. 1B clusters cancers from the cross-cancer similarity of their
-per-feature age-effect profiles. The clustering is hierarchical
-(Ward.D2) with optimal leaf ordering, applied to a distance matrix
-derived from per-layer Pearson similarities averaged across molecular
-layers.</p>
+<p>The clustering panel clusters cancers from the cross-cancer
+similarity of their per-feature age-effect profiles. The clustering is
+hierarchical (Ward.D2) with optimal leaf ordering, applied to a distance
+matrix derived from per-layer Pearson similarities averaged across
+molecular layers.</p>
 <p>This script:</p>
 <ol style="list-style-type: decimal">
 <li><strong>Loads</strong> per-cancer age-effect statistics for every
@@ -376,8 +375,8 @@ cancers.</li>
 informs the decision; the included set itself is specified explicitly so
 the rationale for each layer’s inclusion or exclusion is visible at the
 point of decision. Excluded layers are not discarded from the manuscript
-— they remain in Fig. 1A’s per-cancer counts; they are excluded only
-from the cross-cancer similarity step.</li>
+— they remain in the per-cancer counts; they are excluded only from the
+cross-cancer similarity step.</li>
 <li><strong>Combines</strong> retained layers via pairwise-available
 similarity averaging with a per-pair feature-overlap floor.</li>
 <li><strong>Clusters</strong> cancers from the resulting distance.</li>
@@ -439,7 +438,7 @@ most readable left-to- right arrangement among the equivalent
 orderings.</p>
 <pre class="r"><code>hcopt &lt;- function(d, HC = NULL, method = &quot;ward.D2&quot;, members = NULL) {
   if (!requireNamespace(&quot;cba&quot;, quietly = TRUE)) {
-    stop(&quot;Package &#39;cba&#39; is required for optimal leaf ordering in Fig. 1B clustering.&quot;)
+    stop(&quot;Package &#39;cba&#39; is required for optimal leaf ordering in the clustering.&quot;)
   }
 
   if (is.null(HC)) {
@@ -684,8 +683,8 @@ cross-cancer similarity. Two layers are excluded:</p>
 antibodies — too narrow a feature space to anchor cross-cancer
 similarity, and the dynamic range is much smaller than the genomics
 layers. This is a structural/measurement decision rather than a
-data-driven one. RPPA’s per-cancer counts still appear in Fig.
-1A.</p></li>
+data-driven one. RPPA’s per-cancer counts still appear in the count
+panel.</p></li>
 <li><p><strong>Mutation</strong>: the per-cancer mutation regression
 applies a <code>min_group_size   = 10</code> filter (a gene is tested
 only if both ≥ 10 mutated and ≥ 10 wild- type samples exist). This
@@ -693,7 +692,7 @@ restricts each cancer’s testable feature set to its recurrent driver
 genes, which are largely tissue-specific. The diagnostic above shows
 median pairwise feature overlap of ~1, far below what is needed for
 stable Pearson similarity. Mutation’s per-cancer counts still appear in
-Fig. 1A.</p></li>
+the count panel.</p></li>
 </ul>
 <p>The remaining four layers — Methylation, RNA-seq, miRNA, SCNA — are
 retained for clustering. SCNA passes the median-overlap criterion but

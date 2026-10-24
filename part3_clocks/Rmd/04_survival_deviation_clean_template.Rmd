@@ -38,7 +38,7 @@ knitr::opts_chunk$set(
 Per-cancer Cox survival analysis of age-matched **Deviation**
 (GTEx-anchored, in years) against OS and PFI endpoints from the
 TCGA integrated clinical file (CDR-like). Deviation is loaded
-directly from the saved ClockSHAP object (Step 04 output), not
+directly from the saved ClockSHAP object (the ClockSHAP step output), not
 recomputed.
 
 Outputs a single per-cancer RDS at:

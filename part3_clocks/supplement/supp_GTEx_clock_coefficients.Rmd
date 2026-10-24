@@ -1,0 +1,244 @@
+---
+title: "Supplementary table — GTEx clock coefficients"
+subtitle: "Per-pathway coefficients of the BREAST, LUNG, BRAIN, and COLON clocks"
+author: "Pan-cancer aging project"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: united
+    code_folding: hide
+    toc: true
+    toc_float: true
+params:
+  out_root: "results/derived/GTEx"
+  feature_set: "PC"
+  tables_root: "results/tables"
+  verbose: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Purpose
+
+This collects the fitted coefficients of the four GTEx tissue clocks into a
+single supplementary table. Each clock was fit and saved by the clock-training
+step (`clock_and_RAA_objects-<feature_set>.rds`), so nothing is refit or
+recomputed here. The script only reads the stored clocks and lays them out.
+
+The clocks are stored in the standardized form used in the Methods,
+
+`predicted age = b0 + sum_k b_k * (x_k - mu_k) / sigma_k`,
+
+where `mu_k` and `sigma_k` are the GTEx training mean and standard deviation of
+pathway `k`. The table reports `b_k`, `mu_k`, and `sigma_k` for every pathway,
+plus the per-pathway weight `w_k = b_k / sigma_k` that ClockSHAP uses, and the
+intercept `b0` of each clock. A pathway is "retained" when its coefficient is
+non-zero.
+
+```{r}
+suppressPackageStartupMessages({
+  library(here)
+  library(dplyr)
+  library(tibble)
+  library(tidyr)
+  library(knitr)
+  library(reactable)
+})
+
+msg <- function(...) if (isTRUE(params$verbose)) message(...)
+```
+
+## Clocks
+
+One clock per GTEx tissue. Each is read from the analysis directory of one
+TCGA cancer paired with that tissue. Lung and brain are each paired with two
+cancers; the second directory of each is compared against the first further
+down.
+
+```{r}
+clock_map <- list(
+  BREAST = "BRCA__BREAST",
+  LUNG   = "LUAD__LUNG",
+  BRAIN  = "LGG__BRAIN",
+  COLON  = "COAD__COLON"
+)
+```
+
+## Load saved clocks
+
+```{r}
+suffix       <- paste0("-", params$feature_set)
+out_root_abs <- here::here(params$out_root)
+
+coef_list <- list()
+
+for (tissue in names(clock_map)) {
+  clock_path <- file.path(out_root_abs, clock_map[[tissue]],
+                          paste0("clock_and_RAA_objects", suffix, ".rds"))
+  clock <- readRDS(clock_path)
+
+  feat  <- clock$feature_names
+  cs    <- clock$clock_cs
+  beta  <- cs$beta;  if (is.null(names(beta)))  names(beta)  <- feat
+  mu    <- cs$mu;    if (is.null(names(mu)))    names(mu)    <- feat
+  sigma <- cs$sigma; if (is.null(names(sigma))) names(sigma) <- feat
+
+  beta  <- as.numeric(beta[feat])
+  mu    <- as.numeric(mu[feat])
+  sigma <- as.numeric(sigma[feat])
+
+  # intercept row first, then one row per pathway in the clock's stored order
+  coef_list[[tissue]] <- dplyr::bind_rows(
+    tibble(
+      Tissue             = tissue,
+      Pathway            = "(Intercept)",
+      Coefficient_per_SD = as.numeric(cs$alpha),
+      GTEx_mean          = NA_real_,
+      GTEx_SD            = NA_real_,
+      Weight             = NA_real_,
+      Retained           = NA
+    ),
+    tibble(
+      Tissue             = tissue,
+      Pathway            = feat,
+      Coefficient_per_SD = beta,
+      GTEx_mean          = mu,
+      GTEx_SD            = sigma,
+      Weight             = beta / sigma,
+      Retained           = is.finite(beta) & beta != 0
+    )
+  )
+}
+
+coef_tbl <- dplyr::bind_rows(coef_list) %>%
+  dplyr::mutate(Tissue = factor(Tissue, levels = names(clock_map)))
+
+msg("Loaded ", length(coef_list), " clocks, ", nrow(coef_tbl), " rows.")
+```
+
+## Pathways retained per clock
+
+Number of input pathways and of pathways with a non-zero coefficient in each
+clock.
+
+```{r}
+retained_tbl <- coef_tbl %>%
+  dplyr::filter(Pathway != "(Intercept)") %>%
+  dplyr::group_by(Tissue) %>%
+  dplyr::summarise(
+    Input_pathways    = dplyr::n(),
+    Retained_pathways = sum(Retained),
+    .groups = "drop"
+  )
+
+knitr::kable(
+  retained_tbl,
+  caption = "Input and retained (non-zero coefficient) pathways per clock."
+)
+```
+
+## Coefficients by pathway and tissue
+
+Coefficient per GTEx standard deviation of each pathway score (`b_k`, in
+years), one column per clock, with the intercept in the first row. A zero means
+the clock did not retain that pathway. This is a view of the full table saved
+below, shown here rounded to four significant figures.
+
+```{r}
+coef_wide <- coef_tbl %>%
+  dplyr::select(Pathway, Tissue, Coefficient_per_SD) %>%
+  tidyr::pivot_wider(names_from = Tissue, values_from = Coefficient_per_SD)
+
+coef_wide_print <- coef_wide %>%
+  dplyr::mutate(dplyr::across(where(is.numeric), ~ signif(., 4)))
+
+reactable::reactable(
+  coef_wide_print,
+  searchable = TRUE, resizable = TRUE, striped = TRUE,
+  highlight = TRUE, defaultPageSize = 51
+)
+
+knitr::kable(
+  coef_wide_print,
+  caption = "Clock coefficients per GTEx standard deviation of each pathway score (years), by tissue."
+)
+```
+
+## Full table
+
+One row per tissue and pathway, as saved.
+
+```{r}
+reactable::reactable(
+  coef_tbl %>%
+    dplyr::mutate(dplyr::across(where(is.numeric), ~ signif(., 4))),
+  searchable = TRUE, resizable = TRUE, striped = TRUE,
+  highlight = TRUE, defaultPageSize = 51
+)
+```
+
+## Lung and brain: second analysis directory
+
+The lung clock is fit once in `LUAD__LUNG` and once in `LUSC__LUNG`, and the
+brain clock once in `LGG__BRAIN` and once in `GBM__BRAIN`. The table above uses
+the first of each pair. This compares the clock stored in the second directory
+against it. Differences of zero mean the two directories hold the same clock.
+
+```{r}
+shared_map <- list(
+  LUNG  = "LUSC__LUNG",
+  BRAIN = "GBM__BRAIN"
+)
+
+shared_list <- list()
+
+for (tissue in names(shared_map)) {
+  clock_a <- readRDS(file.path(out_root_abs, clock_map[[tissue]],
+                               paste0("clock_and_RAA_objects", suffix, ".rds")))
+  clock_b <- readRDS(file.path(out_root_abs, shared_map[[tissue]],
+                               paste0("clock_and_RAA_objects", suffix, ".rds")))
+
+  feat_a <- clock_a$feature_names
+  feat_b <- clock_b$feature_names
+
+  beta_a <- clock_a$clock_cs$beta; if (is.null(names(beta_a))) names(beta_a) <- feat_a
+  beta_b <- clock_b$clock_cs$beta; if (is.null(names(beta_b))) names(beta_b) <- feat_b
+
+  shared_list[[tissue]] <- tibble(
+    Tissue                = tissue,
+    Table_clock           = clock_map[[tissue]],
+    Second_clock          = shared_map[[tissue]],
+    Same_pathways         = setequal(feat_a, feat_b),
+    Max_abs_coef_diff     = max(abs(as.numeric(beta_a[feat_a]) - as.numeric(beta_b[feat_a]))),
+    Abs_intercept_diff    = abs(as.numeric(clock_a$clock_cs$alpha) - as.numeric(clock_b$clock_cs$alpha))
+  )
+}
+
+shared_tbl <- dplyr::bind_rows(shared_list)
+
+knitr::kable(
+  shared_tbl,
+  caption = "Clock stored in the second analysis directory of each shared tissue, compared against the one used in the table."
+)
+```
+
+## Save table
+
+```{r}
+tables_root_abs <- here::here(params$tables_root)
+dir.create(tables_root_abs, recursive = TRUE, showWarnings = FALSE)
+
+out_file <- file.path(tables_root_abs, "Supplement_GTEx_clock_coefficients.csv")
+
+utils::write.csv(coef_tbl, file = out_file, row.names = FALSE)
+
+msg("Saved: ", out_file)
+```
+
+## Session info
+
+```{r}
+sessionInfo()
+```

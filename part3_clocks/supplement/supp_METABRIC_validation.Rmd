@@ -1,5 +1,5 @@
 ---
-title: "METABRIC Validation — Common Gene Universe (clean)"
+title: "METABRIC validation on a common gene universe"
 subtitle: "Processing → ssGSEA → elastic-net clock → ClockSHAP → figures → OS → diagnostics"
 author: "Payton Bock — Monti Lab"
 date:   "`r format(Sys.Date(), '%B %d, %Y')`"
@@ -17,7 +17,7 @@ params:
   scanb_se_rds:      "/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/data/GTEx/scanbe_se.rds"
   metabric_eset_rds: "/restricted/projectnb/montilab-p/CBMrepositoryData/METABRIC/ESets/metabric_GE_ESet.rds"
 
-  # TP53 sources (used only for heatmap annotation in Panel C)
+  # TP53 sources (used only for the heatmap annotation column)
   metabric_tp53_tsv: "/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/manuscript_analyses/data/metadata/METABRIC_TP53_cBioPortal.tsv"
   scanb_tp53_tsv:    "/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/manuscript_analyses/data/metadata/SCANB-mutation-info.tsv"
 
@@ -40,7 +40,7 @@ params:
   # Behavior
   verbose: true
 
-  # Panel A — PCA cohort balancing
+  # PCA cohort balancing
   # SCAN-B is the largest cohort (~6k tumors) and dominates both the variance
   # structure of the joint PCA and the visual density on the plot. To get a
   # more balanced cross-cohort view, randomly subsample SCAN-B to this many
@@ -96,9 +96,12 @@ Pipeline:
 6. Retrain elastic-net clock on GTEx
 7. Apply clock to TCGA / SCAN-B / METABRIC; compute GTEx-anchored deviation
 8. Run ClockSHAP with GTEx as reference
-9. Build manuscript figure panels (A: PCA, B: anchored age, C: heatmaps, D: PAM50 deviation, G: pathway × PAM50)
-10. Overall survival (Cox + KM) stacked across TCGA-BRCA + SCAN-B + METABRIC: Panels E (forest) + F (KM by deviation tertile)
+9. Build figure panels (PCA, anchored age, ClockSHAP heatmaps, PAM50 deviation, pathway × PAM50)
+10. Overall survival (Cox + KM) stacked across TCGA-BRCA + SCAN-B + METABRIC
 11. Stability diagnostics: Hallmark coverage, original-vs-retrained clock comparison, METABRIC composition
+
+Some panels may not appear in the published manuscript. Panels are assembled and
+typeset in Adobe Illustrator to produce the final figure.
 
 # 1. Load canonical GTEx + TCGA
 
@@ -118,7 +121,7 @@ vcat("TCGA-PT logCPM:", paste(dim(logcpm_pt_sym),   collapse = " x "))
 
 # 2. Process SCAN-B (counts → logCPM, symbol-collapsed)
 
-Same logic as `supp_SCANB_replication_BRCA_clock`: best replicate per Sample by ALIGNED_PAIRS, primary invasive tumors only, edgeR logCPM, Ensembl → SYMBOL collapse by mean.
+Same logic as `06_scanb_processing_BRCA`: best replicate per Sample by ALIGNED_PAIRS, primary invasive tumors only, edgeR logCPM, Ensembl → SYMBOL collapse by mean.
 
 ```{r scanb_process}
 scanb <- readRDS(params$scanb_se_rds)
@@ -465,7 +468,7 @@ sapply(list(PT = cs_pt, SCANB = cs_scanb, METAB = cs_metab, NT = cs_nt),
 
 # 9. TP53 attach (binary, for heatmap annotation only)
 
-We retain a simple Mut/WT TP53 status for SCAN-B and METABRIC purely for the Panel C heatmap annotation column. TCGA's TP53 is already attached in `metadata$TP53` from `01_processing`. No quantitative TP53 analysis is performed in this manuscript.
+We retain a simple Mut/WT TP53 status for SCAN-B and METABRIC purely for the heatmap annotation column. TCGA's TP53 is already attached in `metadata$TP53` from `01_processing`. No quantitative TP53 analysis is performed in this script.
 
 ```{r tp53_attach}
 # METABRIC: cBioPortal MAF; deleterious classes
@@ -533,7 +536,7 @@ cohort_labels_full <- c(
 )
 ```
 
-## Panel A — PCA on Hallmark ssGSEA (common universe)
+## PCA on Hallmark ssGSEA (common universe)
 
 PCA on the per-cohort Hallmark ssGSEA score matrices (all five cohorts
 scored against the **common gene universe** — section 4/5 output). Because
@@ -542,8 +545,7 @@ separation along the leading PCs reflects platform + biology, not
 gene-availability mismatch. SCAN-B is randomly subsampled before fitting
 (controlled by `params$panelA_scanb_subsample_n`, default 1500) so its
 ~6k samples don't dominate either the variance decomposition or the
-plot density. Save dimensions: 200 × 150 mm (matches companion METABRIC
-supplement Panel A).
+plot density. Save dimensions: 200 × 150 mm.
 
 ```{r panelA}
 cohort_scores_list <- list(
@@ -566,10 +568,10 @@ if ("SCAN-B" %in% names(cohort_scores_list) &&
     keep_idx <- sort(sample.int(scanb_full_n, size = scanb_n_target))
     cohort_scores_list[["SCAN-B"]] <-
       cohort_scores_list[["SCAN-B"]][, keep_idx, drop = FALSE]
-    vcat(sprintf("Panel A: SCAN-B downsampled %d -> %d for PCA",
+    vcat(sprintf("PCA: SCAN-B downsampled %d -> %d",
                  scanb_full_n, scanb_n_target))
   } else {
-    vcat(sprintf("Panel A: SCAN-B has %d samples, below target %d — using all",
+    vcat(sprintf("PCA: SCAN-B has %d samples, below target %d — using all",
                  scanb_full_n, scanb_n_target))
   }
 }
@@ -621,13 +623,13 @@ p_panelA <- ggplot(pc_df, aes(x = PC1, y = PC2, colour = cohort)) +
 p_panelA
 
 ggsave(
-  filename = file.path(fig_out_dir, "PanelA_PCA_Hallmark_ssGSEA.pdf"),
+  filename = file.path(fig_out_dir, "PCA_Hallmark_ssGSEA.pdf"),
   plot     = p_panelA,
   width    = 3, height = 3, units = "in"
 )
 ```
 
-## Panel B — Anchored predicted age vs chronological age
+## Anchored predicted age vs chronological age
 
 ```{r panelB}
 panelB_df <- all_df %>%
@@ -663,17 +665,16 @@ p_panelB <- ggplot(panelB_df, aes(x = age_years, y = pred_anchored, colour = coh
 p_panelB
 
 ggsave(
-  filename = file.path(fig_out_dir, "PanelB_anchored_age_5cohorts.pdf"),
+  filename = file.path(fig_out_dir, "anchored_age_5cohorts.pdf"),
   plot     = p_panelB,
   width    = 220 / 25.4, height = 130 / 25.4, units = "in"
 )
 ```
 
-## Representative ClockSHAP waterfall (TCGA-BRCA)
+## Representative ClockSHAP waterfall (TCGA-BRCA; not used in the manuscript)
 
 Single TCGA-BRCA tumor in middle-deviation range with readable top-N |phi|
-bars. Preserved here as a useful diagnostic; not included in the lettered
-panel sequence (no corresponding panel in the companion METABRIC supplement).
+bars. Preserved here as a diagnostic.
 
 ```{r waterfall}
 pick_pretty_waterfall_sample <- function(cs, top_n = 10,
@@ -737,7 +738,7 @@ ggsave(
 )
 ```
 
-## Panel C — ClockSHAP heatmaps (TCGA-BRCA + SCAN-B + METABRIC)
+## ClockSHAP heatmaps (TCGA-BRCA + SCAN-B + METABRIC; not used in the manuscript)
 
 Three heatmaps with shared color scales and annotation palette. TCGA-BRCA holds row labels and legends; SCAN-B and METABRIC inherit BRCA's hierarchical row order.
 
@@ -841,7 +842,7 @@ ht_panelC_brca <- ComplexHeatmap::Heatmap(
 
 ht_panelC_brca
 
-out_file <- file.path(fig_out_dir, "PanelC_BRCA_ClockSHAP_heatmap.pdf")
+out_file <- file.path(fig_out_dir, "BRCA_ClockSHAP_heatmap.pdf")
 grDevices::pdf(out_file, width = 190 / 25.4, height = 160 / 25.4)
 ComplexHeatmap::draw(ht_panelC_brca,
                      heatmap_legend_side = "right",
@@ -871,7 +872,7 @@ ht_panelC_scanb <- ComplexHeatmap::Heatmap(
 
 ht_panelC_scanb
 
-out_file <- file.path(fig_out_dir, "PanelC_SCANB_ClockSHAP_heatmap.pdf")
+out_file <- file.path(fig_out_dir, "SCANB_ClockSHAP_heatmap.pdf")
 grDevices::pdf(out_file, width = 110 / 25.4, height = 160 / 25.4)
 ComplexHeatmap::draw(ht_panelC_scanb)
 grDevices::dev.off()
@@ -898,13 +899,13 @@ ht_panelC_metab <- ComplexHeatmap::Heatmap(
 
 ht_panelC_metab
 
-out_file <- file.path(fig_out_dir, "PanelC_METABRIC_ClockSHAP_heatmap.pdf")
+out_file <- file.path(fig_out_dir, "METABRIC_ClockSHAP_heatmap.pdf")
 grDevices::pdf(out_file, width = 110 / 25.4, height = 160 / 25.4)
 ComplexHeatmap::draw(ht_panelC_metab)
 grDevices::dev.off()
 ```
 
-## Panel D — PAM50 deviation across cohorts
+## PAM50 deviation across cohorts
 
 3 cohort rows × 1 PAM50 column. Adjacent Normal (TCGA NAT) included as leftmost reference. Kruskal-Wallis omnibus across the 5 tumor subtypes (NAT excluded from the test — visual anchor only).
 
@@ -1018,17 +1019,16 @@ p_panelD <- ggplot(panelD_df, aes(x = group, y = deviation, fill = group)) +
 p_panelD
 
 ggsave(
-  filename = file.path(fig_out_dir, "PanelD_PAM50_deviation.pdf"),
+  filename = file.path(fig_out_dir, "PAM50_deviation.pdf"),
   plot     = p_panelD,
   width    = 7.5, height = 2.5, units = "in"
 )
 ```
 
-## Panel G — Pathway × PAM50 (3 cohorts)
+## Pathway × PAM50 (3 cohorts)
 
 Mean ClockSHAP contribution by PAM50 subtype for the six driver pathways.
-NAT shown as a grey square at the leftmost x-position. Save dimensions
-match companion METABRIC supplement Panel G (7 × 5 in).
+NAT shown as a grey square at the leftmost x-position. Save dimensions: 7 × 5 in.
 
 ```{r panelG}
 poi_pathways <- c(
@@ -1095,6 +1095,9 @@ phi_subtype_means <- phi_long_c %>%
             se_phi   = sd_phi / sqrt(n),
             .groups  = "drop")
 
+knitr::kable(phi_subtype_means, digits = 3,
+             caption = "Per-cohort, per-pathway, per-subtype mean φ, as plotted.")
+
 cohort_cols_traj <- c(
   "TCGA-BRCA" = "#7b3294",
   "SCAN-B"    = "#e66101",
@@ -1126,18 +1129,17 @@ p_panelG <- ggplot(phi_subtype_means, aes(x = PAM50, y = mean_phi, group = cohor
 p_panelG
 
 ggsave(
-  filename = file.path(fig_out_dir, "PanelG_pathway_phi_by_pam50_3cohorts.pdf"),
+  filename = file.path(fig_out_dir, "pathway_phi_by_pam50_3cohorts.pdf"),
   plot     = p_panelG,
   width    = 7.5, height = 4, units = "in"
 )
 ```
 
-# 11. Overall survival across TCGA-BRCA + SCAN-B + METABRIC (Panels E + F)
+# 11. Overall survival across TCGA-BRCA + SCAN-B + METABRIC
 
-Stacked OS analysis matching the companion METABRIC supplement. Three cohorts
-share `Surv(time, event) ~ age + deviation` Cox models (Panel E) and
-deviation-tertile KM curves administratively censored at SCAN-B's natural max
-follow-up (Panel F). Time normalized to days across all three cohorts
+Stacked OS analysis. Three cohorts share `Surv(time, event) ~ age + deviation`
+Cox models and deviation-tertile KM curves administratively censored at
+SCAN-B's natural max follow-up. Time normalized to days across all three cohorts
 (METABRIC `OS_MONTHS` × 30.4375).
 
 ## 11.1 — Load TCGA-BRCA clinical + helpers
@@ -1163,7 +1165,7 @@ harmonize_pam50 <- function(x) {
   factor(x, levels = pam50_surv)
 }
 
-# Survival helper — matches companion supplement's Cox extractor
+# Survival helper — same Cox extractor as the survival figure script
 cox_term <- function(df, formula_str, term_name) {
   fit <- survival::coxph(stats::as.formula(formula_str), data = df)
   co  <- summary(fit)$coefficients
@@ -1259,13 +1261,11 @@ cohort_surv_summary <- dplyr::bind_rows(
 knitr::kable(cohort_surv_summary, caption = "OS cohort sizes after filtering.")
 ```
 
-## 11.3 — Panel E — Cox forest, 3 cohorts stacked
+## 11.3 — Cox forest, 3 cohorts stacked
 
 Aggregate `age + Deviation`, PAM50-adjusted aggregate, and within-subtype
-rows for each cohort. HR < 1 in blue (youthward = worse), HR > 1 in red
-(aged-like = worse). Save dimensions: 4 × 6.75 in (matches companion
-supplement Panel E — main figure 4 × 4.5 in for 2 rows, scaled ×1.5 for
-the third cohort row).
+rows for each cohort. HR < 1 in blue (more youthful = worse), HR > 1 in red
+(less youthful = worse). Save dimensions: 4 × 6.75 in.
 
 ```{r panelE_table}
 run_aggregate_set <- function(df, cohort_label) {
@@ -1315,7 +1315,7 @@ panelE_tbl <- dplyr::bind_rows(
 )
 
 knitr::kable(panelE_tbl, digits = 4,
-             caption = "Panel E — OS Cox forest, 3 cohorts.")
+             caption = "OS Cox forest, 3 cohorts.")
 ```
 
 ```{r panelE_plot, fig.width=4.5, fig.height=6}
@@ -1366,15 +1366,15 @@ p_panelE <- ggplot(panelE_df, aes(x = HR, y = label, colour = hr_dir)) +
 p_panelE
 
 ggsave(
-  filename = file.path(fig_out_dir, "PanelE_OS_forest_3cohorts.pdf"),
+  filename = file.path(fig_out_dir, "OS_forest_3cohorts.pdf"),
   plot     = p_panelE,
   width    = 7.5, height = 2.5, units = "in"
 )
 ```
 
-## 11.4 — Panel F — KM by deviation tertile, 3 cohorts stacked
+## 11.4 — KM by deviation tertile, 3 cohorts stacked (not used in the manuscript)
 
-Within-cohort deviation tertiles. T1 = most youthward, T3 = least youthward.
+Within-cohort deviation tertiles. T1 = most youthful, T3 = least youthful.
 Truncated at SCAN-B's natural max follow-up; log-rank also administratively
 censored at that horizon so plot and test cover the same patient-time window.
 Save dimensions: 3 × 6.75 in.
@@ -1451,7 +1451,7 @@ logrank_tbl <- tibble::tibble(
 knitr::kable(
   logrank_tbl, digits = 4,
   caption = sprintf(
-    "Panel F unadjusted log-rank test by deviation tertile, per cohort (administratively censored at %.2f years to match SCAN-B follow-up).",
+    "Unadjusted log-rank test by deviation tertile, per cohort (administratively censored at %.2f years to match SCAN-B follow-up).",
     x_max
   )
 )
@@ -1504,7 +1504,7 @@ p_panelF <- ggplot(km_curves, aes(x = time / 365.25, y = surv, colour = dev_tert
 p_panelF
 
 ggsave(
-  filename = file.path(fig_out_dir, "PanelF_OS_KM_tertile_3cohorts.pdf"),
+  filename = file.path(fig_out_dir, "OS_KM_tertile_3cohorts.pdf"),
   plot     = p_panelF,
   width    = 3, height = 6.75, units = "in"
 )

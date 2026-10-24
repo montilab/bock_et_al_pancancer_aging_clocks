@@ -1,5 +1,5 @@
 ---
-title: "Supplementary analyses — BRCA clock stability and QC"
+title: "BRCA clock stability and QC"
 author: "Pan-cancer aging pipeline"
 date: "`r format(Sys.Date(), '%B %d, %Y')`"
 output:
@@ -27,7 +27,15 @@ params:
 ---
 
 <!--
-Stability & QC report (single TCGA–GTEx pair).
+BRCA clock stability and QC (single TCGA–GTEx pair; defaults to BRCA–BREAST).
+
+What this script produces (written to params$figure_dir)
+- supplementary_brca_qc_pca.pdf: PCA of GTEx, adjacent-normal, and tumor samples in pathway ssGSEA space
+- supplementary_brca_permuted_age_null.pdf: observed mean tumor deviation against the permuted-age null
+- supplementary_brca_hyperparameter_stability_heatmap.pdf: mean ClockSHAP contributions across nearby (alpha, lambda) settings
+- supplementary_brca_gtex_refit_bootstrap_coefficients.pdf: clock coefficient distributions across GTEx bootstrap refits
+Some panels may not appear in the published manuscript. Panels are assembled and typeset in Adobe Illustrator.
+The tumor bootstrap section (in B) and the coupling section (C) are not used in the manuscript; the tumor bootstrap PDF save is disabled.
 
 Design intent
 - Produce a single, reader-facing HTML report per cancer–tissue combination.
@@ -37,8 +45,8 @@ Design intent
 Upstream assumptions
 - Step 01 produced ssGSEA matrices + sample_metadata.
 - Step 02 produced clock_and_RAA_objects (<analysis_id>/clock_and_RAA_objects-<feature_set>.rds).
-- Step 04 (optional) produced clockshap_objects (<analysis_id>/clockshap_objects-<feature_set>.rds).
-- Step 06 (optional) produced coupling_objects (<analysis_id>/coupling_objects-<feature_set>.rds).
+- The ClockSHAP step (optional) produced clockshap_objects (<analysis_id>/clockshap_objects-<feature_set>.rds); if absent, a linear age-adjusted fallback is used.
+- A coupling step (optional; not part of the manuscript or this repository) may have produced coupling_objects (<analysis_id>/coupling_objects-<feature_set>.rds). Section C is skipped when it is absent.
 -->
 
 ```{r setup, include=FALSE}
@@ -824,9 +832,9 @@ ggsave(
 message("Saved: ", out_file)
 ```
 
-## Tumor bootstrap stability
+## Tumor bootstrap stability (not used in the manuscript)
 
-**Goal:** Resample tumor samples with replacement and recompute mean contributions. This tests whether the top contributors are stable to sampling variation in the tumor cohort.
+**Goal:** Resample tumor samples with replacement and recompute mean contributions. This tests whether the top contributors are stable to sampling variation in the tumor cohort. The PDF save for this plot is disabled.
 
 ```{r pt_boot_compute, include=FALSE}
 boot_summary_tbl <- NULL
@@ -1098,9 +1106,9 @@ ggsave(
 message("Saved: ", out_file)
 ```
 
-# C) Coupling stability summary
+# C) Coupling stability summary (not used in the manuscript)
 
-**Goal:** If Step 06 produced coupling bootstrap descriptors, import them here for a single “stability dashboard” view (no recomputation in this report).
+**Goal:** If a coupling step produced coupling bootstrap descriptors, import them here for a single “stability dashboard” view (no recomputation in this report). The coupling step is not part of the manuscript or this repository, so this section is normally skipped.
 
 ```{r coupling_import, include=FALSE}
 coupling_bootstrap_tbl <- NULL
@@ -1111,9 +1119,9 @@ if (file.exists(coupling_path)) {
   coup <- readRDS(coupling_path)
   if (!is.null(coup$bootstrap) && !is.null(coup$bootstrap$descriptors)) {
     coupling_bootstrap_tbl <- coup$bootstrap$descriptors
-    coupling_bootstrap_msg <- "Imported coupling bootstrap summary from Step 06 outputs."
+    coupling_bootstrap_msg <- "Imported coupling bootstrap summary from the coupling step outputs."
   } else {
-    coupling_bootstrap_msg <- "Coupling objects found, but no bootstrap summaries present (run step 06 with do_bootstrap=TRUE if needed)."
+    coupling_bootstrap_msg <- "Coupling objects found, but no bootstrap summaries present (run the coupling step with do_bootstrap=TRUE if needed)."
   }
 } else {
   coupling_bootstrap_msg <- "No coupling bootstrap outputs found; skipping import."

@@ -1,0 +1,351 @@
+---
+title: "Supplement: age-matched deviation summary across reference, adjacent normal, and tumor cohorts"
+author: "Pan-cancer aging pipeline"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: united
+    code_folding: hide
+    toc: true
+    toc_float: true
+params:
+  out_root: "results/derived/GTEx"
+  feature_set: "PC"
+  tables_root: "results/tables/supplemental"
+  min_nat: 10
+  verbose: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Purpose
+
+This assembles a single summary table of age-matched deviation for the three
+cohorts each tissue-of-origin clock is applied to: the GTEx normal tissue the
+clock was trained on, TCGA adjacent normal tissue, and TCGA primary tumors.
+For each cohort it reports sample count, age distribution, and the mean,
+standard deviation, 95% confidence interval, median, and interquartile range
+of the deviation.
+
+The table underlies the comparison of adjacent normal tissue against both the
+GTEx reference and the matched tumors, which distinguishes the tumor shift from
+a uniform offset between the GTEx and TCGA cohorts.
+
+Tumor and adjacent-normal deviations are read from the saved ClockSHAP bundle
+and are not recomputed. GTEx deviations are not stored in that bundle, so they
+are computed here by applying the same saved clock and reference profile to the
+GTEx feature matrix.
+
+Adjacent normal tissue was carried forward by the processing step only where at
+least `r params$min_nat` Solid Tissue Normal samples were available, so cancers
+without a qualifying adjacent-normal cohort have no deviations to report and
+appear with a count of zero.
+
+Two versions are written to `r params$tables_root`: the full numeric table, and
+a condensed version with the paired statistics folded into single cells so that
+it fits a portrait page.
+
+```{r}
+suppressPackageStartupMessages({
+  library(here)
+  library(dplyr)
+  library(tibble)
+  library(knitr)
+  library(ClockSHAP)
+})
+
+msg <- function(...) if (isTRUE(params$verbose)) message(...)
+```
+
+## Cancers of interest
+
+These are the cross-cancer emphasis set, each paired with its GTEx tissue of
+origin. Add or remove rows here to change which cancers enter the table.
+
+```{r}
+map <- list(
+  BRCA = "BREAST",
+  LUSC = "LUNG",
+  LUAD = "LUNG",
+  GBM  = "BRAIN",
+  LGG  = "BRAIN",
+  COAD = "COLON"
+)
+```
+
+## Summary helper
+
+Summarizes one vector of deviations and its matched ages into a single row.
+Non-finite deviations are dropped. A cohort with no samples returns a row of
+missing values so that it still appears in the table.
+
+```{r}
+summarise_deviation <- function(deviation, age, tissue, cancer, cohort) {
+
+  keep <- is.finite(deviation)
+  d    <- as.numeric(deviation[keep])
+  a    <- as.numeric(age[keep])
+  n    <- length(d)
+
+  if (n < 2) {
+    return(tibble::tibble(
+      tissue           = tissue,
+      cancer           = cancer,
+      cohort           = cohort,
+      n                = n,
+      age_median       = if (n > 0) stats::median(a) else NA_real_,
+      age_min          = if (n > 0) min(a) else NA_real_,
+      age_max          = if (n > 0) max(a) else NA_real_,
+      mean_deviation   = if (n > 0) mean(d) else NA_real_,
+      sd_deviation     = NA_real_,
+      ci_lower         = NA_real_,
+      ci_upper         = NA_real_,
+      median_deviation = if (n > 0) stats::median(d) else NA_real_,
+      q1_deviation     = NA_real_,
+      q3_deviation     = NA_real_
+    ))
+  }
+
+  se    <- stats::sd(d) / sqrt(n)
+  tcrit <- stats::qt(0.975, df = n - 1)
+
+  tibble::tibble(
+    tissue           = tissue,
+    cancer           = cancer,
+    cohort           = cohort,
+    n                = n,
+    age_median       = stats::median(a),
+    age_min          = min(a),
+    age_max          = max(a),
+    mean_deviation   = mean(d),
+    sd_deviation     = stats::sd(d),
+    ci_lower         = mean(d) - tcrit * se,
+    ci_upper         = mean(d) + tcrit * se,
+    median_deviation = stats::median(d),
+    q1_deviation     = unname(stats::quantile(d, 0.25)),
+    q3_deviation     = unname(stats::quantile(d, 0.75))
+  )
+}
+```
+
+## Load saved objects and summarize each cohort
+
+For each cancer-tissue pair the clock objects, the ClockSHAP bundle, and the
+GTEx pathway score matrix are loaded. GTEx deviations are obtained by calling
+`ClockSHAP::clockshap()` with the clock and reference profile stored in the
+bundle, which is the same call the tumor and adjacent-normal deviations were
+produced by. The result is checked against the residual of the GTEx
+prediction line, the anchoring used in the deviation figures, so that the
+numbers in this table are the same quantity plotted there.
+
+A GTEx row is emitted the first time each tissue is encountered, so lung is
+carried by LUAD and LUSC together and brain by GBM and LGG together.
+
+Values are kept at full precision here and rounded only where they are
+displayed and written, so that both output tables round from the same source.
+
+```{r}
+suffix       <- paste0("-", params$feature_set)
+out_root_abs <- here::here(params$out_root)
+
+cohort_rows <- list()
+gtex_done   <- character(0)
+
+for (tcga in names(map)) {
+
+  gtex        <- map[[tcga]]
+  analysis_id <- paste0(tcga, "__", gtex)
+  proc_dir    <- file.path(out_root_abs, analysis_id)
+
+  clock_rds       <- file.path(proc_dir, paste0("clock_and_RAA_objects", suffix, ".rds"))
+  clockshap_rds   <- file.path(proc_dir, paste0("clockshap_objects",     suffix, ".rds"))
+  scores_gtex_rds <- file.path(proc_dir, paste0("ssgsea_scores_gtex",    suffix, ".rds"))
+
+  if (!all(file.exists(clock_rds, clockshap_rds, scores_gtex_rds))) {
+    warning("Missing saved objects for ", analysis_id, "; skipping.")
+    next
+  }
+
+  clock_results <- readRDS(clock_rds)
+  bundle        <- readRDS(clockshap_rds)
+  scores_gtex   <- readRDS(scores_gtex_rds)
+
+  feat <- clock_results$feature_names
+
+  # ---- GTEx reference cohort ----
+  X_gtex_full <- t(scores_gtex[feat, , drop = FALSE])
+  age_gtex    <- clock_results$age$GTEx
+
+  ids_keep    <- intersect(rownames(X_gtex_full), names(age_gtex))
+  X_gtex_cs   <- X_gtex_full[ids_keep, , drop = FALSE]
+  age_gtex_cs <- as.numeric(age_gtex[ids_keep])
+  names(age_gtex_cs) <- ids_keep
+
+  ok_g        <- is.finite(age_gtex_cs)
+  X_gtex_cs   <- X_gtex_cs[ok_g, , drop = FALSE]
+  age_gtex_cs <- age_gtex_cs[ok_g]
+
+  cs_gtex <- ClockSHAP::clockshap(
+    features  = X_gtex_cs,
+    age       = age_gtex_cs,
+    clock     = bundle$clock,
+    reference = bundle$reference
+  )
+
+  # Deviation must equal the residual of the GTEx prediction line, which is the
+  # anchoring the deviation figures use.
+  pred_gtex <- clock_results$pred$GTEx
+  age_line  <- clock_results$age$GTEx[names(pred_gtex)]
+  ok_line   <- complete.cases(pred_gtex, age_line)
+  bias_fit  <- lm(pred_gtex[ok_line] ~ age_line[ok_line])
+  beta0     <- coef(bias_fit)[1]
+  beta1     <- coef(bias_fit)[2]
+
+  d_dev <- max(abs(cs_gtex$deviation - (cs_gtex$predicted - (beta0 + beta1 * cs_gtex$age))),
+               na.rm = TRUE)
+  msg(analysis_id, " GTEx max |deviation - line residual| = ", signif(d_dev, 3))
+  stopifnot(d_dev < 1e-6)
+
+  if (!(gtex %in% gtex_done)) {
+    cohort_rows[[paste0(analysis_id, "_gtex")]] <- summarise_deviation(
+      deviation = cs_gtex$deviation,
+      age       = cs_gtex$age,
+      tissue    = gtex,
+      cancer    = "",
+      cohort    = "GTEx reference"
+    )
+    gtex_done <- c(gtex_done, gtex)
+  }
+
+  # ---- Adjacent normal ----
+  has_nat <- !is.null(bundle$nat) && length(bundle$nat$deviation) > 0
+
+  cohort_rows[[paste0(analysis_id, "_nat")]] <- if (has_nat) {
+    summarise_deviation(
+      deviation = bundle$nat$deviation,
+      age       = bundle$nat$age,
+      tissue    = gtex,
+      cancer    = tcga,
+      cohort    = "Adjacent normal"
+    )
+  } else {
+    summarise_deviation(
+      deviation = numeric(0),
+      age       = numeric(0),
+      tissue    = gtex,
+      cancer    = tcga,
+      cohort    = "Adjacent normal"
+    )
+  }
+
+  msg(analysis_id, " adjacent normal samples: ",
+      if (has_nat) length(bundle$nat$deviation) else 0)
+
+  # ---- Primary tumor ----
+  cohort_rows[[paste0(analysis_id, "_pt")]] <- summarise_deviation(
+    deviation = bundle$pt$deviation,
+    age       = bundle$pt$age,
+    tissue    = gtex,
+    cancer    = tcga,
+    cohort    = "Tumor"
+  )
+}
+
+deviation_summary <- dplyr::bind_rows(cohort_rows)
+
+msg("Summarized ", nrow(deviation_summary), " cohort rows.")
+
+tables_root_abs <- here::here(params$tables_root)
+dir.create(tables_root_abs, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Deviation summary table
+
+Rows are grouped by tissue of origin, with the GTEx reference cohort first,
+followed by the adjacent normal and tumor cohorts of each cancer drawn from
+that tissue. All deviation values are in years.
+
+```{r}
+deviation_summary_numeric <- deviation_summary %>%
+  dplyr::mutate(
+    dplyr::across(c(age_median, age_min, age_max), ~ round(.x, 1)),
+    dplyr::across(c(mean_deviation, sd_deviation, ci_lower, ci_upper,
+                    median_deviation, q1_deviation, q3_deviation), ~ round(.x, 2))
+  )
+
+knitr::kable(
+  deviation_summary_numeric,
+  caption = paste0(
+    "Age-matched deviation by cohort. Deviations are in years, relative to the ",
+    "GTEx tissue-of-origin reference. Adjacent normal tissue was carried ",
+    "forward only where at least ", params$min_nat, " Solid Tissue Normal ",
+    "samples were available; cancers without a qualifying adjacent-normal ",
+    "cohort appear with n = 0."
+  )
+)
+
+utils::write.csv(
+  deviation_summary_numeric,
+  file      = file.path(tables_root_abs, "deviation_summary_by_cohort.csv"),
+  row.names = FALSE
+)
+
+message("Saved: ", file.path(tables_root_abs, "deviation_summary_by_cohort.csv"))
+```
+
+## Condensed table for the supplement
+
+The same values with each pair of statistics folded into one cell, which brings
+the table down to six columns. The tissue and cancer columns are merged into a
+single cohort label, matching how the cohorts are named in the deviation
+figures. Cohorts with no samples carry a hyphen in place of the statistics.
+
+```{r}
+deviation_summary_condensed <- deviation_summary %>%
+  dplyr::mutate(
+    Cohort = dplyr::case_when(
+      cohort == "GTEx reference"  ~ paste("GTEx", tolower(tissue)),
+      cohort == "Adjacent normal" ~ paste(cancer, "adjacent normal"),
+      cohort == "Tumor"           ~ paste(cancer, "tumor")
+    ),
+    `Age, median (range)` = dplyr::if_else(
+      is.na(age_median), "-",
+      sprintf("%.0f (%.0f-%.0f)", age_median, age_min, age_max)
+    ),
+    `Mean (SD)` = dplyr::if_else(
+      is.na(sd_deviation), "-",
+      sprintf("%.1f (%.1f)", mean_deviation, sd_deviation)
+    ),
+    `95% CI` = dplyr::if_else(
+      is.na(ci_lower), "-",
+      sprintf("%.1f to %.1f", ci_lower, ci_upper)
+    ),
+    `Median (IQR)` = dplyr::if_else(
+      is.na(q1_deviation), "-",
+      sprintf("%.1f (%.1f, %.1f)", median_deviation, q1_deviation, q3_deviation)
+    )
+  ) %>%
+  dplyr::select(Cohort, n, `Age, median (range)`, `Mean (SD)`,
+                `95% CI`, `Median (IQR)`)
+
+knitr::kable(
+  deviation_summary_condensed,
+  caption = "Age-matched deviation by cohort, condensed for typesetting. Deviations are in years."
+)
+
+utils::write.csv(
+  deviation_summary_condensed,
+  file      = file.path(tables_root_abs, "deviation_summary_by_cohort_condensed.csv"),
+  row.names = FALSE
+)
+
+message("Saved: ", file.path(tables_root_abs, "deviation_summary_by_cohort_condensed.csv"))
+```
+
+## Session info
+
+```{r}
+sessionInfo()
+```

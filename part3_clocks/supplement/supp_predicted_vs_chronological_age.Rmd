@@ -1,0 +1,234 @@
+---
+title: "Supplement: predicted versus chronological age for each cohort and cancer"
+author: "Pan-cancer aging pipeline"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: united
+    code_folding: hide
+    toc: true
+    toc_float: true
+params:
+  out_root: "results/derived/GTEx"
+  feature_set: "PC"
+  figures_root: "results/figures/supplemental"
+  verbose: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Purpose
+
+This produces the conventional clock diagnostic plot for each of the six
+cancers: predicted age against chronological age, one panel per cancer, showing
+the GTEx tissue the clock was trained on, TCGA adjacent normal tissue, and TCGA
+primary tumors. The fit statistics behind those panels are shown in this report
+and are not written to disk.
+
+Predicted ages are the raw clock output read from the saved Step 02 objects and
+are not recomputed. They are not the GTEx-anchored predicted age used in the
+deviation figures, where chronological age plus deviation places the reference
+on the identity line. Here the identity line is chronological age itself, so
+vertical distance from it is the raw difference between predicted and
+chronological age.
+
+The GTEx cohort appears in every panel drawn from its tissue, so the GTEx lung
+samples are shown in both the LUAD and LUSC panels and the GTEx brain samples in
+both the GBM and LGG panels. The clock is the same in each case.
+
+Panels are written as a single PDF and assembled in Adobe Illustrator to produce
+the final figure. Some panels may not appear in the published manuscript.
+
+```{r}
+suppressPackageStartupMessages({
+  library(here)
+  library(dplyr)
+  library(tibble)
+  library(ggplot2)
+  library(knitr)
+})
+
+msg <- function(...) if (isTRUE(params$verbose)) message(...)
+```
+
+## Cancers of interest
+
+These are the cross-cancer emphasis set, each paired with its GTEx tissue of
+origin. Add or remove rows here to change which cancers are drawn.
+
+```{r}
+map <- list(
+  BRCA = "BREAST",
+  LUSC = "LUNG",
+  LUAD = "LUNG",
+  GBM  = "BRAIN",
+  LGG  = "BRAIN",
+  COAD = "COLON"
+)
+
+cohort_levels <- c("GTEx", "Adjacent normal", "Tumor")
+
+cohort_colors <- c(
+  "GTEx"            = "#4575b4",
+  "Adjacent normal" = "#7f7f7f",
+  "Tumor"           = "#d73027"
+)
+```
+
+## Load saved predictions
+
+For each cancer the Step 02 clock object supplies predicted age and
+chronological age for all three cohorts. Samples with a missing prediction or a
+missing age are dropped. Nothing is refit and no prediction is recomputed.
+
+```{r}
+suffix       <- paste0("-", params$feature_set)
+out_root_abs <- here::here(params$out_root)
+
+pred_rows <- list()
+
+for (tcga in names(map)) {
+
+  gtex        <- map[[tcga]]
+  analysis_id <- paste0(tcga, "__", gtex)
+  clock_rds   <- file.path(out_root_abs, analysis_id,
+                           paste0("clock_and_RAA_objects", suffix, ".rds"))
+
+  if (!file.exists(clock_rds)) {
+    warning("Missing clock objects for ", analysis_id, "; skipping.")
+    next
+  }
+
+  clock_results <- readRDS(clock_rds)
+
+  # Saved element names for the three cohorts, in display order.
+  sources <- list(
+    GTEx              = "GTEx",
+    `Adjacent normal` = "NAT",
+    Tumor             = "Tumour"
+  )
+
+  for (cohort in names(sources)) {
+
+    element <- sources[[cohort]]
+    pred    <- clock_results$pred[[element]]
+
+    if (is.null(pred) || length(pred) == 0) next
+
+    age <- clock_results$age[[element]][names(pred)]
+    ok  <- is.finite(pred) & is.finite(age)
+
+    if (sum(ok) == 0) next
+
+    pred_rows[[paste(analysis_id, cohort, sep = "_")]] <- tibble::tibble(
+      cancer            = tcga,
+      tissue            = gtex,
+      cohort            = cohort,
+      sample_id         = names(pred)[ok],
+      chronological_age = as.numeric(age[ok]),
+      predicted_age     = as.numeric(pred[ok])
+    )
+  }
+
+  msg(analysis_id, " loaded.")
+}
+
+pred_long <- dplyr::bind_rows(pred_rows) %>%
+  dplyr::mutate(
+    cancer = factor(cancer, levels = names(map)),
+    cohort = factor(cohort, levels = cohort_levels)
+  )
+
+msg("Loaded ", nrow(pred_long), " predictions across ",
+    dplyr::n_distinct(pred_long$cancer), " cancers.")
+```
+
+## Fit statistics
+
+Pearson correlation, its square, mean absolute error, and root-mean-square error
+between predicted and chronological age, within each cohort of each cancer.
+These are the values a reader would annotate onto the panels.
+
+```{r}
+fit_stats <- pred_long %>%
+  dplyr::group_by(cancer, tissue, cohort) %>%
+  dplyr::summarise(
+    n    = dplyr::n(),
+    r    = stats::cor(predicted_age, chronological_age),
+    R2   = stats::cor(predicted_age, chronological_age)^2,
+    MAE  = mean(abs(predicted_age - chronological_age)),
+    RMSE = sqrt(mean((predicted_age - chronological_age)^2)),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(dplyr::across(c(r, R2, MAE, RMSE), ~ round(.x, 3)))
+
+knitr::kable(
+  fit_stats,
+  caption = paste0(
+    "Predicted against chronological age by cohort and cancer. R2 is the ",
+    "squared Pearson correlation; MAE and RMSE are in years. GTEx values are ",
+    "in-sample, since the clock was fit on those samples."
+  )
+)
+```
+
+## Predicted against chronological age
+
+OOne panel per cancer. The dashed line is the identity, where predicted age equals chronological age. Solid lines are the within-cohort linear fit of predicted on chronological age, so their slope shows how far each cohort's predictions track age. Axes span the chronological age range across all samples and are shared across panels, so the identity line has the same meaning in each. Fifty-seven tumors with predicted ages below 14 years fall outside the plotted area and are included in the fitted lines.
+
+```{r}
+axis_range <- range(pred_long$chronological_age)
+
+p_pred_vs_age <- ggplot(pred_long,
+                        aes(x = chronological_age, y = predicted_age,
+                            colour = cohort, fill = cohort)) +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", colour = "grey40", linewidth = 0.4) +
+  geom_point(alpha = 0.25, size = 0.7, stroke = 0) +
+  geom_smooth(method = "lm", formula = y ~ x, se = FALSE, linewidth = 0.7) +
+  facet_wrap(~ cancer, ncol = 3) +
+  scale_colour_manual(values = cohort_colors, name = NULL) +
+  scale_fill_manual(values = cohort_colors, name = NULL) +
+  coord_fixed(ratio = 1, xlim = axis_range, ylim = axis_range, expand = FALSE) +
+  scale_x_continuous(breaks = seq(20, 90, 20)) +
+  scale_y_continuous(breaks = seq(20, 90, 20)) +
+  labs(
+    x = "Chronological age (years)",
+    y = "Predicted age (years)"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position  = "bottom",
+    strip.text       = element_text(size = 9, face = "bold"),
+    axis.text        = element_text(size = 8),
+    axis.title       = element_text(size = 10)
+  )
+
+p_pred_vs_age
+```
+
+```{r}
+figures_root_abs <- here::here(params$figures_root)
+dir.create(figures_root_abs, recursive = TRUE, showWarnings = FALSE)
+
+out_file <- file.path(figures_root_abs, "predicted_vs_chronological_age.pdf")
+
+ggsave(
+  filename = out_file,
+  plot     = p_pred_vs_age,
+  width    = 185 / 25.4,
+  height   = 140 / 25.4,
+  units    = "in"
+)
+
+message("Saved: ", out_file)
+```
+
+## Session info
+
+```{r}
+sessionInfo()
+```

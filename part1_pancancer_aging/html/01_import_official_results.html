@@ -360,7 +360,7 @@ outputs needed for part 1 and standardizes them for the manuscript
 workflow.</p>
 <p>It prepares:</p>
 <ul>
-<li>Fig. 1A input tables,</li>
+<li>age-association count tables,</li>
 <li>a simple layer manifest for downstream extension,</li>
 <li>file manifests for RNA-seq GSEA and multi-omic clustering, and</li>
 <li>organ-system annotations used in figure panels.</li>
@@ -772,8 +772,8 @@ result_file_manifest &lt;- bind_rows(
   )
 )</code></pre>
 </div>
-<div id="standardize-fig.-1a-counts" class="section level2">
-<h2>Standardize Fig. 1A counts</h2>
+<div id="standardize-age-association-counts" class="section level2">
+<h2>Standardize age-association counts</h2>
 <pre class="r"><code>all_projects &lt;- sort(Reduce(
   union,
   list(

@@ -1,0 +1,593 @@
+---
+title: "Single-cell breast atlas: which cells carry the youth-like deviation?"
+subtitle: "Donor-level pseudobulks by cellular compartment, scored with the GTEx-breast clock unchanged"
+author: "Pan-cancer aging project"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: united
+    code_folding: hide
+    toc: true
+    toc_float: true
+    toc_depth: 2
+params:
+  tcga_project: "BRCA"
+  gtex_project: "BREAST"
+  feature_set: "PC"
+  out_root: "/restricted/projectnb/agedisease/projects/pancancer_aging_pbock/manuscript_analyses/results/derived/GTEx"
+  atlas_epi_rds: "/restricted/projectnb/brcameta/projects/brca_atlas/data/sc/cellxgene/epi.rds"
+  atlas_all_rds: "/restricted/projectnb/brcameta/projects/brca_atlas/data/sc/cellxgene/all.rds"
+  atlas_cnv_rds: "/restricted/projectnb/brcameta/projects/brca_atlas/data/infercnv/combined_infercnv_data.rds"
+  flag_primary: "outside_norm_90"
+  flag_sensitivity: "outside_norm_95"
+  min_cells_malignant: 100
+  min_cells_epithelial: 100
+  min_cells_nonepi: 50
+  fig_dir: "results/figures/supplemental"
+  tables_root: "results/tables/supplemental"
+  save_outputs: true
+  verbose: true
+  seed: 2026
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+set.seed(params$seed)
+```
+
+# Summary
+
+**Question.** The manuscript's age-matched deviations come from bulk RNA-seq,
+which mixes malignant cells with immune and stromal tissue. The purity
+supplement showed that deviation scales with malignant fraction, consistent
+with a tumor-intrinsic signal diluted by non-malignant tissue, but bulk data
+cannot separate the compartments. Here a single-cell breast cancer atlas is
+used to build them: for each donor, one pseudobulk profile from all cells,
+one from epithelial cells (the tumor compartment), one from everything else
+(immune and stroma), and one from inferCNV-flagged malignant cells. The
+GTEx-breast clock, its reference and ClockSHAP are applied to each profile
+exactly as to SCAN-B, with no refitting.
+
+**Design rule.** A 10x pseudobulk is not bulk RNA-seq. The clock's absolute
+output on it carries a platform offset that turns out to be study-specific
+and about 40 years wide. Absolute deviations are therefore reported but not
+interpreted; the result is the difference between compartments *within a
+donor*, where the offset cancels.
+
+**Findings (run of 2026-10-15; 64 aged donors from four studies).**
+
+1. In 64 of 64 donors, the epithelial compartment is more youth-like than
+   the donor's own non-epithelial cells (median difference −32 years;
+   Wilcoxon signed-rank p ≈ 10⁻¹²). For inferCNV-flagged malignant cells,
+   49 of 49 (median −36). The mixed all-cell profile sits between. This
+   holds in each study separately.
+2. Deviation of the all-cell profile scales with the counted epithelial
+   fraction (ρ = −0.65; −3.4 years per 10 points after study adjustment),
+   the single-cell version of the bulk purity relationship (ρ = −0.57;
+   −2.9 per 10 points).
+3. PAM50 structure survives in the tumor compartment at the coarse level
+   the sample size allows: Normal-Like and luminal A least youth-like,
+   luminal B, HER2-enriched and basal-like most (Kruskal–Wallis p = 0.001
+   after study adjustment).
+4. Record only: the compartment gap is carried about two-thirds by immune
+   and stromal programs reading older-like in non-epithelial cells and
+   one-third by proliferative and metabolic programs reading more
+   youth-like in tumor cells, the same split the purity pathway analysis
+   found.
+
+**Reading.** The bulk deviation is a diluted view of a signal concentrated
+in the tumor cells. This answers the composition limitation directly.
+
+**Outputs.** Three panels (paired compartment deviations per donor;
+all-cell deviation against epithelial fraction; epithelial-compartment
+deviation by PAM50) and a per-profile CSV of deviations. Some panels may not
+appear in the published manuscript. Panels are assembled and typeset in
+Adobe Illustrator. The pathway-contribution sections are record only.
+
+**Caveats.** Absolute levels are not interpretable (platform offset). The
+inferCNV flag is specific but recovers only about half of author-called
+cancer cells, so "epithelial" is the primary tumor compartment and the
+flagged set the stricter check. 64 donors; PAM50 subtypes have 4–19 each.
+Dissociated tissue over-represents immune cells relative to bulk.
+
+```{r}
+suppressPackageStartupMessages({
+  library(dplyr); library(tibble); library(tidyr); library(stringr)
+  library(ggplot2); library(knitr); library(Matrix)
+  library(Seurat)
+  library(edgeR); library(msigdbr); library(GSVA)
+  library(glmnet); library(AnnotationDbi); library(org.Hs.eg.db)
+  library(ClockSHAP)
+})
+msg   <- function(...) if (isTRUE(params$verbose)) message(...)
+fmt_p <- function(p) ifelse(is.na(p), NA_character_, ifelse(p < 1e-4, formatC(p, format = "e", digits = 1), formatC(p, format = "f", digits = 4)))
+```
+
+# Data and processing
+
+## Official BRCA clock objects
+
+The Step-02 clock, the GTEx scores, the ClockSHAP bundle (clock +
+reference), and the GTEx anchoring fit, loaded as in the SCAN-B processing script.
+
+```{r clock-objects}
+analysis_id <- paste0(params$tcga_project, "__", params$gtex_project)
+suffix      <- paste0("-", params$feature_set)
+proc_dir    <- file.path(params$out_root, analysis_id)
+clock_rds       <- file.path(proc_dir, paste0("clock_and_RAA_objects", suffix, ".rds"))
+scores_gtex_rds <- file.path(proc_dir, paste0("ssgsea_scores_gtex", suffix, ".rds"))
+scores_nt_rds   <- file.path(proc_dir, paste0("ssgsea_scores_nt",   suffix, ".rds"))
+scores_pt_rds   <- file.path(proc_dir, paste0("ssgsea_scores_pt",   suffix, ".rds"))
+clockshap_rds   <- file.path(proc_dir, paste0("clockshap_objects",  suffix, ".rds"))
+stopifnot(file.exists(clock_rds), file.exists(scores_gtex_rds), file.exists(clockshap_rds))
+
+clock_results    <- readRDS(clock_rds)
+scores_gtex      <- readRDS(scores_gtex_rds)
+scores_nt        <- if (file.exists(scores_nt_rds)) readRDS(scores_nt_rds) else NULL
+scores_pt        <- if (file.exists(scores_pt_rds)) readRDS(scores_pt_rds) else NULL
+clockshap_bundle <- readRDS(clockshap_rds)
+feat      <- clock_results$feature_names
+clock_cs  <- clockshap_bundle$clock
+reference <- clockshap_bundle$reference
+
+pred_gtex <- clock_results$pred$GTEx
+age_gtex  <- clock_results$age$GTEx[names(pred_gtex)]
+ok_g      <- complete.cases(pred_gtex, age_gtex)
+bias_fit  <- lm(pred_gtex[ok_g] ~ age_gtex[ok_g])
+beta0 <- unname(coef(bias_fit)[1]); beta1 <- unname(coef(bias_fit)[2])
+```
+
+## Atlas: donors, epithelial cells, malignancy flags
+
+The atlas (Andrew's project, read only) is 621,200 cells from 136 donors
+across eight studies; 72 donors have a recorded age, all from four studies
+(Pal 2021, Wu 2021, Wang 2024, Liu 2023). The epithelial object defines the
+epithelial compartment by cell ID and carries age, study and the donor PAM50
+label; the inferCNV table supplies the malignancy flags.
+
+```{r atlas-epithelial}
+epi <- readRDS(params$atlas_epi_rds)
+md_epi <- epi@meta.data
+md_epi$cell_key <- as.character(md_epi[["Cell Id"]])
+epi_cell_ids <- md_epi$cell_key
+rm(epi); invisible(gc())
+
+cnv <- readRDS(params$atlas_cnv_rds)
+cnv$cell_key <- as.character(cnv$cell_id)
+flags <- md_epi %>%
+  dplyr::select(cell_key, donor = donor_id) %>%
+  dplyr::left_join(cnv %>% dplyr::select(cell_key, flag_p = dplyr::all_of(params$flag_primary), flag_s = dplyr::all_of(params$flag_sensitivity)), by = "cell_key") %>%
+  dplyr::mutate(matched = !is.na(flag_p), mal_p = matched & as.logical(flag_p), mal_s = matched & as.logical(flag_s))
+
+donor_tbl <- md_epi %>%
+  dplyr::group_by(donor = donor_id) %>%
+  dplyr::summarise(age_years = suppressWarnings(as.numeric(dplyr::first(age))),
+                   study     = dplyr::first(batch),
+                   pam50     = { t <- table(Pam50, useNA = "no"); if (length(t)) names(t)[which.max(t)] else NA_character_ },
+                   .groups = "drop") %>%
+  dplyr::mutate(pam50 = dplyr::recode(pam50, "Normal" = "Normal-Like"), pam50 = ifelse(is.na(pam50), "Unclassified", pam50))
+knitr::kable(donor_tbl %>% dplyr::count(study, has_age = !is.na(age_years)), caption = "Donors per study, by age availability.")
+rm(md_epi, cnv); invisible(gc())
+```
+
+## Compartments and pseudobulk
+
+Per aged donor: `all` (every cell), `epithelial` (cells in the epithelial
+object), `nonepi` (every other cell), `malignant_p` / `malignant_s`
+(epithelial cells flagged by the primary / sensitivity inferCNV flag).
+Pseudobulk is the sum of raw counts. A donor is kept if its epithelial and
+non-epithelial compartments meet the cell thresholds; a malignant profile
+is kept if it does.
+
+```{r atlas-pseudobulk}
+all_obj <- readRDS(params$atlas_all_rds)
+md_all  <- all_obj@meta.data
+md_all$cell_key <- sub("^_", "", rownames(md_all))        # full-atlas cell names = epithelial `Cell Id` with a leading underscore
+stopifnot(!anyDuplicated(md_all$cell_key), mean(epi_cell_ids %in% md_all$cell_key) > 0.99)
+cnt_all <- LayerData(all_obj, assay = "RNA", layer = "counts")
+gene_ids_all <- rownames(cnt_all)
+rm(all_obj); invisible(gc())
+
+md_all$is_epi   <- md_all$cell_key %in% epi_cell_ids
+md_all$is_mal_p <- md_all$cell_key %in% flags$cell_key[flags$mal_p]
+md_all$is_mal_s <- md_all$cell_key %in% flags$cell_key[flags$mal_s]
+md_all$donor    <- as.character(md_all$donor_id)
+aged <- md_all$donor %in% donor_tbl$donor[!is.na(donor_tbl$age_years)]
+comp_of <- function(sel, name) ifelse(aged & sel, paste0(md_all$donor, "||", name), NA_character_)
+groups <- list(
+  all         = comp_of(rep(TRUE, nrow(md_all)), "all"),
+  epithelial  = comp_of(md_all$is_epi, "epithelial"),
+  nonepi      = comp_of(!md_all$is_epi, "nonepi"),
+  malignant_p = comp_of(md_all$is_mal_p, "malignant_p"),
+  malignant_s = comp_of(md_all$is_mal_s, "malignant_s")
+)
+pseudobulk <- function(counts, grp) {
+  keep <- !is.na(grp); g <- factor(grp[keep])
+  ind  <- Matrix::sparse.model.matrix(~ g - 1); colnames(ind) <- levels(g)
+  list(counts = as.matrix(counts[, keep, drop = FALSE] %*% ind), n_cells = Matrix::colSums(ind))
+}
+pb <- lapply(groups, function(g) pseudobulk(cnt_all, g))
+
+composition <- md_all %>% dplyr::filter(aged) %>% dplyr::group_by(donor) %>%
+  dplyr::summarise(n_cells_donor = dplyr::n(), n_epi = sum(is_epi), n_nonepi = sum(!is_epi), n_mal_p = sum(is_mal_p),
+                   frac_epi = n_epi / n_cells_donor, frac_mal_p = n_mal_p / n_cells_donor, .groups = "drop") %>%
+  dplyr::left_join(donor_tbl, by = "donor")
+rm(cnt_all, md_all); invisible(gc())
+
+donors_use <- composition %>%
+  dplyr::filter(!is.na(age_years), n_epi >= params$min_cells_epithelial, n_nonepi >= params$min_cells_nonepi) %>% dplyr::pull(donor)
+keep_col <- function(nm, n_cells) {
+  donor <- sub("\\|\\|.*$", "", nm); comp <- sub("^.*\\|\\|", "", nm)
+  thr <- c(all = 1, epithelial = params$min_cells_epithelial, nonepi = params$min_cells_nonepi,
+           malignant_p = params$min_cells_malignant, malignant_s = params$min_cells_malignant)[comp]
+  donor %in% donors_use & n_cells >= thr
+}
+pb_counts <- do.call(cbind, lapply(pb, function(x) x$counts[, keep_col(colnames(x$counts), x$n_cells), drop = FALSE]))
+pb_ncells <- stats::setNames(unlist(lapply(pb, function(x) x$n_cells[keep_col(colnames(x$counts), x$n_cells)]), use.names = FALSE), colnames(pb_counts))
+rownames(pb_counts) <- gene_ids_all
+stopifnot(!anyDuplicated(colnames(pb_counts)))
+pb_meta <- tibble::tibble(profile = colnames(pb_counts),
+                          donor = sub("\\|\\|.*$", "", profile),
+                          compartment = sub("^.*\\|\\|", "", profile),
+                          n_cells = as.numeric(pb_ncells[profile])) %>%
+  dplyr::left_join(composition, by = "donor")
+knitr::kable(pb_meta %>% dplyr::group_by(compartment) %>%
+               dplyr::summarise(profiles = dplyr::n(), min_cells = min(n_cells), median_cells = median(n_cells), max_cells = max(n_cells)),
+             caption = "Retained pseudobulk profiles per compartment, and cells per profile.")
+```
+
+## Hallmark ssGSEA, clock, ClockSHAP
+
+The SCAN-B processing functions, unchanged: log-CPM (prior count 1),
+Ensembl-to-symbol collapse by mean, ssGSEA on the 50 Hallmark sets
+(alpha 0.25, no normalization); then the clock and ClockSHAP with the GTEx
+reference.
+
+```{r processing}
+.hallmark_sets <- local({
+  nice <- function(x) x |> stringr::str_remove("^HALLMARK_") |> stringr::str_replace_all("_", " ") |> stringr::str_to_title()
+  hall_raw <- msigdbr::msigdbr(species = "Homo sapiens", category = "H")
+  split(hall_raw$gene_symbol, nice(hall_raw$gs_name))
+})
+.ensembl_to_symbol <- function(ensembl_ids) {
+  syms <- AnnotationDbi::mapIds(org.Hs.eg.db, keys = sub("\\.\\d+$", "", ensembl_ids), keytype = "ENSEMBL", column = "SYMBOL", multiVals = "first")
+  names(syms) <- ensembl_ids; syms
+}
+.collapse_to_symbols <- function(logcpm, symbols) {
+  keep <- !is.na(symbols) & symbols != ""
+  summed <- rowsum(logcpm[keep, , drop = FALSE], group = symbols[keep])
+  sweep(summed, 1, as.numeric(table(symbols[keep])[rownames(summed)]), "/")
+}
+.run_ssgsea <- function(expr) GSVA::gsva(GSVA::ssgseaParam(exprData = expr, geneSets = .hallmark_sets, minSize = 1, maxSize = Inf, alpha = 0.25, normalize = FALSE), verbose = FALSE)
+
+logcpm     <- edgeR::cpm(pb_counts, log = TRUE, prior.count = 1)
+symbols    <- if (all(grepl("^ENSG", head(rownames(logcpm), 100)))) .ensembl_to_symbol(rownames(logcpm)) else rownames(logcpm)
+logcpm_sym <- .collapse_to_symbols(logcpm, symbols)
+scores_pb  <- .run_ssgsea(logcpm_sym)
+stopifnot(all(feat %in% rownames(scores_pb)))
+
+X_pb  <- t(scores_pb[feat, , drop = FALSE])
+ids   <- rownames(X_pb)
+age_v <- stats::setNames(pb_meta$age_years[match(ids, pb_meta$profile)], ids)
+pred_raw <- as.numeric(predict(clock_results$enet_model, newx = X_pb, s = clock_results$tuning$best_lambda))
+cs_pb    <- ClockSHAP::clockshap(features = X_pb, age = age_v, clock = clock_cs, reference = reference)
+stopifnot(max(abs(rowSums(cs_pb$phi) - cs_pb$deviation)) < 1e-6)
+
+res <- pb_meta %>%
+  dplyr::mutate(predicted     = pred_raw[match(profile, ids)],
+                deviation     = as.numeric(cs_pb$deviation)[match(profile, rownames(cs_pb$phi))],
+                pred_anchored = predicted - beta0 + (1 - beta1) * age_years,
+                compartment   = factor(compartment, levels = c("all", "epithelial", "malignant_p", "malignant_s", "nonepi")),
+                pam50         = factor(pam50, levels = c("Normal-Like", "LumA", "LumB", "Her2", "Basal", "Unclassified")))
+knitr::kable(res %>% dplyr::group_by(compartment) %>%
+               dplyr::summarise(profiles = dplyr::n(), mean_dev = mean(deviation), median_dev = median(deviation), sd_dev = sd(deviation)),
+             digits = 1, caption = "Age-matched deviation per compartment. Absolute level reported, not interpreted (see platform check).")
+```
+
+# Platform check
+
+**Asked.** Does the clock read pseudobulk profiles as it reads bulk tumors,
+and how large is the platform offset?
+
+**How.** Pseudobulks placed in the Hallmark feature space beside GTEx and
+TCGA-BRCA; anchored predicted age against chronological age; deviation by
+study within each compartment.
+
+```{r pca, fig.width=7, fig.height=4.5}
+mat_list <- list("GTEx" = scores_gtex, "TCGA-NAT" = scores_nt, "TCGA-PT" = scores_pt)
+mat_list <- mat_list[!vapply(mat_list, is.null, logical(1))]
+for (cp in c("nonepi", "all", "epithelial", "malignant_p"))
+  mat_list[[paste0("sc ", cp)]] <- scores_pb[, pb_meta$profile[pb_meta$compartment == cp], drop = FALSE]
+pathways_common <- Reduce(intersect, lapply(mat_list, rownames))
+combined <- do.call(cbind, lapply(mat_list, function(m) m[pathways_common, , drop = FALSE]))
+cohort   <- rep(names(mat_list), vapply(mat_list, ncol, integer(1)))
+pca <- stats::prcomp(t(combined), center = TRUE, scale. = TRUE)
+ve  <- round(100 * pca$sdev^2 / sum(pca$sdev^2), 1)
+pc_df <- as.data.frame(pca$x[, 1:2]) %>% dplyr::mutate(cohort = factor(cohort, levels = names(mat_list)))
+ggplot(pc_df, aes(PC1, PC2, colour = cohort)) +
+  geom_point(data = pc_df %>% dplyr::filter(!grepl("^sc ", cohort)), alpha = 0.3, size = 1) +
+  geom_point(data = pc_df %>% dplyr::filter(grepl("^sc ", cohort)), alpha = 0.9, size = 1.8) +
+  labs(x = paste0("PC1 (", ve[1], "%)"), y = paste0("PC2 (", ve[2], "%)")) +
+  theme_minimal(base_size = 11) + theme(legend.title = element_blank())
+knitr::kable(pc_df %>% dplyr::group_by(cohort) %>% dplyr::summarise(n = dplyr::n(), PC1 = mean(PC1), PC2 = mean(PC2)), digits = 1,
+             caption = "Cohort centroids in Hallmark PCA space.")
+```
+
+```{r pred-vs-age}
+# raw clock output against chronological age: the slope should match the GTEx training slope (beta1) if the clock's
+# age sensitivity transfers to pseudobulk; the intercept is the platform offset and is not interpreted
+gtex_df <- tibble::tibble(cohort = "GTEx", age_years = age_gtex[ok_g], predicted = pred_gtex[ok_g])
+brca_df <- tibble::tibble(cohort = "TCGA-BRCA", age_years = as.numeric(clock_results$age$Tumour), predicted = as.numeric(clock_results$pred$Tumour)) %>%
+  dplyr::filter(complete.cases(age_years, predicted))
+sc_df <- res %>% dplyr::filter(compartment %in% c("nonepi", "all", "epithelial", "malignant_p")) %>%
+  dplyr::transmute(cohort = paste0("sc ", compartment), age_years, predicted)
+knitr::kable(dplyr::bind_rows(gtex_df, brca_df, sc_df) %>% dplyr::group_by(cohort) %>%
+               dplyr::summarise(n = dplyr::n(), raw_slope_pred_vs_age = coef(lm(predicted ~ age_years))[2],
+                                slope_relative_to_gtex = raw_slope_pred_vs_age / beta1, .groups = "drop"),
+             digits = 2, caption = paste0("Raw clock prediction against chronological age (GTEx training slope beta1 = ", round(beta1, 3), ")."))
+knitr::kable(res %>% dplyr::group_by(compartment, study) %>% dplyr::summarise(mean_dev = mean(deviation), .groups = "drop") %>%
+               tidyr::pivot_wider(names_from = study, values_from = mean_dev), digits = 1,
+             caption = "Mean deviation per compartment and study.")
+```
+
+```{r study-offset}
+# Why Wang 2024 sits apart: chemistry is the same as Wu (10x 3' v2), gene coverage and library size match,
+# but nearly every Hallmark score is uniformly lower, i.e. a global shift in pathway-score scale (a preprocessing
+# property of the deposited matrix). The clock turns that uniform shift into a ~40-year offset through its
+# positive-weight pathways. Shown for the non-epithelial compartment, Wang minus Wu, in years.
+w_yr <- clock_cs$beta / clock_cs$sigma; names(w_yr) <- feat
+sc_ne <- scores_pb[feat, pb_meta$profile[pb_meta$compartment == "nonepi"], drop = FALSE]
+st_ne <- pb_meta$study[match(colnames(sc_ne), pb_meta$profile)]
+off <- tibble::tibble(pathway = feat, weight_yr_per_unit = as.numeric(w_yr[feat]),
+                      score_diff = rowMeans(sc_ne[, st_ne == "wang_2024", drop = FALSE]) - rowMeans(sc_ne[, st_ne == "wu_natgen_2021", drop = FALSE])) %>%
+  dplyr::mutate(years = score_diff * weight_yr_per_unit) %>% dplyr::filter(weight_yr_per_unit != 0) %>% dplyr::arrange(years)
+knitr::kable(off, digits = c(NA, 4, 0, 1), caption = paste0("Wang - Wu offset by clock pathway (non-epithelial compartment); total ", round(sum(off$years), 1), " years."))
+```
+
+**Reading.** PC1 (61%) is the platform axis: all 10x pseudobulks sit far
+from the bulk cohorts, except Wang 2024, which sits inside the bulk cloud.
+Wang's chemistry is the same as Wu's (10x 3′ v2) and its gene coverage and
+library sizes match, but every pathway score is uniformly lower, a global
+shift in score scale from the deposited matrix's preprocessing that the
+clock reads as a ~40-year offset through its positive-weight pathways.
+PC2 (15%) is the bulk normal-to-tumor axis, and it
+orders the compartments the same way: non-epithelial at the GTEx/NAT level,
+all cells between, epithelial and malignant beyond TCGA tumors. The clock's
+age sensitivity transfers: the raw slope of prediction on chronological age
+in each compartment is close to the GTEx training slope (relative slope
+near 1), so the GTEx expected line is the right reference to subtract. Study
+offsets are about 40 years (Wang vs Liu) in every compartment, so absolute
+deviations are not interpreted; the compartment ordering
+nonepi > all > epithelial > malignant holds within each study.
+
+# Result 1 — Within-donor compartment contrasts
+
+**Asked.** Within a donor, is the tumor compartment more youth-like than the
+non-epithelial compartment? This is the direct test of dilution; being
+paired, it is unaffected by the platform offset.
+
+**How.** Deviation of each compartment per donor; differences against
+`nonepi`; Wilcoxon signed-rank; fraction of donors with the tumor
+compartment more youth-like. Repeated without Wang 2024 and per study.
+
+```{r paired}
+wide <- res %>% dplyr::select(donor, study, pam50, frac_epi, frac_mal_p, compartment, deviation) %>%
+  tidyr::pivot_wider(names_from = compartment, values_from = deviation)
+paired_test <- function(a, b, label) {
+  d <- a - b; ok <- is.finite(d)
+  w <- suppressWarnings(wilcox.test(a[ok], b[ok], paired = TRUE))
+  tibble::tibble(contrast = label, n_donors = sum(ok), median_diff = median(d[ok]), frac_more_youthlike = mean(d[ok] < 0), wilcoxon_p = fmt_p(w$p.value))
+}
+contrasts <- function(w) dplyr::bind_rows(
+  paired_test(w$epithelial,  w$nonepi, "epithelial - nonepi"),
+  paired_test(w$malignant_p, w$nonepi, "malignant (primary flag) - nonepi"),
+  paired_test(w$malignant_s, w$nonepi, "malignant (sensitivity flag) - nonepi"),
+  paired_test(w$all,         w$nonepi, "all cells - nonepi"),
+  paired_test(w$malignant_p, w$epithelial, "malignant (primary flag) - epithelial"))
+knitr::kable(contrasts(wide), digits = 1, caption = "Within-donor contrasts, all donors (negative = first compartment more youth-like).")
+knitr::kable(contrasts(wide %>% dplyr::filter(study != "wang_2024")) %>% dplyr::slice_head(n = 2), digits = 1, caption = "Excluding wang_2024.")
+knitr::kable(wide %>% dplyr::mutate(d = epithelial - nonepi) %>% dplyr::group_by(study) %>%
+               dplyr::summarise(n = dplyr::n(), median_diff = median(d), frac_more_youthlike = mean(d < 0), .groups = "drop"),
+             digits = 1, caption = "Epithelial - nonepi difference by study.")
+```
+
+```{r paired-plot, fig.width=5.5, fig.height=4}
+plot_long <- res %>% dplyr::filter(compartment %in% c("nonepi", "all", "epithelial", "malignant_p")) %>%
+  dplyr::mutate(compartment = factor(compartment, levels = c("nonepi", "all", "epithelial", "malignant_p"),
+                                     labels = c("Non-epithelial", "All cells", "Epithelial", "Malignant (CNV)")))
+p_paired <- ggplot(plot_long, aes(compartment, deviation, group = donor)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey55") +
+  geom_line(alpha = 0.25, colour = "grey40") +
+  geom_point(aes(colour = study), alpha = 0.7, size = 1.4) +
+  stat_summary(aes(group = 1), fun = median, geom = "point", shape = 95, size = 10, colour = "#d7191c") +
+  labs(x = NULL, y = "Age-matched deviation (years)") +
+  theme_minimal(base_size = 10) + theme(legend.position = "bottom", legend.title = element_blank(), panel.grid.major.x = element_blank())
+p_paired
+```
+
+**Reading.** Every donor's epithelial compartment is more youth-like than
+its non-epithelial compartment (64/64; median −32 years), and every flagged
+malignant compartment more so (49/49; −36). The all-cell profile lies
+between. The result is the same without Wang and within each study (100%
+in each; medians −14 to −36). The flagged malignant set is slightly more
+youth-like than all epithelial cells (−2.8), as expected if the epithelial
+pool contains some normal epithelium.
+
+# Result 2 — All-cell deviation against counted tumor fraction
+
+**Asked.** Does the all-cell deviation scale with the fraction of tumor
+cells, as it scaled with ABSOLUTE purity in bulk? Here the fraction is
+counted, not estimated.
+
+**How.** All-cell deviation against epithelial fraction: Spearman
+correlation and linear slope per 10 points, raw, with study in the model,
+and without Wang 2024.
+
+```{r fraction}
+dev_all <- wide %>% dplyr::filter(is.finite(all))
+row_of <- function(d, label, adjust = FALSE) {
+  ct <- cor.test(d$all, d$frac_epi, method = "spearman")
+  f  <- if (adjust) lm(all ~ frac_epi + study, d) else lm(all ~ frac_epi, d)
+  tibble::tibble(version = label, n = nrow(d), spearman_rho = unname(ct$estimate), spearman_p = fmt_p(ct$p.value),
+                 slope_per_10pct = 0.1 * coef(f)[["frac_epi"]], slope_p = fmt_p(summary(f)$coefficients["frac_epi", 4]))
+}
+knitr::kable(dplyr::bind_rows(row_of(dev_all, "raw"), row_of(dev_all, "study-adjusted slope", adjust = TRUE),
+                              row_of(dev_all %>% dplyr::filter(study != "wang_2024"), "excluding wang_2024")),
+             digits = 2, caption = "All-cell deviation against epithelial fraction. Bulk reference: ABSOLUTE purity in TCGA-BRCA, rho -0.57, -2.9 years per 10 points.")
+```
+
+```{r fraction-plot, fig.width=4.5, fig.height=3.6}
+ct <- cor.test(dev_all$all, dev_all$frac_epi, method = "spearman")
+p_frac <- ggplot(dev_all, aes(frac_epi, all)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey55") +
+  geom_point(aes(colour = study), alpha = 0.8, size = 1.5) +
+  geom_smooth(method = "lm", formula = y ~ x, se = TRUE, colour = "#d7191c", linewidth = 0.8) +
+  annotate("text", x = Inf, y = Inf, hjust = 1.05, vjust = 1.3, size = 3,
+           label = sprintf("rho = %.2f, %s", ct$estimate, ifelse(ct$p.value < 0.001, "p < 0.001", sprintf("p = %.3f", ct$p.value)))) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.25))) +
+  labs(x = "Epithelial fraction of cells", y = "Age-matched deviation, all cells (years)") +
+  theme_minimal(base_size = 10) + theme(legend.position = "bottom", legend.title = element_blank())
+p_frac
+```
+
+**Reading.** ρ = −0.65 raw; −3.4 years per 10 points with study in the
+model; −3.7 (ρ = −0.78) without Wang. Same relationship as bulk purity,
+with a counted fraction. Wang runs parallel below the fit: an intercept
+shift, not a different slope.
+
+# Result 3 — PAM50 ordering in the tumor compartment
+
+**Asked.** Does the PAM50 ordering of deviation hold in the epithelial
+pseudobulk? Subtype counts are small, so ordering and omnibus test only.
+
+**How.** Epithelial-compartment deviation by donor PAM50: raw medians,
+medians of the residual from `deviation ~ study`, and without Wang 2024;
+Kruskal–Wallis for each.
+
+```{r pam50}
+epi_df <- res %>% dplyr::filter(compartment == "epithelial", pam50 != "Unclassified") %>%
+  dplyr::mutate(pam50 = droplevels(pam50), dev_study_adj = residuals(lm(deviation ~ study)))
+knitr::kable(epi_df %>% dplyr::group_by(pam50) %>%
+               dplyr::summarise(n = dplyr::n(), median_dev = median(deviation), median_study_adj = median(dev_study_adj),
+                                n_no_wang = sum(study != "wang_2024"), median_no_wang = median(deviation[study != "wang_2024"]), .groups = "drop"),
+             digits = 1, caption = "Epithelial-compartment deviation by PAM50.")
+kw <- c(raw = kruskal.test(deviation ~ pam50, epi_df)$p.value,
+        study_adjusted = kruskal.test(dev_study_adj ~ pam50, epi_df)$p.value,
+        excluding_wang = kruskal.test(deviation ~ pam50, epi_df %>% dplyr::filter(study != "wang_2024"))$p.value)
+knitr::kable(tibble::tibble(version = names(kw), kruskal_wallis_p = fmt_p(kw)), caption = "Kruskal-Wallis across PAM50 subtypes.")
+```
+
+```{r pam50-plot, fig.width=4.5, fig.height=3.75}
+pam50_pal <- c("Normal-Like" = "#cccccc", "LumA" = "#4575b4", "LumB" = "#91bfdb", "Her2" = "#fc8d59", "Basal" = "#d73027")
+p_pam50 <- ggplot(epi_df, aes(pam50, deviation, fill = pam50)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_boxplot(width = 0.6, outlier.shape = NA, alpha = 0.85) +
+  geom_jitter(aes(colour = study), width = 0.15, alpha = 0.7, size = 1.2) +
+  scale_fill_manual(values = pam50_pal, guide = "none") +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.05, vjust = 1.3, size = 3.3, label = paste0("Kruskal-Wallis p = ", formatC(kw[["raw"]], format = "g", digits = 2))) +
+  labs(x = NULL, y = "Age-matched deviation, epithelial cells (years)") +
+  theme_minimal(base_size = 10) + theme(panel.grid.minor = element_blank(), panel.grid.major.x = element_blank(), legend.position = "bottom", legend.title = element_blank())
+p_pam50
+```
+
+**Reading.** Subtypes differ (p = 6 × 10⁻⁴ raw, 1 × 10⁻³ study-adjusted).
+After study adjustment the subtypes form two tiers: Normal-Like and luminal
+A least youth-like, luminal B, HER2-enriched and basal-like most. The order
+within the second tier is not resolvable at n = 12–19 per subtype.
+
+# Record — pathway contributions by compartment (not used in the manuscript)
+
+Absolute per-pathway contributions carry the platform
+offset and are not interpretable; the paired epithelial − nonepi difference
+per pathway is.
+
+```{r pathways}
+phi <- as.data.frame(cs_pb$phi) %>% tibble::rownames_to_column("profile") %>%
+  dplyr::left_join(res %>% dplyr::select(profile, donor, compartment), by = "profile")
+retained <- feat[colSums(abs(cs_pb$phi[, feat, drop = FALSE])) > 0]
+phi_diff <- phi %>% dplyr::filter(compartment %in% c("epithelial", "nonepi")) %>%
+  dplyr::select(donor, compartment, dplyr::all_of(retained)) %>%
+  tidyr::pivot_longer(dplyr::all_of(retained), names_to = "pathway", values_to = "phi") %>%
+  tidyr::pivot_wider(names_from = compartment, values_from = phi) %>%
+  dplyr::filter(is.finite(epithelial), is.finite(nonepi)) %>%
+  dplyr::group_by(pathway) %>%
+  dplyr::summarise(n = dplyr::n(), median_diff = median(epithelial - nonepi),
+                   wilcoxon_p = fmt_p(suppressWarnings(wilcox.test(epithelial, nonepi, paired = TRUE))$p.value), .groups = "drop") %>%
+  dplyr::arrange(median_diff)
+knitr::kable(phi_diff, digits = 1, caption = "Paired epithelial - nonepi contribution per pathway (negative = more youth-like in epithelial cells).")
+```
+
+**Reading.** The ~30-year compartment gap is carried about two-thirds by
+immune and stromal programs reading older-like in non-epithelial cells
+(IL2/STAT5, complement, TNFα/NFκB, coagulation) and one-third by tumor
+programs reading more youth-like in epithelial cells (glycolysis,
+myogenesis, P53, G2M); Wnt runs the other way. This matches the purity
+pathway analysis, where immune and stromal contributions were
+purity-dependent and the proliferative/metabolic core was not.
+
+## Within-donor contribution differences, one column per donor
+
+Each cell is the ClockSHAP contribution of a pathway in the donor's
+epithelial pseudobulk minus the same pathway in the donor's non-epithelial
+pseudobulk, so the platform offset cancels. Blue: more youth-like in the
+tumor cells than in the donor's own immune and stromal cells; red: the
+reverse. Column sums equal the paired deviation difference of Result 1;
+columns are ordered by it.
+
+```{r heatmap-difference, fig.width=9, fig.height=5.5}
+suppressPackageStartupMessages({ library(ComplexHeatmap); library(circlize); library(grid) })
+phi_by <- function(cp) {
+  r <- res %>% dplyr::filter(compartment == cp)
+  m <- cs_pb$phi[r$profile, retained, drop = FALSE]; rownames(m) <- r$donor; m
+}
+phi_epi <- phi_by("epithelial"); phi_non <- phi_by("nonepi")
+donors_d <- intersect(rownames(phi_epi), rownames(phi_non))
+diff_mat <- t(phi_epi[donors_d, ] - phi_non[donors_d, ])
+rownames(diff_mat)[rownames(diff_mat) == "Reactive Oxygen Species Pathway"] <- "ROS Pathway"
+col_meta <- wide %>% dplyr::filter(donor %in% donors_d) %>% dplyr::mutate(diff = epithelial - nonepi) %>% dplyr::arrange(diff)
+diff_mat <- diff_mat[, col_meta$donor, drop = FALSE]
+stopifnot(max(abs(colSums(diff_mat) - col_meta$diff)) < 1e-6)
+
+pam_cols   <- c("Normal-Like" = "#cccccc", LumA = "#4575b4", LumB = "#91bfdb", Her2 = "#fc8d59", Basal = "#d73027", Unclassified = "grey70")
+study_cols <- stats::setNames(c("#1b9e77", "#d95f02", "#7570b3", "#e7298a")[seq_along(unique(res$study))], sort(unique(res$study)))
+lim <- as.numeric(stats::quantile(abs(diff_mat), 0.99))
+ha  <- ComplexHeatmap::HeatmapAnnotation(
+  `Deviation diff` = col_meta$diff, PAM50 = as.character(col_meta$pam50), Study = col_meta$study,
+  col = list(`Deviation diff` = circlize::colorRamp2(c(min(col_meta$diff), 0, max(0, max(col_meta$diff))), c("darkblue", "white", "darkred")),
+             PAM50 = pam_cols, Study = study_cols),
+  annotation_name_gp = grid::gpar(fontsize = 9), annotation_height = grid::unit(rep(3, 3), "mm"))
+ht_diff <- ComplexHeatmap::Heatmap(
+  diff_mat, name = "epithelial - nonepi\n(ClockSHAP, yr)",
+  col = circlize::colorRamp2(c(-lim, 0, lim), c("steelblue", "white", "firebrick")),
+  top_annotation = ha, cluster_rows = TRUE, cluster_columns = FALSE,
+  show_column_names = FALSE, row_names_gp = grid::gpar(fontsize = 9),
+  column_title = "Tumor cells versus the donor's non-epithelial cells, one column per donor")
+ComplexHeatmap::draw(ht_diff, heatmap_legend_side = "right", merge_legends = TRUE)
+```
+
+**Reading.** Two consistent blocks in essentially every donor: a youth-like
+block (IL2/STAT5, glycolysis, complement, myogenesis, TNFα/NFκB,
+coagulation, P53, G2M) and an older-like block (Wnt/β-catenin, UV response
+up, pancreas β cells, UPR). The six highlighted pathways fall on the sides
+the bulk decomposition assigned them. Column order is partly study: Pal and
+Wu carry the largest differences, Wang and Liu smaller ones with a
+compressed range in every row, so the platform affects the magnitude of the
+contrast as well as the offset. Sign and pathway identity are
+study-independent; magnitude is not.
+
+# Save outputs
+
+```{r save}
+if (isTRUE(params$save_outputs)) {
+  fig_dir_abs <- here::here(params$fig_dir); tables_root_abs <- here::here(params$tables_root)
+  dir.create(fig_dir_abs, recursive = TRUE, showWarnings = FALSE); dir.create(tables_root_abs, recursive = TRUE, showWarnings = FALSE)
+  utils::write.csv(res, file.path(tables_root_abs, "Supplement_scBRCA_pseudobulk_deviation.csv"), row.names = FALSE)
+  ggsave(file.path(fig_dir_abs, "Supplement_scBRCA_paired_compartments.pdf"), p_paired, width = 5, height = 3,    units = "in")
+  ggsave(file.path(fig_dir_abs, "Supplement_scBRCA_deviation_vs_fraction.pdf"), p_frac,  width = 5, height = 3,  units = "in")
+  ggsave(file.path(fig_dir_abs, "Supplement_scBRCA_PAM50_epithelial.pdf"),     p_pam50, width = 5, height = 3, units = "in")
+}
+```
+
+```{r}
+sessionInfo()
+```

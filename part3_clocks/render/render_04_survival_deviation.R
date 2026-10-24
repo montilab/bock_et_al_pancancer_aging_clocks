@@ -18,21 +18,18 @@ jobs <- data.frame(
 for (i in seq_len(nrow(jobs))) {
   tcga <- jobs$tcga_project[i]
   gtex <- jobs$gtex_project[i]
-  
-  message("Rendering stability: ", tcga, " / ", gtex)
-  
+
+  message("Rendering 04_survival_deviation: ", tcga, " / ", gtex)
+
   rmarkdown::render(
-    input = "part3_clocks/Rmd/07_stability_clean_template.Rmd",
+    input = "part3_clocks/Rmd/04_survival_deviation_clean_template.Rmd",
     params = list(
       tcga_project = tcga,
-      gtex_project = gtex,
-      feature_set  = "PC",
-      out_root     = "results/derived/GTEx",
-      min_nat      = 10
+      gtex_project = gtex
     ),
     output_file = file.path(
       "..", "html",
-      paste0("07_stability_", tcga, "_", gtex, ".html")
+      paste0("04_survival_deviation_", tcga, "_", gtex, ".html")
     ),
     clean = TRUE,
     envir = new.env(),

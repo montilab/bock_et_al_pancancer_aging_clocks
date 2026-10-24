@@ -20,17 +20,17 @@ for (i in seq_len(nrow(jobs))) {
   tcga <- jobs$tcga_project[i]
   gtex <- jobs$gtex_project[i]
   
-  message("Rendering 04_clockshap: ", tcga, " / ", gtex)
+  message("Rendering 03_clockshap: ", tcga, " / ", gtex)
   
   rmarkdown::render(
-    input = "part3_clocks/Rmd/04_clockshap_template.Rmd",
+    input = "part3_clocks/Rmd/03_clockshap_template.Rmd",
     params = list(
       tcga_project = tcga,
       gtex_project = gtex
     ),
     output_file = file.path(
       "..", "html",
-      paste0("04_clockshap_", tcga, "_", gtex, ".html")
+      paste0("03_clockshap_", tcga, "_", gtex, ".html")
     ),
     clean = TRUE,
     envir = new.env(),

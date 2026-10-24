@@ -11,7 +11,7 @@
 
 <meta name="author" content="Pan-cancer aging project" />
 
-<meta name="date" content="2026-07-31" />
+<meta name="date" content="2026-08-25" />
 
 <title>Supplementary table — GTEx clock nested cross-validation performance</title>
 
@@ -2812,22 +2812,36 @@ border-radius: 0px;
 
 <h1 class="title toc-ignore">Supplementary table — GTEx clock nested
 cross-validation performance</h1>
-<h3 class="subtitle">GTEx-only, nested-CV performance for the BREAST,
-BRAIN, LUNG, and COLON clocks</h3>
+<h3 class="subtitle">GTEx-only, in-sample and nested-CV performance for
+the BREAST, BRAIN, LUNG, and COLON clocks</h3>
 <h4 class="author">Pan-cancer aging project</h4>
-<h4 class="date">July 31, 2026</h4>
+<h4 class="date">August 25, 2026</h4>
 
 </div>
 
 
 <div id="what-this-does" class="section level2">
 <h2>What this does</h2>
-<p>Nested cross-validation of the GTEx tissue clocks. The full
-alpha/lambda tuning (Step 02’s search) is re-run inside each outer fold,
-so the reported R2/RMSE/MAE account for hyperparameter selection, not
-just fitting. This validates the <em>procedure</em>; the deployed clock
-is still the full-data model from Step 02. Its alpha and lambda are
-shown for reference. Read-only: nothing downstream changes.</p>
+<p>Performance of the GTEx tissue clocks, reported two ways.</p>
+<p>In-sample metrics come from the deployed clock evaluated on the GTEx
+samples it was fit on. These are read directly from the saved Step 02
+predictions and nothing is refit, so they describe how well the deployed
+model fits its own training data. They are optimistic by construction
+and are reported for comparability with clock studies that publish
+training fit.</p>
+<p>Nested cross-validation re-runs the full alpha/lambda tuning (Step
+02’s search) inside each outer fold, so the reported R2/RMSE/MAE account
+for hyperparameter selection, not just fitting. This is the honest
+generalization estimate and the one quoted in the main text. It
+validates the <em>procedure</em>; the deployed clock is still the
+full-data model from Step 02. Its alpha and lambda are shown for
+reference.</p>
+<p>Both R2 values are the squared Pearson correlation between predicted
+and chronological age, so the two columns are directly comparable.
+Read-only: nothing downstream changes.</p>
+<p>Two versions of the table are written: the full numeric table at
+<code>out_csv</code>, and a condensed version alongside it with
+<code>_condensed</code> appended to the file name.</p>
 <pre class="r"><code># Age-decile-stratified k folds (matches Step 02&#39;s stratification).
 build_foldid &lt;- function(y, k, seed) {
   set.seed(seed)
@@ -2883,6 +2897,22 @@ nested_oof &lt;- function(x, y, alpha_grid, lambda_grid, outer_k, inner_k, seed)
   keep &lt;- is.finite(y)
   x &lt;- x[keep, , drop = FALSE]; y &lt;- as.numeric(y[keep])
 
+  # In-sample: deployed clock on its own training samples, straight from Step 02.
+  pred_in &lt;- clock$pred$GTEx
+  age_in  &lt;- clock$age$GTEx[names(pred_in)]
+  ok_in   &lt;- is.finite(pred_in) &amp; is.finite(age_in)
+
+  # The two R2 columns are only comparable if both are computed over the same
+  # GTEx samples; warn rather than stop, since a small difference may be benign.
+  if (sum(ok_in) != length(y)) {
+    warning(analysis_id, &quot;: in-sample n (&quot;, sum(ok_in),
+            &quot;) differs from rebuilt training n (&quot;, length(y), &quot;).&quot;)
+  }
+
+  fit_r2   &lt;- cor(pred_in[ok_in], age_in[ok_in])^2                   # squared Pearson r
+  fit_rmse &lt;- sqrt(mean((pred_in[ok_in] - age_in[ok_in])^2))
+  fit_mae  &lt;- mean(abs(pred_in[ok_in] - age_in[ok_in]))
+
   oof &lt;- nested_oof(x, y, alpha_grid, lambda_grid,
                     params$outer_k, params$inner_k, params$seed)
   ok  &lt;- is.finite(oof) &amp; is.finite(y)
@@ -2904,6 +2934,9 @@ nested_oof &lt;- function(x, y, alpha_grid, lambda_grid, outer_k, inner_k, seed)
     `Age max`                = max(y),
     `Input pathways`         = length(feat),
     `Nonzero-coef pathways`  = n_nonzero,
+    `In-sample R2`           = round(fit_r2, 3),
+    `In-sample RMSE`         = round(fit_rmse, 2),
+    `In-sample MAE`          = round(fit_mae, 2),
     `Nested-CV R2`           = round(cv_r2, 3),
     `Nested-CV RMSE`         = round(cv_rmse, 2),
     `Nested-CV MAE`          = round(cv_mae, 2),
@@ -2916,24 +2949,27 @@ perf_tbl &lt;- purrr::map_dfr(params$analyses, process_one)</code></pre>
 </div>
 <div id="table" class="section level2">
 <h2>Table</h2>
-<pre class="r"><code>knitr::kable(perf_tbl, caption = &quot;GTEx tissue clocks: descriptors and nested-CV performance.&quot;)</code></pre>
-<table>
-<caption>GTEx tissue clocks: descriptors and nested-CV
+<pre class="r"><code>knitr::kable(perf_tbl, caption = &quot;GTEx tissue clocks: descriptors, in-sample fit, and nested-CV performance.&quot;)</code></pre>
+<table style="width:100%;">
+<caption>GTEx tissue clocks: descriptors, in-sample fit, and nested-CV
 performance.</caption>
 <colgroup>
+<col width="5%" />
+<col width="3%" />
+<col width="5%" />
+<col width="3%" />
+<col width="3%" />
+<col width="3%" />
 <col width="7%" />
-<col width="4%" />
+<col width="10%" />
 <col width="6%" />
-<col width="4%" />
-<col width="4%" />
-<col width="4%" />
-<col width="9%" />
-<col width="13%" />
 <col width="7%" />
-<col width="9%" />
-<col width="8%" />
-<col width="9%" />
-<col width="9%" />
+<col width="6%" />
+<col width="6%" />
+<col width="7%" />
+<col width="6%" />
+<col width="7%" />
+<col width="7%" />
 </colgroup>
 <thead>
 <tr class="header">
@@ -2945,6 +2981,9 @@ performance.</caption>
 <th align="right">Age max</th>
 <th align="right">Input pathways</th>
 <th align="right">Nonzero-coef pathways</th>
+<th align="right">In-sample R2</th>
+<th align="right">In-sample RMSE</th>
+<th align="right">In-sample MAE</th>
 <th align="right">Nested-CV R2</th>
 <th align="right">Nested-CV RMSE</th>
 <th align="right">Nested-CV MAE</th>
@@ -2962,6 +3001,9 @@ performance.</caption>
 <td align="right">70</td>
 <td align="right">50</td>
 <td align="right">18</td>
+<td align="right">0.222</td>
+<td align="right">11.60</td>
+<td align="right">9.35</td>
 <td align="right">0.136</td>
 <td align="right">12.16</td>
 <td align="right">9.85</td>
@@ -2977,6 +3019,9 @@ performance.</caption>
 <td align="right">70</td>
 <td align="right">50</td>
 <td align="right">40</td>
+<td align="right">0.168</td>
+<td align="right">9.50</td>
+<td align="right">7.12</td>
 <td align="right">0.133</td>
 <td align="right">9.67</td>
 <td align="right">7.25</td>
@@ -2992,6 +3037,9 @@ performance.</caption>
 <td align="right">70</td>
 <td align="right">50</td>
 <td align="right">16</td>
+<td align="right">0.216</td>
+<td align="right">10.68</td>
+<td align="right">8.49</td>
 <td align="right">0.166</td>
 <td align="right">10.96</td>
 <td align="right">8.69</td>
@@ -3007,6 +3055,9 @@ performance.</caption>
 <td align="right">70</td>
 <td align="right">50</td>
 <td align="right">31</td>
+<td align="right">0.262</td>
+<td align="right">11.62</td>
+<td align="right">9.47</td>
 <td align="right">0.166</td>
 <td align="right">12.31</td>
 <td align="right">10.02</td>
@@ -3017,10 +3068,115 @@ performance.</caption>
 </table>
 <pre class="r"><code>reactable::reactable(perf_tbl, striped = TRUE, highlight = TRUE, defaultPageSize = 8)</code></pre>
 <div class="reactable html-widget html-fill-item" id="htmlwidget-d3e9a00c385781e44941" style="width:auto;height:auto;"></div>
-<script type="application/json" data-for="htmlwidget-d3e9a00c385781e44941">{"x":{"tag":{"name":"Reactable","attribs":{"data":{"GTEx tissue":["BREAST","BRAIN","LUNG","COLON"],"n GTEx":[482,2931,655,822],"Age median":[54,61,56,54],"Age SD":[13.1,10.36,12,13.48],"Age min":[21,20,21,20],"Age max":[70,70,70,70],"Input pathways":[50,50,50,50],"Nonzero-coef pathways":[18,40,16,31],"Nested-CV R2":[0.136,0.133,0.166,0.166],"Nested-CV RMSE":[12.16,9.67,10.96,12.31],"Nested-CV MAE":[9.85,7.25,8.69,10.02],"Deployed alpha":[0.6,0.2,0.6,0.5],"Deployed lambda":[0.579,0.1796,0.579,0.1796]},"columns":[{"id":"GTEx tissue","name":"GTEx tissue","type":"character"},{"id":"n GTEx","name":"n GTEx","type":"numeric"},{"id":"Age median","name":"Age median","type":"numeric"},{"id":"Age SD","name":"Age SD","type":"numeric"},{"id":"Age min","name":"Age min","type":"numeric"},{"id":"Age max","name":"Age max","type":"numeric"},{"id":"Input pathways","name":"Input pathways","type":"numeric"},{"id":"Nonzero-coef pathways","name":"Nonzero-coef pathways","type":"numeric"},{"id":"Nested-CV R2","name":"Nested-CV R2","type":"numeric"},{"id":"Nested-CV RMSE","name":"Nested-CV RMSE","type":"numeric"},{"id":"Nested-CV MAE","name":"Nested-CV MAE","type":"numeric"},{"id":"Deployed alpha","name":"Deployed alpha","type":"numeric"},{"id":"Deployed lambda","name":"Deployed lambda","type":"numeric"}],"defaultPageSize":8,"highlight":true,"striped":true,"dataKey":"be6a4bb8962d659b44a45ef444b9be57"},"children":[]},"class":"reactR_markup"},"evals":[],"jsHooks":[]}</script>
+<script type="application/json" data-for="htmlwidget-d3e9a00c385781e44941">{"x":{"tag":{"name":"Reactable","attribs":{"data":{"GTEx tissue":["BREAST","BRAIN","LUNG","COLON"],"n GTEx":[482,2931,655,822],"Age median":[54,61,56,54],"Age SD":[13.1,10.36,12,13.48],"Age min":[21,20,21,20],"Age max":[70,70,70,70],"Input pathways":[50,50,50,50],"Nonzero-coef pathways":[18,40,16,31],"In-sample R2":[0.222,0.168,0.216,0.262],"In-sample RMSE":[11.6,9.5,10.68,11.62],"In-sample MAE":[9.35,7.12,8.49,9.47],"Nested-CV R2":[0.136,0.133,0.166,0.166],"Nested-CV RMSE":[12.16,9.67,10.96,12.31],"Nested-CV MAE":[9.85,7.25,8.69,10.02],"Deployed alpha":[0.6,0.2,0.6,0.5],"Deployed lambda":[0.579,0.1796,0.579,0.1796]},"columns":[{"id":"GTEx tissue","name":"GTEx tissue","type":"character"},{"id":"n GTEx","name":"n GTEx","type":"numeric"},{"id":"Age median","name":"Age median","type":"numeric"},{"id":"Age SD","name":"Age SD","type":"numeric"},{"id":"Age min","name":"Age min","type":"numeric"},{"id":"Age max","name":"Age max","type":"numeric"},{"id":"Input pathways","name":"Input pathways","type":"numeric"},{"id":"Nonzero-coef pathways","name":"Nonzero-coef pathways","type":"numeric"},{"id":"In-sample R2","name":"In-sample R2","type":"numeric"},{"id":"In-sample RMSE","name":"In-sample RMSE","type":"numeric"},{"id":"In-sample MAE","name":"In-sample MAE","type":"numeric"},{"id":"Nested-CV R2","name":"Nested-CV R2","type":"numeric"},{"id":"Nested-CV RMSE","name":"Nested-CV RMSE","type":"numeric"},{"id":"Nested-CV MAE","name":"Nested-CV MAE","type":"numeric"},{"id":"Deployed alpha","name":"Deployed alpha","type":"numeric"},{"id":"Deployed lambda","name":"Deployed lambda","type":"numeric"}],"defaultPageSize":8,"highlight":true,"striped":true,"dataKey":"cbd6cbf88b34adcc1804de8f9c07df0c"},"children":[]},"class":"reactR_markup"},"evals":[],"jsHooks":[]}</script>
 <pre class="r"><code>dir.create(dirname(params$out_csv), recursive = TRUE, showWarnings = FALSE)
 readr::write_csv(perf_tbl, params$out_csv)
 message(&quot;Wrote: &quot;, params$out_csv)</code></pre>
+</div>
+<div id="condensed-table-for-the-supplement" class="section level2">
+<h2>Condensed table for the supplement</h2>
+<p>The same values with the paired statistics folded into single cells,
+which brings the table to eight columns so that it fits a portrait page.
+Age SD and both MAE columns are dropped here and remain in the full
+table above and in the saved CSV.</p>
+<pre class="r"><code>perf_condensed &lt;- perf_tbl %&gt;%
+  dplyr::transmute(
+    Tissue                = `GTEx tissue`,
+    n                     = `n GTEx`,
+    `Age, median (range)` = sprintf(&quot;%.0f (%.0f-%.0f)&quot;, `Age median`, `Age min`, `Age max`),
+    Pathways              = sprintf(&quot;%d of %d&quot;, as.integer(`Nonzero-coef pathways`),
+                                                as.integer(`Input pathways`)),
+    `In-sample R2 (RMSE)` = sprintf(&quot;%.3f (%.1f)&quot;, `In-sample R2`, `In-sample RMSE`),
+    `Nested-CV R2 (RMSE)` = sprintf(&quot;%.3f (%.1f)&quot;, `Nested-CV R2`, `Nested-CV RMSE`),
+    alpha                 = `Deployed alpha`,
+    lambda                = `Deployed lambda`
+  )
+
+knitr::kable(
+  perf_condensed,
+  caption = paste0(
+    &quot;GTEx tissue clocks, condensed for typesetting. R2 is the squared Pearson &quot;,
+    &quot;correlation between predicted and chronological age; RMSE is in years. &quot;,
+    &quot;In-sample values come from the deployed clock evaluated on its own &quot;,
+    &quot;training samples and are optimistic by construction.&quot;
+  )
+)</code></pre>
+<table>
+<caption>GTEx tissue clocks, condensed for typesetting. R2 is the
+squared Pearson correlation between predicted and chronological age;
+RMSE is in years. In-sample values come from the deployed clock
+evaluated on its own training samples and are optimistic by
+construction.</caption>
+<colgroup>
+<col width="7%" />
+<col width="5%" />
+<col width="21%" />
+<col width="9%" />
+<col width="21%" />
+<col width="21%" />
+<col width="6%" />
+<col width="7%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th align="left">Tissue</th>
+<th align="right">n</th>
+<th align="left">Age, median (range)</th>
+<th align="left">Pathways</th>
+<th align="left">In-sample R2 (RMSE)</th>
+<th align="left">Nested-CV R2 (RMSE)</th>
+<th align="right">alpha</th>
+<th align="right">lambda</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td align="left">BREAST</td>
+<td align="right">482</td>
+<td align="left">54 (21-70)</td>
+<td align="left">18 of 50</td>
+<td align="left">0.222 (11.6)</td>
+<td align="left">0.136 (12.2)</td>
+<td align="right">0.6</td>
+<td align="right">0.5790</td>
+</tr>
+<tr class="even">
+<td align="left">BRAIN</td>
+<td align="right">2931</td>
+<td align="left">61 (20-70)</td>
+<td align="left">40 of 50</td>
+<td align="left">0.168 (9.5)</td>
+<td align="left">0.133 (9.7)</td>
+<td align="right">0.2</td>
+<td align="right">0.1796</td>
+</tr>
+<tr class="odd">
+<td align="left">LUNG</td>
+<td align="right">655</td>
+<td align="left">56 (21-70)</td>
+<td align="left">16 of 50</td>
+<td align="left">0.216 (10.7)</td>
+<td align="left">0.166 (11.0)</td>
+<td align="right">0.6</td>
+<td align="right">0.5790</td>
+</tr>
+<tr class="even">
+<td align="left">COLON</td>
+<td align="right">822</td>
+<td align="left">54 (20-70)</td>
+<td align="left">31 of 50</td>
+<td align="left">0.262 (11.6)</td>
+<td align="left">0.166 (12.3)</td>
+<td align="right">0.5</td>
+<td align="right">0.1796</td>
+</tr>
+</tbody>
+</table>
+<pre class="r"><code>out_csv_condensed &lt;- sub(&quot;\\.csv$&quot;, &quot;_condensed.csv&quot;, params$out_csv)
+
+dir.create(dirname(out_csv_condensed), recursive = TRUE, showWarnings = FALSE)
+readr::write_csv(perf_condensed, out_csv_condensed)
+message(&quot;Wrote: &quot;, out_csv_condensed)</code></pre>
 </div>
 
 
